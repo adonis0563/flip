@@ -1,0 +1,6 @@
+{
+  "name": "Flip",
+  "description": "A zero-account, local-first file and text sharing app. No sign-up, no cloud, no internet required.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -15,6 +15,8 @@ import com.example.ui.FlipAppContent
 import com.example.ui.theme.MyApplicationTheme
 import android.annotation.SuppressLint
 import com.example.viewmodel.FlipViewModel
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 
 @SuppressLint("InvalidFragmentVersionForActivityResult")
 class MainActivity : ComponentActivity() {
@@ -43,6 +45,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        
+        // Initialize Theme settings
+        com.example.ui.theme.ThemeSettings.initialize(this)
         
         // Initialize storage directory safely
         com.example.service.StorageService.appFilesDir = getExternalFilesDir(null)
@@ -81,7 +86,31 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MyApplicationTheme {
+            val themeMode by viewModel.themeMode.collectAsState()
+            val darkTheme = when (themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> androidx.compose.foundation.isSystemInDarkTheme()
+            }
+
+            val context = androidx.compose.ui.platform.LocalContext.current
+            androidx.compose.runtime.LaunchedEffect(darkTheme) {
+                val activity = context as? androidx.activity.ComponentActivity
+                activity?.enableEdgeToEdge(
+                    statusBarStyle = if (darkTheme) {
+                        androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        androidx.activity.SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                    },
+                    navigationBarStyle = if (darkTheme) {
+                        androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        androidx.activity.SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                    }
+                )
+            }
+
+            MyApplicationTheme(darkTheme = darkTheme) {
                 FlipAppContent(viewModel = viewModel)
             }
         }

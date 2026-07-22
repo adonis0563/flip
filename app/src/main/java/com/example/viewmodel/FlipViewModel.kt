@@ -79,6 +79,25 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val _isServerRunning = MutableStateFlow(false)
     val isServerRunning: StateFlow<Boolean> = _isServerRunning.asStateFlow()
 
+    private val _activeSessionId = MutableStateFlow<String?>(null)
+    val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
+
+    fun createNewTransferSession(): String {
+        val sessionId = UUID.randomUUID().toString().take(12)
+        _activeSessionId.value = sessionId
+        currentSessionId = sessionId
+        return sessionId
+    }
+
+    fun invalidateCurrentSession() {
+        val id = _activeSessionId.value ?: currentSessionId
+        if (id != null) {
+            QrSessionManager.invalidateSession(id)
+            _activeSessionId.value = null
+            currentSessionId = null
+        }
+    }
+
     // State lock for queue running
     private var queueJob: Job? = null
     @Volatile
@@ -167,6 +186,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _discoveredDevices.value = emptyList()
         TransferManager.clearQueue(context)
         
+        createNewTransferSession()
+
         connectionStateManager.updateNetworkStatus()
         connectionStateManager.setHasDiscoveredDevices(false)
         connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
@@ -202,8 +223,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 _localDevice.value = updatedLocal
 
                 // 2. Generate Session ID and Advertise over BLE
-                val sessionId = UUID.randomUUID().toString()
-                currentSessionId = sessionId
+                val sessionId = createNewTransferSession()
                 
                 if (updatedLocal != null) {
                     bleService.startAdvertising(
@@ -282,6 +302,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     private fun performDisconnectCleanup() {
+        invalidateCurrentSession()
+
         // Cancel all pending or active transfers
         TransferManager.cancelAllActiveTransfers(context)
 

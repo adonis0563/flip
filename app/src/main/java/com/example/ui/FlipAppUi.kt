@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.collect
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.IntentSenderRequest
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
@@ -58,9 +59,15 @@ import com.example.model.Device
 import com.example.model.TransferItem
 import com.example.model.TransferStatus
 import com.example.service.QrCodeGenerator
+import com.example.service.QrSessionManager
+import com.example.service.QrParseResult
+import com.example.service.QrConnectionPackage
+import com.example.service.WifiHotspotManager
 import com.example.service.StorageService
 import com.example.service.LocalFileItem
 import com.example.service.FlipConnectionState
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import coil.compose.AsyncImage
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -74,6 +81,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.border
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import android.location.LocationManager
+import android.net.wifi.WifiManager
+import android.bluetooth.BluetoothManager
+import android.provider.Settings
+import android.os.Build
 
 // Helper to extract file details (name and size) from a URI
 fun getFileDetails(context: Context, uri: Uri): Pair<String, Long> {
@@ -106,6 +120,7 @@ fun FlipAppContent(viewModel: FlipViewModel) {
     val bleError by viewModel.bleError.collectAsState()
     val flipConnectionState by viewModel.flipConnectionState.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
+    val activeSessionId by viewModel.activeSessionId.collectAsState()
 
     val context = LocalContext.current
 
@@ -204,6 +219,7 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                         if (role == "SENDER") {
                             SenderWaitingScreen(
                                 localDevice = localDevice,
+                                activeSessionId = activeSessionId,
                                 onUpdateIp = { viewModel.updateLocalIpAddress(it) },
                                 onCancel = { viewModel.resetToHome() }
                             )
@@ -377,6 +393,320 @@ fun SplashScreen(onGetStarted: () -> Unit) {
 }
 
 // -------------------------------------------------------------
+// Connection Setup Helper Functions & Dialog
+fun checkHotspotEnabled(context: Context): Boolean {
+    val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return false
+    try {
+        val method = wifiManager.javaClass.getDeclaredMethod("isWifiApEnabled")
+        method.isAccessible = true
+        if (method.invoke(wifiManager) as? Boolean == true) return true
+    } catch (_: Exception) {}
+    try {
+        val method = wifiManager.javaClass.getMethod("getWifiApState")
+        val state = method.invoke(wifiManager) as? Int
+        if (state == 13 || state == 12) return true
+    } catch (_: Exception) {}
+    if (com.example.service.WifiHotspotManager.simulatedSsid != null) return true
+    return false
+}
+
+fun checkWifiEnabled(context: Context): Boolean {
+    val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return false
+    return wifiManager.isWifiEnabled
+}
+
+fun checkBluetoothEnabled(context: Context): Boolean {
+    val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    return bluetoothManager?.adapter?.isEnabled == true
+}
+
+fun checkLocationEnabled(context: Context): Boolean {
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return false
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        locationManager.isLocationEnabled
+    } else {
+        locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+    }
+}
+
+fun openHotspotSettings(context: Context) {
+    try {
+        val intent = Intent("android.settings.TETHER_SETTINGS").apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        openSettingsFallback(context, Settings.ACTION_WIRELESS_SETTINGS)
+    }
+}
+
+fun openWifiSettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_WIFI_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        openSettingsFallback(context, Settings.ACTION_SETTINGS)
+    }
+}
+
+fun openBluetoothSettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        openSettingsFallback(context, Settings.ACTION_SETTINGS)
+    }
+}
+
+fun openLocationSettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        openSettingsFallback(context, Settings.ACTION_SETTINGS)
+    }
+}
+
+private fun openSettingsFallback(context: Context, action: String) {
+    try {
+        val intent = Intent(action).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        try {
+            val fallback = Intent(Settings.ACTION_SETTINGS).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+            context.startActivity(fallback)
+        } catch (_: Exception) {}
+    }
+}
+
+@Composable
+fun ConnectionSetupDialog(
+    isSendMode: Boolean,
+    onDismissRequest: () -> Unit,
+    onContinue: () -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+
+    var isNetworkServiceOn by remember {
+        mutableStateOf(if (isSendMode) checkHotspotEnabled(context) else checkWifiEnabled(context))
+    }
+    var isBluetoothOn by remember { mutableStateOf(checkBluetoothEnabled(context)) }
+    var isLocationOn by remember { mutableStateOf(checkLocationEnabled(context)) }
+
+    fun refreshStatus() {
+        isNetworkServiceOn = if (isSendMode) checkHotspotEnabled(context) else checkWifiEnabled(context)
+        isBluetoothOn = checkBluetoothEnabled(context)
+        isLocationOn = checkLocationEnabled(context)
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                refreshStatus()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            refreshStatus()
+            delay(500)
+        }
+    }
+
+    val allEnabled = isNetworkServiceOn && isBluetoothOn && isLocationOn
+
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.SettingsInputAntenna,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(28.dp)
+                )
+                Text(
+                    text = if (isSendMode) "Prepare to Send" else "Prepare to Receive",
+                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                    color = MinTextPrimary
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = if (isSendMode)
+                        "Enable the required services below before starting Send."
+                    else
+                        "Enable the required services below before starting Receive.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MinTextMuted
+                )
+
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        SetupRowItem(
+                            icon = if (isSendMode) Icons.Default.WifiTethering else Icons.Default.Wifi,
+                            title = if (isSendMode) "Hotspot" else "Wi-Fi",
+                            isEnabled = isNetworkServiceOn,
+                            onTurnOn = {
+                                if (isSendMode) openHotspotSettings(context) else openWifiSettings(context)
+                            }
+                        )
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+
+                        SetupRowItem(
+                            icon = Icons.Default.Bluetooth,
+                            title = "Bluetooth",
+                            isEnabled = isBluetoothOn,
+                            onTurnOn = { openBluetoothSettings(context) }
+                        )
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+
+                        SetupRowItem(
+                            icon = Icons.Default.LocationOn,
+                            title = "Location",
+                            isEnabled = isLocationOn,
+                            onTurnOn = { openLocationSettings(context) }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onContinue,
+                enabled = allEnabled,
+                modifier = Modifier.testTag("connection_setup_continue_btn"),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    disabledContainerColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f),
+                    disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text("Continue", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismissRequest,
+                modifier = Modifier.testTag("connection_setup_cancel_btn")
+            ) {
+                Text("Cancel", color = MinTextSubtle, fontWeight = FontWeight.Medium)
+            }
+        },
+        containerColor = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(24.dp)
+    )
+}
+
+@Composable
+private fun SetupRowItem(
+    icon: ImageVector,
+    title: String,
+    isEnabled: Boolean,
+    onTurnOn: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.weight(1f)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .background(
+                        color = if (isEnabled) AccentGreen.copy(alpha = 0.15f) else AccentRed.copy(alpha = 0.15f),
+                        shape = CircleShape
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = title,
+                    tint = if (isEnabled) AccentGreen else AccentRed,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            Column {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = MinTextPrimary
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .background(
+                                color = if (isEnabled) AccentGreen else AccentRed,
+                                shape = CircleShape
+                            )
+                    )
+                    Text(
+                        text = if (isEnabled) "Enabled" else "Disabled",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                        color = if (isEnabled) AccentGreen else AccentRed
+                    )
+                }
+            }
+        }
+
+        OutlinedButton(
+            onClick = onTurnOn,
+            modifier = Modifier
+                .height(36.dp)
+                .testTag("turn_on_${title.lowercase()}_btn"),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+            shape = RoundedCornerShape(10.dp)
+        ) {
+            Text(
+                text = if (isEnabled) "Open Settings" else "Turn On",
+                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+            )
+        }
+    }
+}
+
 // Home Screen Composable
 // -------------------------------------------------------------
 @Composable
@@ -388,8 +718,9 @@ fun HomeScreen(
     onExploreFiles: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
-    var showPrecheckDialogForSend by remember { mutableStateOf(false) }
-    var showPrecheckDialogForReceive by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var showConnectionSetupForSend by remember { mutableStateOf(false) }
+    var showConnectionSetupForReceive by remember { mutableStateOf(false) }
     var showNoNetworkDialog by remember { mutableStateOf(false) }
     var showMobileDataDialog by remember { mutableStateOf(false) }
     var pendingMode by remember { mutableStateOf<String?>(null) }
@@ -505,10 +836,13 @@ fun HomeScreen(
         ) {
             Button(
                 onClick = {
-                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
+                    val isHotspotOn = checkHotspotEnabled(context)
+                    val isBtOn = checkBluetoothEnabled(context)
+                    val isLocOn = checkLocationEnabled(context)
+                    if (isHotspotOn && isBtOn && isLocOn) {
                         onSendMode()
                     } else {
-                        showPrecheckDialogForSend = true
+                        showConnectionSetupForSend = true
                     }
                 },
                 modifier = Modifier
@@ -540,10 +874,13 @@ fun HomeScreen(
 
             Button(
                 onClick = {
-                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
+                    val isWifiOn = checkWifiEnabled(context)
+                    val isBtOn = checkBluetoothEnabled(context)
+                    val isLocOn = checkLocationEnabled(context)
+                    if (isWifiOn && isBtOn && isLocOn) {
                         onReceiveMode()
                     } else {
-                        showPrecheckDialogForReceive = true
+                        showConnectionSetupForReceive = true
                     }
                 },
                 modifier = Modifier
@@ -604,161 +941,25 @@ fun HomeScreen(
 
     }
 
-    if (showPrecheckDialogForSend) {
-        AlertDialog(
-            onDismissRequest = { showPrecheckDialogForSend = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Connection Check",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Enable Connections", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "For maximum speed and efficiency, let this phone create a local Wi-Fi network for the transfer.",
-                        color = MinTextMuted
-                    )
-                    Text(
-                        text = "1. Turn on Mobile Hotspot on this phone.\n2. Have the receiver connect to your Hotspot's Wi-Fi.\n3. Keep Bluetooth on so they can pair automatically.",
-                        color = MinTextMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Current IP: ${localDevice?.ip ?: "Unknown"}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(
-                                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) AccentGreen else AccentRed,
-                                    CircleShape
-                                )
-                        )
-                        Text(
-                            text = if (flipConnectionState != FlipConnectionState.DISCONNECTED) "Connections ready" else "Waiting for network & Bluetooth...",
-                            color = if (flipConnectionState != FlipConnectionState.DISCONNECTED) AccentGreen else MinTextMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showPrecheckDialogForSend = false
-                        if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
-                            onSendMode()
-                        } else {
-                            showNoNetworkDialog = true
-                        }
-                    }
-                ) {
-                    Text("My Hotspot is Active", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPrecheckDialogForSend = false }) {
-                    Text("Cancel", color = MinTextSubtle)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
+    if (showConnectionSetupForSend) {
+        ConnectionSetupDialog(
+            isSendMode = true,
+            onDismissRequest = { showConnectionSetupForSend = false },
+            onContinue = {
+                showConnectionSetupForSend = false
+                onSendMode()
+            }
         )
     }
 
-    if (showPrecheckDialogForReceive) {
-        AlertDialog(
-            onDismissRequest = { showPrecheckDialogForReceive = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Connection Check",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Enable Connections", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "Please connect this phone to the sender's local Wi-Fi or Mobile Hotspot before proceeding.",
-                        color = MinTextMuted
-                    )
-                    Text(
-                        text = "1. Turn on Wi-Fi on this phone.\n2. Connect to the sender's Mobile Hotspot network.\n3. Make sure Bluetooth is enabled.",
-                        color = MinTextMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Current IP: ${localDevice?.ip ?: "Unknown"}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(
-                                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) AccentGreen else AccentRed,
-                                    CircleShape
-                                )
-                        )
-                        Text(
-                            text = if (flipConnectionState != FlipConnectionState.DISCONNECTED) "Connections ready" else "Waiting for network & Bluetooth...",
-                            color = if (flipConnectionState != FlipConnectionState.DISCONNECTED) AccentGreen else MinTextMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showPrecheckDialogForReceive = false
-                        if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
-                            onReceiveMode()
-                        } else {
-                            showNoNetworkDialog = true
-                        }
-                    }
-                ) {
-                    Text("I'm Connected to Hotspot", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPrecheckDialogForReceive = false }) {
-                    Text("Cancel", color = MinTextSubtle)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
+    if (showConnectionSetupForReceive) {
+        ConnectionSetupDialog(
+            isSendMode = false,
+            onDismissRequest = { showConnectionSetupForReceive = false },
+            onContinue = {
+                showConnectionSetupForReceive = false
+                onReceiveMode()
+            }
         )
     }
 
@@ -803,11 +1004,37 @@ fun HomeScreen(
 @Composable
 fun SenderWaitingScreen(
     localDevice: Device?,
+    activeSessionId: String? = null,
     onUpdateIp: (String) -> Unit,
     onCancel: () -> Unit
 ) {
     val context = LocalContext.current
-    val pairingPayload = "flip://ip=${localDevice?.ip}&port=${localDevice?.port}&id=${localDevice?.id}&name=${localDevice?.name}"
+    val clipboardManager = LocalClipboardManager.current
+
+    val sessionId = remember(activeSessionId, localDevice?.id) {
+        activeSessionId ?: localDevice?.id ?: java.util.UUID.randomUUID().toString().take(12)
+    }
+
+    val hotspotSsid = remember {
+        com.example.service.WifiHotspotManager.simulatedSsid
+            ?: "FLIP_${localDevice?.id?.take(4)?.uppercase() ?: "WIFI"}"
+    }
+    val hotspotPassword = remember {
+        com.example.service.WifiHotspotManager.simulatedPassword
+            ?: "flip${localDevice?.id?.take(6) ?: "123456"}"
+    }
+
+    val pairingPayload = remember(localDevice, hotspotSsid, hotspotPassword, sessionId) {
+        com.example.service.QrSessionManager.generateQrUri(
+            sessionId = sessionId,
+            deviceName = localDevice?.name ?: "Android Device",
+            mode = "hotspot",
+            ssid = hotspotSsid,
+            pwd = hotspotPassword,
+            ip = localDevice?.ip ?: "192.168.43.1",
+            port = localDevice?.port ?: 8080
+        )
+    }
 
     // Generate local QR Code
     val qrBitmap = remember(pairingPayload) {
@@ -1144,15 +1371,220 @@ fun ReceiverScanningScreen(
     onManualConnect: (String, Int) -> Unit,
     onCancel: () -> Unit
 ) {
+    val context = LocalContext.current
     var manualCode by remember { mutableStateOf("") }
     var showScanOverlay by remember { mutableStateOf(false) }
 
+    var qrErrorDialogMessage by remember { mutableStateOf<String?>(null) }
+    var scannedPackageData by remember { mutableStateOf<QrConnectionPackage?>(null) }
+    var isJoiningWifi by remember { mutableStateOf(false) }
+
+    val wifiHotspotManager = remember(context) { WifiHotspotManager(context) }
     val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
+
+    fun processScannedQr(rawQr: String) {
+        if (!rawQr.startsWith("flip://")) return
+
+        val parseResult = QrSessionManager.parseAndValidateQrUri(rawQr)
+        when (parseResult) {
+            is QrParseResult.Error -> {
+                qrErrorDialogMessage = parseResult.message
+            }
+            is QrParseResult.Success -> {
+                scannedPackageData = parseResult.packageData
+            }
+        }
+    }
 
     LaunchedEffect(showScanOverlay) {
         if (showScanOverlay && !cameraPermissionState.status.isGranted) {
             cameraPermissionState.launchPermissionRequest()
         }
+    }
+
+    if (qrErrorDialogMessage != null) {
+        AlertDialog(
+            onDismissRequest = { qrErrorDialogMessage = null },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ErrorOutline,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error
+                    )
+                    Text("QR Code Invalid or Expired", fontWeight = FontWeight.Bold)
+                }
+            },
+            text = {
+                Text(
+                    text = qrErrorDialogMessage ?: "Invalid QR code",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        qrErrorDialogMessage = null
+                        manualCode = ""
+                    },
+                    modifier = Modifier.testTag("qr_error_dismiss_btn")
+                ) {
+                    Text("Scan Again")
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(20.dp)
+        )
+    }
+
+    if (scannedPackageData != null) {
+        val pkg = scannedPackageData!!
+        val clipboardManager = LocalClipboardManager.current
+
+        AlertDialog(
+            onDismissRequest = { scannedPackageData = null },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.WifiTethering,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Column {
+                        Text(
+                            text = "Connect to ${pkg.deviceName}",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                        Text(
+                            text = "QR Fallback Connection",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MinTextMuted
+                        )
+                    }
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "Flip decrypted complete session credentials from the QR code. Join the sender's hotspot to complete connection automatically.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MinTextMuted
+                    )
+
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (pkg.ssid.isNotBlank()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("Hotspot Name:", style = MaterialTheme.typography.labelMedium, color = MinTextMuted)
+                                    Text(pkg.ssid, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                }
+                            }
+
+                            if (pkg.password.isNotBlank()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("Password:", style = MaterialTheme.typography.labelMedium, color = MinTextMuted)
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(pkg.password, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                                        IconButton(
+                                            onClick = {
+                                                clipboardManager.setText(AnnotatedString(pkg.password))
+                                                Toast.makeText(context, "Password copied to clipboard", Toast.LENGTH_SHORT).show()
+                                            },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(Icons.Default.ContentCopy, contentDescription = "Copy Password", modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Server IP:", style = MaterialTheme.typography.labelMedium, color = MinTextMuted)
+                                Text("${pkg.ip}:${pkg.port}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
+                    if (isJoiningWifi) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text("Joining Wi-Fi and establishing connection...", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        isJoiningWifi = true
+                        wifiHotspotManager.joinWifi(pkg.ssid, pkg.password, pkg.ip, object : WifiHotspotManager.WifiJoinListener {
+                            override fun onJoined(ip: String) {
+                                isJoiningWifi = false
+                                scannedPackageData = null
+                                showScanOverlay = false
+                                onManualConnect(pkg.ip, pkg.port)
+                            }
+
+                            override fun onFailed(error: String) {
+                                isJoiningWifi = false
+                                scannedPackageData = null
+                                showScanOverlay = false
+                                onManualConnect(pkg.ip, pkg.port)
+                            }
+                        })
+                    },
+                    modifier = Modifier.testTag("join_hotspot_confirm_btn"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("Join & Connect", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        scannedPackageData = null
+                    }
+                ) {
+                    Text("Cancel", color = MinTextSubtle)
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(20.dp)
+        )
     }
 
     Column(
@@ -1244,14 +1676,7 @@ fun ReceiverScanningScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 onQrCodeScanned = { qrResult ->
                                     if (qrResult.startsWith("flip://")) {
-                                        try {
-                                            val ip = qrResult.substringAfter("ip=").substringBefore("&")
-                                            val port = qrResult.substringAfter("port=").substringBefore("&").toIntOrNull() ?: 8080
-                                            onManualConnect(ip, port)
-                                            showScanOverlay = false
-                                        } catch (e: Exception) {
-                                            // Ignore
-                                        }
+                                        processScannedQr(qrResult)
                                     }
                                 }
                             )
@@ -1295,15 +1720,8 @@ fun ReceiverScanningScreen(
                         value = manualCode,
                         onValueChange = { 
                             manualCode = it
-                            // Auto-extract URI connections
                             if (it.startsWith("flip://")) {
-                                try {
-                                    val ip = it.substringAfter("ip=").substringBefore("&")
-                                    val port = it.substringAfter("port=").substringBefore("&").toIntOrNull() ?: 8080
-                                    onManualConnect(ip, port)
-                                } catch (e: Exception) {
-                                    // Ignore
-                                }
+                                processScannedQr(it)
                             }
                         },
                         placeholder = { Text("Paste pairing URL (for testing)", color = Color.Gray) },
@@ -1710,6 +2128,35 @@ fun InAppFilePickerContent(
     // Multi-select state
     var selectedFiles by remember { mutableStateOf<Set<LocalFileItem>>(emptySet()) }
     var isSelectionMode by remember { mutableStateOf(false) }
+    var showDeleteConfirmationDialog by remember { mutableStateOf(false) }
+    var isDeletingFiles by remember { mutableStateOf(false) }
+
+    // Scanning status state
+    var isScanning by remember { mutableStateOf(false) }
+    var scanStatusText by remember { mutableStateOf("") }
+    var scanProgress by remember { mutableStateOf(0f) }
+    var refreshTrigger by remember { mutableStateOf(0) }
+    val scope = rememberCoroutineScope()
+
+    val deleteIntentSenderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            scope.launch(Dispatchers.IO) {
+                val db = com.example.database.AppDatabase.getDatabase(context)
+                val dao = db.indexedFileDao()
+                val uris = selectedFiles.map { it.uri.toString() }
+                val ids = selectedFiles.map { it.id }
+                dao.deleteByUris(uris)
+                dao.deleteByIds(ids)
+                withContext(Dispatchers.Main) {
+                    selectedFiles = emptySet()
+                    isSelectionMode = false
+                    refreshTrigger++
+                }
+            }
+        }
+    }
 
     // Proper back handler
     BackHandler(enabled = true) {
@@ -1752,6 +2199,7 @@ fun InAppFilePickerContent(
             selectedFiles = (selectedFiles + resolved).toSet()
         }
     }    
+
     // Required permission based on category
     val permissionsToRequest = remember {
         val list = mutableListOf<String>()
@@ -1769,13 +2217,6 @@ fun InAppFilePickerContent(
     val isPermissionGranted = remember(multiplePermissionsState.permissions) {
         multiplePermissionsState.permissions.any { it.status.isGranted }
     }
-    
-    // Scanning status state
-    var isScanning by remember { mutableStateOf(false) }
-    var scanStatusText by remember { mutableStateOf("") }
-    var scanProgress by remember { mutableStateOf(0f) }
-    var refreshTrigger by remember { mutableStateOf(0) }
-    val scope = rememberCoroutineScope()
 
     fun triggerScan() {
         scope.launch {
@@ -2102,18 +2543,28 @@ fun InAppFilePickerContent(
                     )
                 }
                 
-                if (selectedFiles.isNotEmpty()) {
-                    Button(
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    val selectableFiles = remember(filesList, searchQuery) {
+                        val filtered = if (searchQuery.isBlank()) filesList else filesList.filter { it.name.contains(searchQuery, ignoreCase = true) }
+                        filtered.filter { it.category != "Directory" }
+                    }
+                    val allSelected = selectableFiles.isNotEmpty() && selectedFiles.size >= selectableFiles.size
+                    TextButton(
                         onClick = {
-                            handleSendAction(selectedFiles.toList())
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                        modifier = Modifier.height(38.dp)
+                            if (allSelected) {
+                                selectedFiles = emptySet()
+                            } else {
+                                selectedFiles = selectableFiles.toSet()
+                            }
+                        }
                     ) {
-                        Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Send", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            text = if (allSelected) "Deselect All" else "Select All",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
+                        )
                     }
                 }
             }
@@ -2843,24 +3294,191 @@ fun InAppFilePickerContent(
         }
     }
         
-        // Actions Footer
-        if (selectedFiles.isNotEmpty()) {
-            Button(
-                onClick = {
-                    handleSendAction(selectedFiles.toList())
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                shape = RoundedCornerShape(16.dp)
+        // Modern File Manager Selection Bottom Toolbar (Open, Share, Delete, Send)
+        if (isSelectionMode || selectedFiles.isNotEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f)),
+                shadowElevation = 4.dp
             ) {
-                Text(
-                    text = "Send ${selectedFiles.size} Selected Files",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Open (if single item selected)
+                    val isSingle = selectedFiles.size == 1
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = isSingle) {
+                                if (isSingle) {
+                                    openLocalFile(context, selectedFiles.first())
+                                }
+                            }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Launch,
+                            contentDescription = "Open File",
+                            tint = if (isSingle) MaterialTheme.colorScheme.primary else MinTextMuted.copy(alpha = 0.4f),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Open",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = if (isSingle) MinTextPrimary else MinTextMuted.copy(alpha = 0.4f)
+                            )
+                        )
+                    }
+
+                    // Share
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = selectedFiles.isNotEmpty()) {
+                                if (selectedFiles.isNotEmpty()) {
+                                    shareLocalFiles(context, selectedFiles.toList())
+                                }
+                            }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Share Files",
+                            tint = if (selectedFiles.isNotEmpty()) MaterialTheme.colorScheme.primary else MinTextMuted.copy(alpha = 0.4f),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Share",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = if (selectedFiles.isNotEmpty()) MinTextPrimary else MinTextMuted.copy(alpha = 0.4f)
+                            )
+                        )
+                    }
+
+                    // Delete
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(enabled = selectedFiles.isNotEmpty()) {
+                                if (selectedFiles.isNotEmpty()) {
+                                    showDeleteConfirmationDialog = true
+                                }
+                            }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Delete Files",
+                            tint = if (selectedFiles.isNotEmpty()) MaterialTheme.colorScheme.error else MinTextMuted.copy(alpha = 0.4f),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Delete",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = if (selectedFiles.isNotEmpty()) MaterialTheme.colorScheme.error else MinTextMuted.copy(alpha = 0.4f)
+                            )
+                        )
+                    }
+
+                    // Send (Flip Transfer)
+                    Button(
+                        onClick = {
+                            if (selectedFiles.isNotEmpty()) {
+                                handleSendAction(selectedFiles.toList())
+                            }
+                        },
+                        enabled = selectedFiles.isNotEmpty(),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Send",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Send (${selectedFiles.size})",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
             }
         }
+    }
+
+    if (showDeleteConfirmationDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!isDeletingFiles) showDeleteConfirmationDialog = false },
+            title = {
+                Text(
+                    text = "Delete ${selectedFiles.size} File${if (selectedFiles.size > 1) "s" else ""}",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = MinTextPrimary
+                    )
+                )
+            },
+            text = {
+                Text(
+                    text = "Are you sure you want to permanently delete the selected file(s) from your device?",
+                    style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        scope.launch {
+                            isDeletingFiles = true
+                            val result = StorageService.deleteFiles(context, selectedFiles.toList())
+                            isDeletingFiles = false
+                            showDeleteConfirmationDialog = false
+                            if (result.intentSender != null) {
+                                try {
+                                    val intentSenderRequest = IntentSenderRequest.Builder(result.intentSender).build()
+                                    deleteIntentSenderLauncher.launch(intentSenderRequest)
+                                } catch (e: Exception) {
+                                    android.util.Log.e("FlipAppUi", "Failed to launch delete intent sender", e)
+                                }
+                            } else {
+                                selectedFiles = emptySet()
+                                isSelectionMode = false
+                                refreshTrigger++
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    if (isDeletingFiles) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.onError, strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                    }
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showDeleteConfirmationDialog = false },
+                    enabled = !isDeletingFiles
+                ) {
+                    Text("Cancel")
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.background
+        )
     }
 
     if (isExtracting) {
@@ -3536,6 +4154,47 @@ fun openLocalFile(context: Context, fileItem: LocalFileItem) {
         context.startActivity(intent)
     } catch (e: Exception) {
         Toast.makeText(context, "Cannot open file: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
+
+fun shareLocalFiles(context: Context, files: List<LocalFileItem>) {
+    if (files.isEmpty()) return
+    try {
+        val uris = ArrayList<Uri>()
+        for (file in files) {
+            val uriStr = file.uri.toString()
+            if (uriStr.startsWith("content://")) {
+                uris.add(file.uri)
+            } else {
+                val path = file.uri.path ?: uriStr.removePrefix("file://")
+                val f = java.io.File(path)
+                if (f.exists()) {
+                    val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                        context,
+                        "com.example.fileprovider",
+                        f
+                    )
+                    uris.add(contentUri)
+                }
+            }
+        }
+        if (uris.isEmpty()) return
+
+        val intent = if (uris.size == 1) {
+            Intent(Intent.ACTION_SEND).apply {
+                putExtra(Intent.EXTRA_STREAM, uris.first())
+                type = files.first().mimeType.ifEmpty { "*/*" }
+            }
+        } else {
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                type = "*/*"
+            }
+        }
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        context.startActivity(Intent.createChooser(intent, "Share files via"))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Cannot share files: ${e.message}", Toast.LENGTH_LONG).show()
     }
 }
 

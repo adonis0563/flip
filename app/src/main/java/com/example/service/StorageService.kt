@@ -529,4 +529,80 @@ object StorageService {
             Log.e("StorageService", "Failed to clean temp transfer files: ${e.message}")
         }
     }
+
+    data class DeleteResult(
+        val successCount: Int,
+        val failureCount: Int,
+        val intentSender: android.content.IntentSender? = null
+    )
+
+    suspend fun deleteFiles(context: Context, files: List<LocalFileItem>): DeleteResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        var successCount = 0
+        var failureCount = 0
+        val urisForDeleteRequest = mutableListOf<Uri>()
+        val db = com.example.database.AppDatabase.getDatabase(context)
+        val dao = db.indexedFileDao()
+
+        for (file in files) {
+            var deleted = false
+            val uri = file.uri
+            val uriStr = uri.toString()
+
+            try {
+                if (uriStr.startsWith("content://")) {
+                    try {
+                        val rows = context.contentResolver.delete(uri, null, null)
+                        if (rows > 0) {
+                            deleted = true
+                        } else {
+                            urisForDeleteRequest.add(uri)
+                        }
+                    } catch (securityEx: SecurityException) {
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
+                            securityEx is android.app.RecoverableSecurityException) {
+                            return@withContext DeleteResult(
+                                successCount = successCount,
+                                failureCount = failureCount,
+                                intentSender = securityEx.userAction.actionIntent.intentSender
+                            )
+                        } else {
+                            urisForDeleteRequest.add(uri)
+                        }
+                    }
+                } else if (uri.scheme == "file" || uriStr.startsWith("/")) {
+                    val pathStr = uri.path ?: file.uri.toString().removePrefix("file://")
+                    val f = File(pathStr)
+                    if (f.exists()) {
+                        deleted = f.delete()
+                    }
+                }
+
+                if (deleted) {
+                    successCount++
+                    dao.deleteByIds(listOf(file.id))
+                    dao.deleteByUriOrPath(uriStr, uri.path)
+                } else if (!urisForDeleteRequest.contains(uri)) {
+                    failureCount++
+                }
+            } catch (e: Exception) {
+                Log.e("StorageService", "Error deleting file $uriStr", e)
+                failureCount++
+            }
+        }
+
+        if (urisForDeleteRequest.isNotEmpty() && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            try {
+                val intentSender = MediaStore.createDeleteRequest(context.contentResolver, urisForDeleteRequest).intentSender
+                return@withContext DeleteResult(
+                    successCount = successCount,
+                    failureCount = failureCount,
+                    intentSender = intentSender
+                )
+            } catch (e: Exception) {
+                Log.e("StorageService", "Failed to create MediaStore delete request", e)
+            }
+        }
+
+        DeleteResult(successCount = successCount, failureCount = failureCount)
+    }
 }

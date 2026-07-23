@@ -4268,6 +4268,11 @@ fun SettingsScreen(
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
+
+    if (showDiagnosticsDialog) {
+        ConnectionDiagnosticsDialog(onDismiss = { showDiagnosticsDialog = false })
+    }
 
     Column(
         modifier = Modifier
@@ -4444,6 +4449,48 @@ fun SettingsScreen(
                 }
             }
 
+            // Section: Developer & Connection Diagnostics
+            item {
+                SettingsSectionHeader(title = "Developer & Diagnostics")
+                Spacer(modifier = Modifier.height(8.dp))
+                SettingsItemCard {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { showDiagnosticsDialog = true }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.BugReport,
+                                contentDescription = "Diagnostics",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Connection Diagnostics",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = MinTextPrimary
+                                )
+                                Text(
+                                    text = "Run end-to-end pipeline checks (Stages 1 - 10) & view report",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MinTextMuted
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ChevronRight,
+                                contentDescription = "Run Diagnostics",
+                                tint = MinTextMuted
+                            )
+                        }
+                    }
+                }
+            }
+
             // Section: About
             item {
                 SettingsSectionHeader(title = "About Flip")
@@ -4590,5 +4637,294 @@ fun FutureSettingRowInline(
                 .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
                 .padding(horizontal = 6.dp, vertical = 2.dp)
         )
+    }
+}
+
+// -------------------------------------------------------------
+// Connection Diagnostics UI Component
+// -------------------------------------------------------------
+@Composable
+fun ConnectionDiagnosticsDialog(
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+    val diagnosticsManager = remember { com.example.service.ConnectionDiagnosticsManager(context) }
+
+    val currentReport by diagnosticsManager.currentReport.collectAsState()
+    val isRunning by diagnosticsManager.isRunning.collectAsState()
+    val scope = rememberCoroutineScope()
+
+    var activeTab by remember { mutableStateOf(0) } // 0 = Stage Results, 1 = Raw Logs
+
+    LaunchedEffect(Unit) {
+        if (currentReport == null && !isRunning) {
+            diagnosticsManager.runEndToEndDiagnostics()
+        }
+    }
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .fillMaxHeight(0.88f)
+                .clip(RoundedCornerShape(24.dp)),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 8.dp
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(20.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.BugReport,
+                                contentDescription = "Diagnostics",
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = "Connection Diagnostics",
+                                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold),
+                                color = MinTextPrimary
+                            )
+                            Text(
+                                text = if (isRunning) "Running pipeline checks..." else "End-to-End Pipeline Verification",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MinTextMuted
+                            )
+                        }
+                    }
+
+                    IconButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.testTag("diag_close_button")
+                    ) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Close")
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Tab Switcher: Stage Results vs Raw Logs
+                TabRow(
+                    selectedTabIndex = activeTab,
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                ) {
+                    Tab(
+                        selected = activeTab == 0,
+                        onClick = { activeTab = 0 },
+                        text = { Text("Stage Results", fontWeight = FontWeight.Bold) }
+                    )
+                    Tab(
+                        selected = activeTab == 1,
+                        onClick = { activeTab = 1 },
+                        text = { Text("Raw Logs (${currentReport?.logs?.size ?: 0})", fontWeight = FontWeight.Bold) }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                if (isRunning) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(48.dp))
+                            Text(
+                                text = "Testing Stages 1 through 10...",
+                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                color = MinTextPrimary
+                            )
+                        }
+                    }
+                } else if (activeTab == 0) {
+                    val report = currentReport
+                    if (report != null) {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            items(report.stageResults) { stage ->
+                                DiagnosticStageCard(stage)
+                            }
+                        }
+                    } else {
+                        Box(
+                            modifier = Modifier.weight(1f),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("No report generated yet.")
+                        }
+                    }
+                } else {
+                    val logs = currentReport?.logs ?: emptyList()
+                    LazyColumn(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E1E1E), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(logs) { logLine ->
+                            val color = when {
+                                logLine.contains("✓") || logLine.contains("PASS") -> Color(0xFF4CAF50)
+                                logLine.contains("✗") || logLine.contains("FAIL") -> Color(0xFFF44336)
+                                logLine.contains("⚠") || logLine.contains("SKIPPED") -> Color(0xFFFF9800)
+                                logLine.contains("[BLE]") -> Color(0xFF2196F3)
+                                logLine.contains("[QR]") -> Color(0xFFE91E63)
+                                logLine.contains("[HOTSPOT]") -> Color(0xFF9C27B0)
+                                logLine.contains("[HANDSHAKE]") -> Color(0xFF00BCD4)
+                                else -> Color(0xFFE0E0E0)
+                            }
+                            Text(
+                                text = logLine,
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = color
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Bottom Action Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            currentReport?.let { report ->
+                                clipboardManager.setText(
+                                    androidx.compose.ui.text.AnnotatedString(report.formatFinalReport())
+                                )
+                                Toast.makeText(context, "Final report copied to clipboard!", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        enabled = currentReport != null && !isRunning,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("diag_copy_report_btn")
+                    ) {
+                        Icon(imageVector = Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Copy Report")
+                    }
+
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                diagnosticsManager.runEndToEndDiagnostics()
+                            }
+                        },
+                        enabled = !isRunning,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("diag_re_run_btn")
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Run Again")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DiagnosticStageCard(stage: com.example.service.DiagnosticStageResult) {
+    var isExpanded by remember { mutableStateOf(stage.status == com.example.service.DiagnosticStatus.FAIL) }
+
+    val (badgeBg, badgeFg, symbol) = when (stage.status) {
+        com.example.service.DiagnosticStatus.PASS -> Triple(Color(0xFFE8F5E9), Color(0xFF2E7D32), "✓ PASS")
+        com.example.service.DiagnosticStatus.FAIL -> Triple(Color(0xFFFFEBEE), Color(0xFFC62828), "✗ FAIL")
+        com.example.service.DiagnosticStatus.SKIPPED -> Triple(Color(0xFFFFF3E0), Color(0xFFEF6C00), "⚠ SKIPPED")
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { isExpanded = !isExpanded },
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Stage ${stage.stageNumber}: ${stage.stageName}",
+                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                    color = MinTextPrimary
+                )
+
+                Surface(
+                    color = badgeBg,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = symbol,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.ExtraBold),
+                        color = badgeFg,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = stage.summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = MinTextMuted
+            )
+
+            if (isExpanded && stage.details.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
+                Spacer(modifier = Modifier.height(8.dp))
+                stage.details.forEach { detail ->
+                    Text(
+                        text = "• $detail",
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MinTextSubtle,
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    )
+                }
+            }
+        }
     }
 }

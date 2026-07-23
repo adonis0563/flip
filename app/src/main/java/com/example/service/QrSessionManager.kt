@@ -93,8 +93,26 @@ object QrSessionManager {
     fun decryptPayload(encryptedToken: String?, sessionId: String?): String? {
         if (encryptedToken.isNullOrBlank() || sessionId.isNullOrBlank()) return null
         return try {
-            val combined = Base64.decode(encryptedToken, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-            if (combined.size <= 16) return null
+            val cleanToken = try {
+                URLDecoder.decode(encryptedToken, "UTF-8")
+            } catch (_: Exception) {
+                encryptedToken
+            }
+
+            val combined = try {
+                Base64.decode(cleanToken, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+            } catch (_: Exception) {
+                try {
+                    Base64.decode(cleanToken, Base64.DEFAULT)
+                } catch (_: Exception) {
+                    Base64.decode(encryptedToken, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                }
+            }
+
+            if (combined.size <= 16) {
+                Log.e(TAG, "[QR] Token payload size invalid (${combined.size} bytes <= 16)")
+                return null
+            }
 
             val iv = ByteArray(16)
             System.arraycopy(combined, 0, iv, 0, 16)
@@ -108,7 +126,7 @@ object QrSessionManager {
             val decryptedBytes = cipher.doFinal(ciphertext)
             String(decryptedBytes, StandardCharsets.UTF_8)
         } catch (e: Exception) {
-            Log.e(TAG, "Decryption error: ${e.message}")
+            Log.e(TAG, "[QR] Decryption error for sessionId=$sessionId: ${e.message}")
             null
         }
     }
@@ -152,8 +170,12 @@ object QrSessionManager {
      * Parses and validates a QR string
      */
     fun parseAndValidateQrUri(qrString: String): QrParseResult {
+        Log.d(TAG, "[QR_STAGE] QR scanned: $qrString")
+
         if (!qrString.startsWith("flip://")) {
-            return QrParseResult.Error("Invalid QR code: Format does not match Flip protocol.")
+            val err = "Invalid QR code: Format does not match Flip protocol."
+            Log.e(TAG, "[QR_STAGE] QR validation failed: $err")
+            return QrParseResult.Error(err)
         }
 
         val uriBody = qrString.substringAfter("flip://")
@@ -161,7 +183,9 @@ object QrSessionManager {
 
         val version = params["v"]?.toIntOrNull() ?: 1
         if (version > CURRENT_PROTOCOL_VERSION) {
-            return QrParseResult.Error("Unsupported protocol version (v$version). Please update the Flip app.")
+            val err = "Unsupported protocol version (v$version). Please update the Flip app."
+            Log.e(TAG, "[QR_STAGE] QR validation failed: $err")
+            return QrParseResult.Error(err)
         }
 
         val sessionId = params["id"] ?: ""
@@ -171,6 +195,8 @@ object QrSessionManager {
             val legacyPort = params["port"]?.toIntOrNull() ?: 8080
             if (legacyIp.isNotBlank()) {
                 val legacyName = params["name"] ?: "Sender Device"
+                Log.d(TAG, "[QR_STAGE] QR parsed (legacy direct format): ip=$legacyIp, port=$legacyPort")
+                Log.d(TAG, "[HANDSHAKE_STAGE] Connection information extracted: ip=$legacyIp, port=$legacyPort")
                 return QrParseResult.Success(
                     QrConnectionPackage(
                         version = 1,
@@ -186,13 +212,19 @@ object QrSessionManager {
                     )
                 )
             }
-            return QrParseResult.Error("Invalid QR code: Missing session ID.")
+            val err = "Invalid QR code: Missing session ID."
+            Log.e(TAG, "[QR_STAGE] QR validation failed: $err")
+            return QrParseResult.Error(err)
         }
 
         // Check if session has been invalidated or finished
         if (isSessionInvalidated(sessionId)) {
-            return QrParseResult.Error("This QR code is no longer valid or the session has finished.")
+            val err = "This QR code is no longer valid or the session has finished."
+            Log.e(TAG, "[QR_STAGE] QR validation failed: $err")
+            return QrParseResult.Error(err)
         }
+
+        Log.d(TAG, "[QR_STAGE] QR parsed successfully: sessionId=$sessionId, version=$version")
 
         val deviceName = try {
             URLDecoder.decode(params["name"] ?: "Sender Device", "UTF-8")
@@ -212,8 +244,11 @@ object QrSessionManager {
         if (!token.isNullOrBlank()) {
             val decryptedJson = decryptPayload(token, sessionId)
             if (decryptedJson == null) {
-                return QrParseResult.Error("Decryption failed. QR code may be corrupted or invalid.")
+                val err = "Decryption failed. QR code may be corrupted or invalid."
+                Log.e(TAG, "[QR_STAGE] Token decryption failed for sessionId=$sessionId")
+                return QrParseResult.Error(err)
             }
+            Log.d(TAG, "[QR_STAGE] Token decrypted successfully: $decryptedJson")
 
             try {
                 val json = JSONObject(decryptedJson)
@@ -224,7 +259,9 @@ object QrSessionManager {
                 ts = json.optLong("ts", 0L)
                 exp = json.optLong("exp", 0L)
             } catch (e: Exception) {
-                return QrParseResult.Error("Invalid encrypted payload structure.")
+                val err = "Invalid encrypted payload structure."
+                Log.e(TAG, "[QR_STAGE] Token JSON parse error: ${e.message}")
+                return QrParseResult.Error(err)
             }
         } else {
             // Unencrypted fallback check if token is missing
@@ -234,17 +271,24 @@ object QrSessionManager {
             port = params["port"]?.toIntOrNull() ?: 8080
             ts = params["ts"]?.toLongOrNull() ?: 0L
             exp = params["exp"]?.toLongOrNull() ?: 0L
+            Log.d(TAG, "[QR_STAGE] Token is missing, using unencrypted query fallback")
         }
 
         if (ip.isBlank()) {
-            return QrParseResult.Error("Invalid QR code: Missing target IP address.")
+            val err = "Invalid QR code: Missing target IP address."
+            Log.e(TAG, "[QR_STAGE] QR validation failed: $err")
+            return QrParseResult.Error(err)
         }
 
         // Expiration check
         val now = System.currentTimeMillis()
         if (exp > 0 && now > exp) {
-            return QrParseResult.Error("This QR code has expired. Please ask the sender to generate a fresh QR code.")
+            val err = "This QR code has expired. Please ask the sender to generate a fresh QR code."
+            Log.e(TAG, "[QR_STAGE] QR validation failed: $err")
+            return QrParseResult.Error(err)
         }
+
+        Log.d(TAG, "[HANDSHAKE_STAGE] Connection information extracted: ip=$ip, port=$port, ssid=$ssid, mode=$mode")
 
         return QrParseResult.Success(
             QrConnectionPackage(
@@ -264,13 +308,21 @@ object QrSessionManager {
 
     private fun parseQueryParams(queryString: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
-        val pairs = queryString.split("&")
+        val cleanQuery = queryString.substringAfter("?").trim()
+        val pairs = cleanQuery.split("&")
         for (pair in pairs) {
             val parts = pair.split("=", limit = 2)
             if (parts.size == 2) {
-                map[parts[0]] = parts[1]
+                val key = parts[0].removePrefix("?").trim()
+                val value = parts[1].trim()
+                if (key.isNotEmpty()) {
+                    map[key] = value
+                }
             } else if (parts.size == 1 && parts[0].isNotEmpty()) {
-                map[parts[0]] = ""
+                val key = parts[0].removePrefix("?").trim()
+                if (key.isNotEmpty()) {
+                    map[key] = ""
+                }
             }
         }
         return map

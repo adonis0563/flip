@@ -625,6 +625,75 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         }
     }
 
+    fun processScannedQr(qrUri: String) {
+        Log.d("FlipViewModel", "Processing scanned QR or flip:// deep link URI: $qrUri")
+        when (val parseResult = QrSessionManager.parseAndValidateQrUri(qrUri)) {
+            is QrParseResult.Error -> {
+                val err = parseResult.message
+                Log.e("FlipViewModel", "QR validation failed: $err")
+                showToast("QR Error: $err")
+            }
+            is QrParseResult.Success -> {
+                val pkg = parseResult.packageData
+                val sessionId = pkg.sessionId
+                val ssid = pkg.ssid
+                val pwd = pkg.password
+                val ip = pkg.ip
+                val port = pkg.port
+
+                Log.d("FlipViewModel", "Valid QR URI parsed: sessionId=$sessionId, IP=$ip, Port=$port, SSID=$ssid")
+
+                _role.value = "SENDER"
+                _connectionState.value = ConnectionState.CONNECTING
+                showToast("QR code recognized. Connecting to receiver...")
+
+                if (ssid.isNotEmpty() && pwd.isNotEmpty() && ip.isNotEmpty() && port > 0) {
+                    // Direct Wi-Fi hotspot auto-connect
+                    wifiHotspotManager.joinWifi(ssid, pwd, ip, object : WifiHotspotManager.WifiJoinListener {
+                        override fun onJoined(joinedIp: String) {
+                            val currentLocal = _localDevice.value ?: return
+                            viewModelScope.launch(Dispatchers.IO) {
+                                transferService.connectToDevice(
+                                    remoteIp = joinedIp,
+                                    remotePort = port,
+                                    localDevice = currentLocal,
+                                    onSuccess = { remote ->
+                                        bleService.stopScanning()
+                                        bleService.stopAdvertising()
+                                        viewModelScope.launch(Dispatchers.Main) {
+                                            _remoteDevice.value = remote
+                                            _connectionState.value = ConnectionState.CONNECTED
+                                            connectionStateManager.setPeerStatus(PeerConnectionStatus.READY)
+                                            showToast("Connected to ${remote.name} via QR!")
+                                            checkAndQueuePreSelected()
+                                        }
+                                    },
+                                    onError = { err ->
+                                        viewModelScope.launch(Dispatchers.Main) {
+                                            showToast("Connection failed: $err")
+                                            resetToHome()
+                                        }
+                                    }
+                                )
+                            }
+                        }
+
+                        override fun onFailed(error: String) {
+                            showToast("Wi-Fi join failed: $error")
+                            resetToHome()
+                        }
+                    })
+                } else if (ip.isNotEmpty() && port > 0) {
+                    // Direct IP connect
+                    connectManually(ip, port)
+                } else if (sessionId.isNotEmpty()) {
+                    // Fallback to BLE scanning for receiver with this session ID
+                    startSenderMode()
+                }
+            }
+        }
+    }
+
     fun importSharedFiles(uris: List<Uri>) {
         viewModelScope.launch(Dispatchers.Main) {
             val items = withContext(Dispatchers.IO) {

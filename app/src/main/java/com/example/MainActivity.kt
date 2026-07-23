@@ -127,10 +127,19 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIncomingIntent(intent: android.content.Intent?) {
         if (intent == null) return
+        Log.d("MainActivity", "Incoming intent.data: ${intent.data}")
         val action = intent.action
         val type = intent.type
+        val data = intent.data
 
-        if (android.content.Intent.ACTION_SEND == action && type != null) {
+        if (android.content.Intent.ACTION_VIEW == action && data != null) {
+            val uriString = data.toString()
+            Log.d("MainActivity", "Received ACTION_VIEW with intent.data=$data")
+            if (uriString.startsWith("flip://") || data.scheme == "flip") {
+                Log.d("MainActivity", "Processing flip:// deep link URI: $uriString")
+                viewModel.processScannedQr(uriString)
+            }
+        } else if (android.content.Intent.ACTION_SEND == action && type != null) {
             val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
             } else {

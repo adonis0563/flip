@@ -60,6 +60,13 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Deep linking for flip:// URIs -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="flip" />
+            </intent-filter>
             <!-- Share sheet integration -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />

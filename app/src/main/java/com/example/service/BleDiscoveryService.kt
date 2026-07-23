@@ -74,7 +74,11 @@ class BleDiscoveryService(
      * V2 RECEIVER: Start advertising session info and run GATT server
      */
     fun startAdvertising(protocolVersion: String, sessionId: String, deviceName: String, deviceType: String) {
-        Log.d(TAG, "startAdvertising: sessionId=$sessionId, deviceName=$deviceName")
+        Log.d(TAG, "[BLE_STAGE] Start advertising: protocolVersion=$protocolVersion, sessionId=$sessionId, deviceName=$deviceName, deviceType=$deviceType")
+        
+        // Stop any previous advertising session FIRST before registering new session
+        stopAdvertising()
+
         activeSessionId = sessionId
         sessionState = SessionState.UNCLAIMED
         activeClaimedGattDevice = null
@@ -100,8 +104,17 @@ class BleDiscoveryService(
             }
         )
         BleSimulationRegistry.registerReceiver(simulatedReceiver)
+        Log.d(TAG, "[BLE_STAGE] Registered receiver in simulation registry: sessionId=$sessionId")
 
-        // 2. Real Native BLE Advertising
+        // 2. Real Native BLE Advertising Permission & State Check
+        val missingPermissions = checkPermissions(isAdvertising = true)
+        if (missingPermissions.isNotEmpty()) {
+            val errMessage = "Denied required Bluetooth permission(s) before advertising: ${missingPermissions.joinToString(", ")}"
+            Log.e(TAG, "[BLE_PERMISSIONS] Cannot start advertising: $errMessage")
+            listener.onDiscoveryError("BLE Advertising Error: $errMessage")
+            return
+        }
+
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
             Log.w(TAG, "Bluetooth not enabled or supported. Running in BLE Simulation mode only.")
             return
@@ -113,7 +126,6 @@ class BleDiscoveryService(
             return
         }
 
-        stopAdvertising()
         startGattServer()
 
         val settings = AdvertiseSettings.Builder()
@@ -124,26 +136,32 @@ class BleDiscoveryService(
 
         val payload = encodePayloadV2(protocolVersion, sessionId, deviceName, deviceType)
 
-        val data = AdvertiseData.Builder()
-            .addManufacturerData(MANUFACTURER_ID, payload)
+        // Primary Advertisement Data: Service UUID + Service Data (fits in 28 bytes <= 31 byte legacy BLE limit)
+        val advertiseData = AdvertiseData.Builder()
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
+            .addServiceData(ParcelUuid(SERVICE_UUID), payload)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .build()
 
+        // Scan Response Data: Manufacturer payload
+        val scanResponseData = AdvertiseData.Builder()
+            .addManufacturerData(MANUFACTURER_ID, payload)
+            .build()
+
         advertiseCallback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                Log.d(TAG, "Native BLE V2 Advertisement started successfully")
+                Log.d(TAG, "[BLE_STAGE] Advertising started successfully (Native BLE)")
             }
 
             override fun onStartFailure(errorCode: Int) {
                 val msg = "Native BLE Adv failed: errorCode $errorCode"
-                Log.e(TAG, msg)
+                Log.e(TAG, "[BLE_STAGE] Advertising failed: $msg")
                 // We do not fail hard because the simulation registry is still active and works!
             }
         }
 
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        advertiser?.startAdvertising(settings, advertiseData, scanResponseData, advertiseCallback)
     }
 
     private var activePairingJsonCallback: ((String) -> Unit)? = null
@@ -214,7 +232,7 @@ class BleDiscoveryService(
      * V2 SENDER: Start scanning for active receivers
      */
     fun startScanning() {
-        Log.d(TAG, "startScanning")
+        Log.d(TAG, "[BLE_STAGE] Start scanning")
         
         // 1. Scan in Simulation Registry
         simScanListener = { simReceiver ->
@@ -227,11 +245,20 @@ class BleDiscoveryService(
                 port = 0,
                 deviceType = simReceiver.deviceType
             )
+            Log.d(TAG, "[BLE_STAGE] Device discovered: id=${device.id}, name=${device.name}")
             listener.onDeviceDiscovered(device)
         }
         BleSimulationRegistry.registerScanListener(simScanListener!!)
 
-        // 2. Native BLE Scanning
+        // 2. Native BLE Scanning Permission & State Check
+        val missingPermissions = checkPermissions(isAdvertising = false)
+        if (missingPermissions.isNotEmpty()) {
+            val errMessage = "Denied required Bluetooth permission(s) before scanning: ${missingPermissions.joinToString(", ")}"
+            Log.e(TAG, "[BLE_PERMISSIONS] Cannot start scanning: $errMessage")
+            listener.onDiscoveryError("BLE Scanning Error: $errMessage")
+            return
+        }
+
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
             Log.w(TAG, "Bluetooth not enabled or supported. Running in BLE Simulation scanning mode only.")
             return
@@ -264,12 +291,12 @@ class BleDiscoveryService(
 
             override fun onScanFailed(errorCode: Int) {
                 val msg = "Native BLE Scan failed: errorCode $errorCode"
-                Log.e(TAG, msg)
+                Log.e(TAG, "[BLE_STAGE] Scan failed: $msg")
             }
         }
 
         scanner?.startScan(listOf(filter), settings, scanCallback)
-        Log.d(TAG, "Native BLE Scanning started")
+        Log.d(TAG, "[BLE_STAGE] Native BLE Scanning started")
     }
 
     fun stopScanning() {
@@ -291,20 +318,89 @@ class BleDiscoveryService(
     }
 
     private fun handleScanResult(result: ScanResult) {
-        val record = result.scanRecord ?: return
-        val manufacturerData = record.getManufacturerSpecificData(MANUFACTURER_ID) ?: return
-        
-        val device = decodePayloadV2(manufacturerData, result.device.address)
-        if (device != null) {
-            listener.onDeviceDiscovered(device)
+        val devAddr = result.device?.address ?: "UNKNOWN_ADDR"
+        val devName = result.device?.name ?: result.scanRecord?.deviceName ?: "UNKNOWN_NAME"
+        Log.d(TAG, "[BLE] ScanResult received: device=$devAddr ($devName), rssi=${result.rssi}")
+
+        val record = result.scanRecord
+        if (record == null) {
+            Log.d(TAG, "[BLE] ScanResult REJECTED for $devAddr: scanRecord is null")
+            return
         }
+
+        // Try Service Data first (primary advertisement), then Manufacturer Data (scan response)
+        var payloadBytes = record.getServiceData(ParcelUuid(SERVICE_UUID))
+        if (payloadBytes == null) {
+            payloadBytes = record.getManufacturerSpecificData(MANUFACTURER_ID)
+        }
+
+        if (payloadBytes == null) {
+            val uuids = record.serviceUuids
+            if (uuids != null && uuids.contains(ParcelUuid(SERVICE_UUID))) {
+                Log.d(TAG, "[BLE] Advertisement with SERVICE_UUID detected without payload, registering: $devName ($devAddr)")
+                val device = Device(
+                    id = devAddr,
+                    name = devName,
+                    ip = "0.0.0.0",
+                    port = 0,
+                    deviceType = "phone"
+                )
+                listener.onDeviceDiscovered(device)
+                return
+            }
+            Log.d(TAG, "[BLE] ScanResult REJECTED for $devAddr: missing service/manufacturer payload for SERVICE_UUID. Present UUIDs: ${record.serviceUuids}")
+            return
+        }
+        
+        val device = decodePayloadV2(payloadBytes, devAddr)
+        if (device != null) {
+            Log.d(TAG, "[BLE] Device discovered & accepted: id=${device.id}, name=${device.name}")
+            listener.onDeviceDiscovered(device)
+        } else {
+            Log.w(TAG, "[BLE] ScanResult REJECTED for $devAddr: failed to decode V2 payload bytes (len=${payloadBytes.size})")
+        }
+    }
+
+    private fun checkPermissions(isAdvertising: Boolean): List<String> {
+        val missing = mutableListOf<String>()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val scanGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_SCAN) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val connectGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_CONNECT) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val advertiseGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_ADVERTISE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+            Log.d(TAG, "[BLE_PERMISSIONS] Android 12+ Permission Check Before Operation (isAdvertising=$isAdvertising):")
+            Log.d(TAG, "  BLUETOOTH_SCAN: $scanGranted")
+            Log.d(TAG, "  BLUETOOTH_CONNECT: $connectGranted")
+            Log.d(TAG, "  BLUETOOTH_ADVERTISE: $advertiseGranted")
+
+            if (isAdvertising && !advertiseGranted) {
+                missing.add(android.Manifest.permission.BLUETOOTH_ADVERTISE)
+            }
+            if (!isAdvertising && !scanGranted) {
+                missing.add(android.Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (!connectGranted) {
+                missing.add(android.Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        } else {
+            val fineGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val coarseGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val locGranted = fineGranted || coarseGranted
+
+            Log.d(TAG, "[BLE_PERMISSIONS] Android <12 Location Permission Check: $locGranted")
+
+            if (!locGranted) {
+                missing.add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+        return missing
     }
 
     /**
      * V2 SENDER: Establish GATT Connection to claim session and receive pairing data
      */
     fun connectToGatt(targetDevice: Device) {
-        Log.d(TAG, "connectToGatt targetDevice=${targetDevice.id}")
+        Log.d(TAG, "[BLE_STAGE] Handshake started (GATT connect to target device=${targetDevice.id})")
 
         // 1. Simulation GATT Connection Handshake
         if (targetDevice.id.startsWith("SIM_")) {
@@ -321,14 +417,18 @@ class BleDiscoveryService(
                     }
                 }.start()
             } else {
-                listener.onDiscoveryError("Simulated session no longer active")
+                val err = "Simulated session no longer active"
+                Log.e(TAG, "[BLE_STAGE] Handshake failed: $err")
+                listener.onDiscoveryError(err)
             }
             return
         }
 
         // 2. Real Native GATT Connection Handshake
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            listener.onDiscoveryError("Bluetooth not available for GATT connection")
+            val err = "Bluetooth not available for GATT connection"
+            Log.e(TAG, "[BLE_STAGE] Handshake failed: $err")
+            listener.onDiscoveryError(err)
             return
         }
 

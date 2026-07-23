@@ -96,17 +96,23 @@ object TransferManager {
     }
 
     fun addFileToTransferQueue(context: Context, uri: Uri, fileName: String, fileSize: Long) {
-        val transferId = UUID.randomUUID().toString()
-        val newItem = TransferItem(
-            id = transferId,
-            fileName = fileName,
-            fileUri = uri.toString(),
-            fileSize = fileSize,
-            status = TransferStatus.QUEUED,
-            isIncoming = false
-        )
-
         synchronized(this) {
+            val existing = _transferQueue.value.find { 
+                it.fileUri == uri.toString() && (it.status == TransferStatus.QUEUED || it.status == TransferStatus.SENDING)
+            }
+            if (existing != null) {
+                Log.d(TAG, "File $fileName already in transfer queue (${existing.status})")
+                return
+            }
+            val transferId = UUID.randomUUID().toString()
+            val newItem = TransferItem(
+                id = transferId,
+                fileName = fileName,
+                fileUri = uri.toString(),
+                fileSize = fileSize,
+                status = TransferStatus.QUEUED,
+                isIncoming = false
+            )
             _transferQueue.value = _transferQueue.value + newItem
         }
         saveState(context)

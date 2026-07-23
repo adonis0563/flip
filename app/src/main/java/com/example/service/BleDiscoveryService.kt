@@ -32,6 +32,12 @@ class BleDiscoveryService(
     private var activeSessionId: String? = null
     private var sessionState = SessionState.UNCLAIMED
     private var activePairingJson: String? = null
+    @Volatile
+    private var isCccdSubscribed = false
+    @Volatile
+    private var pendingPairingJson: String? = null
+    @Volatile
+    private var negotiatedMtu = 23
 
     // GATT Client (Sender role)
     private var bluetoothGatt: BluetoothGatt? = null
@@ -60,6 +66,7 @@ class BleDiscoveryService(
         private const val MANUFACTURER_ID = 0xFFFF
         val SERVICE_UUID = UUID.fromString("0000f119-0000-1000-8000-00805f9b34fb")
         val CHARACTERISTIC_UUID = UUID.fromString("0000f120-0000-1000-8000-00805f9b34fb")
+        val CCCD_DESCRIPTOR_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
     fun isBluetoothSupported(): Boolean {
@@ -83,6 +90,9 @@ class BleDiscoveryService(
         sessionState = SessionState.UNCLAIMED
         activeClaimedGattDevice = null
         activePairingJson = null
+        isCccdSubscribed = false
+        pendingPairingJson = null
+        negotiatedMtu = 23
 
         // 1. Register in Simulation Registry (so we always have a working demo fallback)
         val simulatedReceiver = SimulatedReceiver(
@@ -176,6 +186,18 @@ class BleDiscoveryService(
         activePairingJsonCallback = null
 
         // Trigger real native GATT notification/write
+        synchronized(this) {
+            if (isCccdSubscribed) {
+                Log.d(TAG, "GATT Server: Client already subscribed to CCCD notifications. Sending pairing data immediately.")
+                performPairingDataTransmission(pairingJson)
+            } else {
+                Log.d(TAG, "GATT Server: Client not yet subscribed to CCCD notifications. Buffering pairing data until CCCD descriptor write is acknowledged.")
+                pendingPairingJson = pairingJson
+            }
+        }
+    }
+
+    private fun performPairingDataTransmission(pairingJson: String) {
         val server = bluetoothGattServer ?: return
         val activeDevice = activeClaimedGattDevice ?: return
         val service = server.getService(SERVICE_UUID) ?: return
@@ -183,17 +205,17 @@ class BleDiscoveryService(
 
         // Send pairing data fragmented over GATT
         val payloadBytes = pairingJson.toByteArray(StandardCharsets.UTF_8)
-        val mtu = 20 // Default fallback MTU chunk size
+        val mtuChunkSize = (negotiatedMtu - 5).coerceIn(20, 500)
         
         Thread {
             try {
                 var offset = 0
                 val totalLength = payloadBytes.size
                 var chunkIndex = 0
-                val totalChunks = ((totalLength + mtu - 1) / mtu).coerceAtLeast(1)
+                val totalChunks = ((totalLength + mtuChunkSize - 1) / mtuChunkSize).coerceAtLeast(1)
 
                 while (offset < totalLength) {
-                    val size = (totalLength - offset).coerceAtLeast(0).coerceAtMost(mtu)
+                    val size = (totalLength - offset).coerceAtLeast(0).coerceAtMost(mtuChunkSize)
                     val chunk = ByteArray(2 + size)
                     chunk[0] = chunkIndex.toByte()
                     chunk[1] = totalChunks.toByte()
@@ -204,9 +226,9 @@ class BleDiscoveryService(
                     
                     offset += size
                     chunkIndex++
-                    Thread.sleep(50) // Tiny delay between chunks
+                    Thread.sleep(40) // Small delay between notification chunks to avoid buffer overflow
                 }
-                Log.d(TAG, "Finished native BLE GATT pairing data transfer ($totalChunks chunks)")
+                Log.d(TAG, "Finished native BLE GATT pairing data transfer ($totalChunks chunks using MTU chunk size $mtuChunkSize)")
             } catch (e: Exception) {
                 Log.e(TAG, "Error writing native GATT pairing data chunks", e)
             }
@@ -465,23 +487,39 @@ class BleDiscoveryService(
 
                 override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
                     super.onMtuChanged(gatt, mtu, status)
-                    Log.d(TAG, "Native GATT MTU size negotiated: $mtu")
+                    Log.d(TAG, "Native GATT MTU size negotiated: $mtu (status=$status)")
                     
                     // Register notifications for pairing data
                     val service = gatt?.getService(SERVICE_UUID)
                     val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
                     if (characteristic != null) {
-                        gatt.setCharacteristicNotification(characteristic, true)
+                        val notificationSet = gatt.setCharacteristicNotification(characteristic, true)
+                        Log.d(TAG, "setCharacteristicNotification result: $notificationSet")
                         
                         // Enable local descriptor CCCD notifications
-                        val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+                        val descriptor = characteristic.getDescriptor(CCCD_DESCRIPTOR_UUID)
                         if (descriptor != null) {
                             descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            gatt.writeDescriptor(descriptor)
+                            val writeInitiated = gatt.writeDescriptor(descriptor)
+                            Log.d(TAG, "Subscribed to Pairing Data characteristic notifications via writeDescriptor: $writeInitiated")
+                        } else {
+                            Log.e(TAG, "CCCD descriptor not found on characteristic")
+                            listener.onDiscoveryError("CCCD descriptor not found on target characteristic")
                         }
-                        Log.d(TAG, "Subscribed to Pairing Data characteristic notifications")
                     } else {
                         listener.onDiscoveryError("Pairing characteristic not found on target device")
+                    }
+                }
+
+                override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
+                    super.onDescriptorWrite(gatt, descriptor, status)
+                    if (descriptor?.uuid == CCCD_DESCRIPTOR_UUID) {
+                        if (status == BluetoothGatt.GATT_SUCCESS) {
+                            Log.d(TAG, "GATT Client: CCCD descriptor write acknowledged by server. Notification subscription active.")
+                        } else {
+                            Log.e(TAG, "GATT Client: CCCD descriptor write failed with status $status")
+                            listener.onDiscoveryError("Failed to subscribe to pairing data notifications (status $status)")
+                        }
                     }
                 }
 
@@ -539,7 +577,7 @@ class BleDiscoveryService(
                         Log.d(TAG, "GATT Server: Client connected: ${device.address}")
                         
                         // First-Connect Wins Claim Policy
-                        synchronized(this) {
+                        synchronized(this@BleDiscoveryService) {
                             if (sessionState != SessionState.UNCLAIMED) {
                                 Log.w(TAG, "Rejecting extra client ${device.address} since session is already claimed")
                                 bluetoothGattServer?.cancelConnection(device)
@@ -551,8 +589,18 @@ class BleDiscoveryService(
                             connectedGattDevices.add(device)
                         }
 
-                        // Stop BLE Advertising immediately
-                        stopAdvertising()
+                        // Stop BLE Advertising immediately without destroying GATT server
+                        BleSimulationRegistry.unregisterReceiver(activeSessionId ?: "")
+                        try {
+                            if (advertiser != null && advertiseCallback != null) {
+                                advertiser?.stopAdvertising(advertiseCallback)
+                                Log.d(TAG, "BLE Advertisement stopped on first connect")
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error stopping advertiser: ${e.message}")
+                        } finally {
+                            advertiseCallback = null
+                        }
 
                         Handler(Looper.getMainLooper()).post {
                             activeSessionId?.let { listener.onSessionClaimed(it) }
@@ -563,18 +611,70 @@ class BleDiscoveryService(
                         if (device == activeClaimedGattDevice) {
                             activeClaimedGattDevice = null
                             sessionState = SessionState.UNCLAIMED
+                            isCccdSubscribed = false
                         }
+                    }
+                }
+
+                override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
+                    super.onMtuChanged(device, mtu)
+                    Log.d(TAG, "GATT Server: MTU negotiated to $mtu for device ${device?.address}")
+                    negotiatedMtu = mtu
+                }
+
+                override fun onDescriptorWriteRequest(
+                    device: BluetoothDevice?,
+                    requestId: Int,
+                    descriptor: BluetoothGattDescriptor?,
+                    preparedWrite: Boolean,
+                    responseNeeded: Boolean,
+                    offset: Int,
+                    value: ByteArray?
+                ) {
+                    super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
+                    val isCccd = descriptor?.uuid == CCCD_DESCRIPTOR_UUID
+                    if (isCccd) {
+                        val enableNotifications = value != null && value.isNotEmpty() && (value[0].toInt() != 0)
+                        Log.d(TAG, "GATT Server: CCCD Descriptor write request from ${device?.address}, enableNotifications=$enableNotifications")
+                        
+                        if (responseNeeded) {
+                            bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                        }
+                        
+                        if (enableNotifications) {
+                            var pendingToTransmit: String? = null
+                            synchronized(this@BleDiscoveryService) {
+                                isCccdSubscribed = true
+                                pendingToTransmit = pendingPairingJson
+                                pendingPairingJson = null
+                            }
+                            
+                            if (pendingToTransmit != null) {
+                                Log.d(TAG, "GATT Server: CCCD subscription acknowledged. Transmitting buffered pairing data now.")
+                                performPairingDataTransmission(pendingToTransmit!!)
+                            }
+                        }
+                        return
+                    }
+
+                    if (responseNeeded) {
+                        bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                     }
                 }
             })
 
-            // Add Pairing service & characteristic
+            // Add Pairing service & characteristic with CCCD descriptor
             val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
             val characteristic = BluetoothGattCharacteristic(
                 CHARACTERISTIC_UUID,
                 BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
                 BluetoothGattCharacteristic.PERMISSION_READ
             )
+            val cccdDescriptor = BluetoothGattDescriptor(
+                CCCD_DESCRIPTOR_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+            )
+            characteristic.addDescriptor(cccdDescriptor)
             service.addCharacteristic(characteristic)
             bluetoothGattServer?.addService(service)
             Log.d(TAG, "Native BLE GATT Server hosted successfully")
@@ -594,6 +694,9 @@ class BleDiscoveryService(
             bluetoothGattServer = null
             connectedGattDevices.clear()
             activeClaimedGattDevice = null
+            isCccdSubscribed = false
+            pendingPairingJson = null
+            negotiatedMtu = 23
         }
     }
 

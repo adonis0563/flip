@@ -299,11 +299,9 @@ class HttpServerService(private val context: android.content.Context, private va
                 bytesWritten += bytesRead
                 remaining -= bytesRead
 
-                // Write offset marker to disk progressively
-                offsetFile.writeText(bytesWritten.toString())
-
                 val now = System.currentTimeMillis()
-                if (now - lastProgressUpdate > 150) { // Throttle updates to ~150ms for performance
+                if (now - lastProgressUpdate > 150) { // Throttle updates and offset file writes
+                    offsetFile.writeText(bytesWritten.toString())
                     listener.onFileTransferProgress(transferId, bytesWritten)
                     lastProgressUpdate = now
                 }

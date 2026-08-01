@@ -299,18 +299,23 @@ fun SplashScreen(onGetStarted: () -> Unit) {
         // Large display app logo with Material 3 depth
         Surface(
             modifier = Modifier
-                .size(160.dp)
+                .size(140.dp)
                 .clip(RoundedCornerShape(32.dp)),
             color = MaterialTheme.colorScheme.surfaceVariant,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
             tonalElevation = 2.dp
         ) {
-            Image(
-                painter = painterResource(id = R.drawable.flip_logo),
-                contentDescription = "Flip Logo",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    painter = painterResource(id = R.drawable.flip_logo),
+                    contentDescription = "Flip Logo",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(80.dp)
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -406,7 +411,7 @@ fun checkHotspotEnabled(context: Context): Boolean {
         val state = method.invoke(wifiManager) as? Int
         if (state == 13 || state == 12) return true
     } catch (_: Exception) {}
-    if (com.example.service.WifiHotspotManager.simulatedSsid != null) return true
+    if (com.example.service.WifiHotspotManager.activeHotspotSsid != null) return true
     return false
 }
 
@@ -1015,30 +1020,29 @@ fun SenderWaitingScreen(
         activeSessionId ?: localDevice?.id ?: java.util.UUID.randomUUID().toString().take(12)
     }
 
-    val hotspotSsid = remember {
-        com.example.service.WifiHotspotManager.simulatedSsid
-            ?: "FLIP_${localDevice?.id?.take(4)?.uppercase() ?: "WIFI"}"
-    }
-    val hotspotPassword = remember {
-        com.example.service.WifiHotspotManager.simulatedPassword
-            ?: "flip${localDevice?.id?.take(6) ?: "123456"}"
-    }
+    val hotspotSsid = com.example.service.WifiHotspotManager.activeHotspotSsid ?: ""
+    val hotspotPassword = com.example.service.WifiHotspotManager.activeHotspotPassword ?: ""
+    val hostIp = localDevice?.ip?.takeIf { it.isNotBlank() && it != "127.0.0.1" } ?: ""
 
-    val pairingPayload = remember(localDevice, hotspotSsid, hotspotPassword, sessionId) {
-        com.example.service.QrSessionManager.generateQrUri(
-            sessionId = sessionId,
-            deviceName = localDevice?.name ?: "Android Device",
-            mode = "hotspot",
-            ssid = hotspotSsid,
-            pwd = hotspotPassword,
-            ip = localDevice?.ip ?: "192.168.43.1",
-            port = localDevice?.port ?: 8080
-        )
+    val pairingPayload = remember(localDevice, hotspotSsid, hotspotPassword, hostIp, sessionId) {
+        if (hotspotSsid.isNotBlank() && hotspotPassword.isNotBlank() && hostIp.isNotBlank()) {
+            com.example.service.QrSessionManager.generateQrUri(
+                sessionId = sessionId,
+                deviceName = localDevice?.name ?: "Android Device",
+                mode = "hotspot",
+                ssid = hotspotSsid,
+                pwd = hotspotPassword,
+                ip = hostIp,
+                port = localDevice?.port ?: 8080
+            )
+        } else ""
     }
 
     // Generate local QR Code
     val qrBitmap = remember(pairingPayload) {
-        QrCodeGenerator.generateQrCode(pairingPayload)
+        if (pairingPayload.isNotBlank()) {
+            QrCodeGenerator.generateQrCode(pairingPayload)
+        } else null
     }
 
     // Connect code: last segment of IP + port

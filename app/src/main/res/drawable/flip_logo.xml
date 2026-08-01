@@ -2,31 +2,20 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
-    android:viewportWidth="100"
-    android:viewportHeight="100">
-
-    <!-- Dark minimalist background circle to hold the design together on launcher -->
+    android:viewportWidth="108"
+    android:viewportHeight="108">
     <path
-        android:fillColor="#111111"
-        android:pathData="M 50,50 m -45,0 a 45,45 0 1,1 90,0 a 45,45 0 1,1 -90,0" />
-
-    <!-- Left half of the split-diamond (white/silver) representing send/receive state -->
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="8.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 30,42 L 72,42 M 56,26 L 72,42 L 56,58" />
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M 47,24 L 21,50 L 47,76 Z" />
-
-    <!-- Right half of the split-diamond (muted gray/outline) representing opposing state -->
-    <path
-        android:fillColor="#888888"
-        android:pathData="M 53,24 L 79,50 L 53,76 Z" />
-
-    <!-- Inset inverse indicators -->
-    <path
-        android:fillColor="#111111"
-        android:pathData="M 39,50 m -4,0 a 4,4 0 1,1 8,0 a 4,4 0 1,1 -8,0" />
-
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M 61,50 m -4,0 a 4,4 0 1,1 8,0 a 4,4 0 1,1 -8,0" />
-
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="8.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 78,66 L 36,66 M 52,50 L 36,66 L 52,82" />
 </vector>

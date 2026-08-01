@@ -233,8 +233,12 @@ object TransferManager {
             } else {
                 context.startService(intent)
             }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException starting TransferForegroundService: ${e.message}")
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "IllegalStateException/ForegroundServiceStartNotAllowedException starting service: ${e.message}")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to trigger TransferForegroundService", e)
+            Log.e(TAG, "Failed to trigger TransferForegroundService: ${e.message}", e)
         }
     }
 

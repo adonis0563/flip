@@ -430,12 +430,20 @@ class BleDiscoveryService(
             val simReceiver = BleSimulationRegistry.activeAdvertisements[sessionId]
             if (simReceiver != null) {
                 Thread {
-                    Thread.sleep(800) // Simulate connection delay
-                    simReceiver.onGattConnect { json ->
-                        // Simulate receiving the pairing data back
-                        Handler(Looper.getMainLooper()).post {
-                            listener.onPairingDataReceived(json)
+                    try {
+                        Thread.sleep(800) // Simulate connection delay
+                        simReceiver.onGattConnect { json ->
+                            // Simulate receiving the pairing data back
+                            Handler(Looper.getMainLooper()).post {
+                                try {
+                                    listener.onPairingDataReceived(json)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Error in onPairingDataReceived: ${e.message}", e)
+                                }
+                            }
                         }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Uncaught exception in SIM BLE thread: ${e.message}", e)
                     }
                 }.start()
             } else {

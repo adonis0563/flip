@@ -56,14 +56,18 @@ class MainActivity : ComponentActivity() {
         val permissions = mutableListOf(
             Manifest.permission.CAMERA,
             Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.CHANGE_WIFI_STATE,
+            Manifest.permission.ACCESS_WIFI_STATE
         )
 
-        // Storage permissions branching by Android API version
+        // Storage & Wi-Fi & Notification permissions branching by Android API version
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
             permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         } else {
             permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
             permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -127,38 +131,42 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIncomingIntent(intent: android.content.Intent?) {
         if (intent == null) return
-        Log.d("MainActivity", "Incoming intent.data: ${intent.data}")
-        val action = intent.action
-        val type = intent.type
-        val data = intent.data
+        try {
+            Log.d("MainActivity", "Incoming intent.data: ${intent.data}")
+            val action = intent.action
+            val type = intent.type
+            val data = intent.data
 
-        if (android.content.Intent.ACTION_VIEW == action && data != null) {
-            val uriString = data.toString()
-            Log.d("MainActivity", "Received ACTION_VIEW with intent.data=$data")
-            if (uriString.startsWith("flip://") || data.scheme == "flip") {
-                Log.d("MainActivity", "Processing flip:// deep link URI: $uriString")
-                viewModel.processScannedQr(uriString)
+            if (android.content.Intent.ACTION_VIEW == action && data != null) {
+                val uriString = data.toString()
+                Log.d("MainActivity", "Received ACTION_VIEW with intent.data=$data")
+                if (uriString.startsWith("flip://") || data.scheme == "flip") {
+                    Log.d("MainActivity", "Processing flip:// deep link URI: $uriString")
+                    viewModel.processScannedQr(uriString)
+                }
+            } else if (android.content.Intent.ACTION_SEND == action && type != null) {
+                val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+                }
+                streamUri?.let { uri ->
+                    viewModel.importSharedFiles(listOf(uri))
+                }
+            } else if (android.content.Intent.ACTION_SEND_MULTIPLE == action && type != null) {
+                val streamUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM)
+                }
+                streamUris?.let { uris ->
+                    viewModel.importSharedFiles(uris.filterNotNull())
+                }
             }
-        } else if (android.content.Intent.ACTION_SEND == action && type != null) {
-            val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
-            }
-            streamUri?.let { uri ->
-                viewModel.importSharedFiles(listOf(uri))
-            }
-        } else if (android.content.Intent.ACTION_SEND_MULTIPLE == action && type != null) {
-            val streamUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM)
-            }
-            streamUris?.let { uris ->
-                viewModel.importSharedFiles(uris.filterNotNull())
-            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error handling incoming intent: ${e.message}", e)
         }
     }
 }

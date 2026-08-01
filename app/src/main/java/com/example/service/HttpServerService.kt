@@ -27,6 +27,18 @@ class HttpServerService(private val context: android.content.Context, private va
     @Volatile
     private var isRunning = false
 
+    @Volatile
+    private var expectedSessionId: String? = null
+
+    fun setExpectedSessionId(sessionId: String?) {
+        expectedSessionId = sessionId
+    }
+
+    fun isListening(): Boolean {
+        val socket = serverSocket
+        return isRunning && socket != null && socket.isBound && !socket.isClosed
+    }
+
     interface ServerListener {
         fun onDeviceConnected(device: Device)
         fun onDeviceDisconnected()

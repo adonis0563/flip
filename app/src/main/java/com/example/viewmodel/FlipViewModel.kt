@@ -179,25 +179,69 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     /**
      * SENDER: Tap "Send" role initiation
+     * The Sender creates the temporary LocalOnlyHotspot, starts the HTTP server, and displays QR.
      */
     fun startSenderMode() {
         _role.value = "SENDER"
         _connectionState.value = ConnectionState.SEARCHING
         _discoveredDevices.value = emptyList()
         TransferManager.clearQueue(context)
-        
-        createNewTransferSession()
 
         connectionStateManager.updateNetworkStatus()
         connectionStateManager.setHasDiscoveredDevices(false)
         connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
 
-        // Senders scan for Receiver advertisements in V2
-        bleService.startScanning()
+        val sessionId = createNewTransferSession()
+
+        // 1. SENDER creates real LocalOnlyHotspot
+        showToast("Starting Sender Local Hotspot...")
+        wifiHotspotManager.startHotspot(object : WifiHotspotManager.HotspotListener {
+            override fun onHotspotStarted(ssid: String, psw: String, ip: String) {
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        // 2. Bind & Start HTTP Server on active hotspot host IP
+                        val server = HttpServerService(context, this@FlipViewModel)
+                        server.setExpectedSessionId(sessionId)
+                        val port = server.startServer()
+                        httpServerService = server
+                        _isServerRunning.value = true
+
+                        val devName = Build.MODEL ?: "Android Sender"
+                        val updatedLocal = Device(id = "local_device", name = devName, ip = ip, port = port)
+                        _localDevice.value = updatedLocal
+
+                        withContext(Dispatchers.Main) {
+                            showToast("Hotspot active ($ssid). Ready for receiver!")
+                        }
+
+                        // 3. Start optional BLE Advertising
+                        bleService.startAdvertising(
+                            protocolVersion = "1.0",
+                            sessionId = sessionId,
+                            deviceName = devName,
+                            deviceType = "phone"
+                        )
+                    } catch (e: Exception) {
+                        Log.e("FlipViewModel", "Failed to start sender HTTP server: ${e.message}")
+                        withContext(Dispatchers.Main) {
+                            showToast("Failed to start sender HTTP server: ${e.message}")
+                            resetToHome()
+                        }
+                    }
+                }
+            }
+
+            override fun onHotspotFailed(error: String) {
+                Log.e("FlipViewModel", "Failed to start sender hotspot: $error")
+                showToast("Failed to start hotspot: $error")
+                resetToHome()
+            }
+        })
     }
 
     /**
      * RECEIVER: Tap "Receive" role initiation
+     * Receiver does NOT create a hotspot. Receiver waits to scan Sender's QR code.
      */
     fun startReceiverMode() {
         _role.value = "RECEIVER"
@@ -209,38 +253,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         connectionStateManager.setHasDiscoveredDevices(false)
         connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
 
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // 1. Bind and start local HTTP server
-                val server = HttpServerService(context, this@FlipViewModel)
-                val port = server.startServer()
-                httpServerService = server
-                _isServerRunning.value = true
+        // Ensure receiver is not running a hotspot
+        wifiHotspotManager.stopHotspot()
 
-                // Update local device port info
-                val ip = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
-                val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
-                _localDevice.value = updatedLocal
-
-                // 2. Generate Session ID and Advertise over BLE
-                val sessionId = createNewTransferSession()
-                
-                if (updatedLocal != null) {
-                    bleService.startAdvertising(
-                        protocolVersion = "1.0",
-                        sessionId = sessionId,
-                        deviceName = updatedLocal.name,
-                        deviceType = "phone"
-                    )
-                }
-            } catch (e: Exception) {
-                Log.e("FlipViewModel", "Failed to start receiver server: ${e.message}")
-                withContext(Dispatchers.Main) {
-                    showToast("Failed to start receiver server: ${e.message}")
-                    resetToHome()
-                }
-            }
-        }
+        // Receiver scans for Sender advertisements
+        bleService.startScanning()
     }
 
     /**
@@ -454,10 +471,12 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             val adapter = moshi.adapter(Map::class.java)
             val pairingMap = adapter.fromJson(pairingJson) ?: throw IllegalArgumentException("Invalid JSON")
             
-            val ssid = pairingMap["ssid"] as String
-            val password = pairingMap["password"] as String
-            val ip = pairingMap["ip"] as String
-            val port = (pairingMap["port"] as Double).toInt()
+            val ssid = pairingMap["ssid"]?.toString() ?: ""
+            val password = pairingMap["password"]?.toString() ?: ""
+            val ip = pairingMap["ip"]?.toString() ?: ""
+            val port = (pairingMap["port"] as? Number)?.toInt()
+                ?: (pairingMap["port"] as? String)?.toIntOrNull()
+                ?: 8080
             
             showToast("Pairing data received! Joining Hotspot...")
             _connectionState.value = ConnectionState.CONNECTING
@@ -643,9 +662,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
                 Log.d("FlipViewModel", "Valid QR URI parsed: sessionId=$sessionId, IP=$ip, Port=$port, SSID=$ssid")
 
-                _role.value = "SENDER"
+                _role.value = "RECEIVER"
                 _connectionState.value = ConnectionState.CONNECTING
-                showToast("QR code recognized. Connecting to receiver...")
+                showToast("QR code recognized. Connecting to sender...")
 
                 if (ssid.isNotEmpty() && pwd.isNotEmpty() && ip.isNotEmpty() && port > 0) {
                     // Direct Wi-Fi hotspot auto-connect

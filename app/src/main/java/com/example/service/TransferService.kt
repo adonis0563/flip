@@ -41,17 +41,14 @@ class TransferService(private val context: Context) {
      */
     fun connectToDevice(remoteIp: String, remotePort: Int, localDevice: Device, onSuccess: (Device) -> Unit, onError: (String) -> Unit) {
         val url = "http://$remoteIp:$remotePort/connect"
-        Log.d(TAG, "[HANDSHAKE_STAGE] Handshake started with $remoteIp:$remotePort")
-
         val json = deviceAdapter.toJson(localDevice)
         val body = json.toRequestBody("application/json".toMediaTypeOrNull())
         val request = Request.Builder().url(url).post(body).build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                val reason = e.message ?: "Connection failed"
-                Log.e(TAG, "[HANDSHAKE_STAGE] Handshake failed with $remoteIp:$remotePort: $reason")
-                onError(reason)
+                Log.e(TAG, "Connection failed: ${e.message}")
+                onError(e.message ?: "Connection failed")
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -61,21 +58,15 @@ class TransferService(private val context: Context) {
                         try {
                             val remoteDevice = deviceAdapter.fromJson(responseBody)
                             if (remoteDevice != null) {
-                                Log.d(TAG, "[HANDSHAKE_STAGE] Handshake succeeded with $remoteIp:$remotePort (${remoteDevice.name})")
+                                // Keep remote configuration intact
                                 onSuccess(remoteDevice.copy(ip = remoteIp, port = remotePort))
                             } else {
-                                val reason = "Invalid response payload from device"
-                                Log.e(TAG, "[HANDSHAKE_STAGE] Handshake failed with $remoteIp:$remotePort: $reason")
-                                onError(reason)
+                                onError("Invalid response payload from device")
                             }
                         } catch (e: Exception) {
-                            val reason = "Failed to parse device pairing response: ${e.message}"
-                            Log.e(TAG, "[HANDSHAKE_STAGE] Handshake failed with $remoteIp:$remotePort: $reason")
                             onError("Failed to parse device pairing response")
                         }
                     } else {
-                        val reason = "Device rejected connection (HTTP ${response.code})"
-                        Log.e(TAG, "[HANDSHAKE_STAGE] Handshake failed with $remoteIp:$remotePort: $reason")
                         onError("Device rejected connection (HTTP ${response.code})")
                     }
                 }

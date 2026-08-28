@@ -96,23 +96,17 @@ object TransferManager {
     }
 
     fun addFileToTransferQueue(context: Context, uri: Uri, fileName: String, fileSize: Long) {
+        val transferId = UUID.randomUUID().toString()
+        val newItem = TransferItem(
+            id = transferId,
+            fileName = fileName,
+            fileUri = uri.toString(),
+            fileSize = fileSize,
+            status = TransferStatus.QUEUED,
+            isIncoming = false
+        )
+
         synchronized(this) {
-            val existing = _transferQueue.value.find { 
-                it.fileUri == uri.toString() && (it.status == TransferStatus.QUEUED || it.status == TransferStatus.SENDING)
-            }
-            if (existing != null) {
-                Log.d(TAG, "File $fileName already in transfer queue (${existing.status})")
-                return
-            }
-            val transferId = UUID.randomUUID().toString()
-            val newItem = TransferItem(
-                id = transferId,
-                fileName = fileName,
-                fileUri = uri.toString(),
-                fileSize = fileSize,
-                status = TransferStatus.QUEUED,
-                isIncoming = false
-            )
             _transferQueue.value = _transferQueue.value + newItem
         }
         saveState(context)
@@ -233,12 +227,8 @@ object TransferManager {
             } else {
                 context.startService(intent)
             }
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException starting TransferForegroundService: ${e.message}")
-        } catch (e: IllegalStateException) {
-            Log.e(TAG, "IllegalStateException/ForegroundServiceStartNotAllowedException starting service: ${e.message}")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to trigger TransferForegroundService: ${e.message}", e)
+            Log.e(TAG, "Failed to trigger TransferForegroundService", e)
         }
     }
 

@@ -32,12 +32,6 @@ class BleDiscoveryService(
     private var activeSessionId: String? = null
     private var sessionState = SessionState.UNCLAIMED
     private var activePairingJson: String? = null
-    @Volatile
-    private var isCccdSubscribed = false
-    @Volatile
-    private var pendingPairingJson: String? = null
-    @Volatile
-    private var negotiatedMtu = 23
 
     // GATT Client (Sender role)
     private var bluetoothGatt: BluetoothGatt? = null
@@ -66,7 +60,6 @@ class BleDiscoveryService(
         private const val MANUFACTURER_ID = 0xFFFF
         val SERVICE_UUID = UUID.fromString("0000f119-0000-1000-8000-00805f9b34fb")
         val CHARACTERISTIC_UUID = UUID.fromString("0000f120-0000-1000-8000-00805f9b34fb")
-        val CCCD_DESCRIPTOR_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
     fun isBluetoothSupported(): Boolean {
@@ -81,18 +74,11 @@ class BleDiscoveryService(
      * V2 RECEIVER: Start advertising session info and run GATT server
      */
     fun startAdvertising(protocolVersion: String, sessionId: String, deviceName: String, deviceType: String) {
-        Log.d(TAG, "[BLE_STAGE] Start advertising: protocolVersion=$protocolVersion, sessionId=$sessionId, deviceName=$deviceName, deviceType=$deviceType")
-        
-        // Stop any previous advertising session FIRST before registering new session
-        stopAdvertising()
-
+        Log.d(TAG, "startAdvertising: sessionId=$sessionId, deviceName=$deviceName")
         activeSessionId = sessionId
         sessionState = SessionState.UNCLAIMED
         activeClaimedGattDevice = null
         activePairingJson = null
-        isCccdSubscribed = false
-        pendingPairingJson = null
-        negotiatedMtu = 23
 
         // 1. Register in Simulation Registry (so we always have a working demo fallback)
         val simulatedReceiver = SimulatedReceiver(
@@ -114,17 +100,8 @@ class BleDiscoveryService(
             }
         )
         BleSimulationRegistry.registerReceiver(simulatedReceiver)
-        Log.d(TAG, "[BLE_STAGE] Registered receiver in simulation registry: sessionId=$sessionId")
 
-        // 2. Real Native BLE Advertising Permission & State Check
-        val missingPermissions = checkPermissions(isAdvertising = true)
-        if (missingPermissions.isNotEmpty()) {
-            val errMessage = "Denied required Bluetooth permission(s) before advertising: ${missingPermissions.joinToString(", ")}"
-            Log.e(TAG, "[BLE_PERMISSIONS] Cannot start advertising: $errMessage")
-            listener.onDiscoveryError("BLE Advertising Error: $errMessage")
-            return
-        }
-
+        // 2. Real Native BLE Advertising
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
             Log.w(TAG, "Bluetooth not enabled or supported. Running in BLE Simulation mode only.")
             return
@@ -136,6 +113,7 @@ class BleDiscoveryService(
             return
         }
 
+        stopAdvertising()
         startGattServer()
 
         val settings = AdvertiseSettings.Builder()
@@ -146,32 +124,26 @@ class BleDiscoveryService(
 
         val payload = encodePayloadV2(protocolVersion, sessionId, deviceName, deviceType)
 
-        // Primary Advertisement Data: Service UUID + Service Data (fits in 28 bytes <= 31 byte legacy BLE limit)
-        val advertiseData = AdvertiseData.Builder()
+        val data = AdvertiseData.Builder()
+            .addManufacturerData(MANUFACTURER_ID, payload)
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            .addServiceData(ParcelUuid(SERVICE_UUID), payload)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .build()
 
-        // Scan Response Data: Manufacturer payload
-        val scanResponseData = AdvertiseData.Builder()
-            .addManufacturerData(MANUFACTURER_ID, payload)
-            .build()
-
         advertiseCallback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                Log.d(TAG, "[BLE_STAGE] Advertising started successfully (Native BLE)")
+                Log.d(TAG, "Native BLE V2 Advertisement started successfully")
             }
 
             override fun onStartFailure(errorCode: Int) {
                 val msg = "Native BLE Adv failed: errorCode $errorCode"
-                Log.e(TAG, "[BLE_STAGE] Advertising failed: $msg")
+                Log.e(TAG, msg)
                 // We do not fail hard because the simulation registry is still active and works!
             }
         }
 
-        advertiser?.startAdvertising(settings, advertiseData, scanResponseData, advertiseCallback)
+        advertiser?.startAdvertising(settings, data, advertiseCallback)
     }
 
     private var activePairingJsonCallback: ((String) -> Unit)? = null
@@ -186,18 +158,6 @@ class BleDiscoveryService(
         activePairingJsonCallback = null
 
         // Trigger real native GATT notification/write
-        synchronized(this) {
-            if (isCccdSubscribed) {
-                Log.d(TAG, "GATT Server: Client already subscribed to CCCD notifications. Sending pairing data immediately.")
-                performPairingDataTransmission(pairingJson)
-            } else {
-                Log.d(TAG, "GATT Server: Client not yet subscribed to CCCD notifications. Buffering pairing data until CCCD descriptor write is acknowledged.")
-                pendingPairingJson = pairingJson
-            }
-        }
-    }
-
-    private fun performPairingDataTransmission(pairingJson: String) {
         val server = bluetoothGattServer ?: return
         val activeDevice = activeClaimedGattDevice ?: return
         val service = server.getService(SERVICE_UUID) ?: return
@@ -205,17 +165,17 @@ class BleDiscoveryService(
 
         // Send pairing data fragmented over GATT
         val payloadBytes = pairingJson.toByteArray(StandardCharsets.UTF_8)
-        val mtuChunkSize = (negotiatedMtu - 5).coerceIn(20, 500)
+        val mtu = 20 // Default fallback MTU chunk size
         
         Thread {
             try {
                 var offset = 0
                 val totalLength = payloadBytes.size
                 var chunkIndex = 0
-                val totalChunks = ((totalLength + mtuChunkSize - 1) / mtuChunkSize).coerceAtLeast(1)
+                val totalChunks = ((totalLength + mtu - 1) / mtu).coerceAtLeast(1)
 
                 while (offset < totalLength) {
-                    val size = (totalLength - offset).coerceAtLeast(0).coerceAtMost(mtuChunkSize)
+                    val size = (totalLength - offset).coerceAtLeast(0).coerceAtMost(mtu)
                     val chunk = ByteArray(2 + size)
                     chunk[0] = chunkIndex.toByte()
                     chunk[1] = totalChunks.toByte()
@@ -226,9 +186,9 @@ class BleDiscoveryService(
                     
                     offset += size
                     chunkIndex++
-                    Thread.sleep(40) // Small delay between notification chunks to avoid buffer overflow
+                    Thread.sleep(50) // Tiny delay between chunks
                 }
-                Log.d(TAG, "Finished native BLE GATT pairing data transfer ($totalChunks chunks using MTU chunk size $mtuChunkSize)")
+                Log.d(TAG, "Finished native BLE GATT pairing data transfer ($totalChunks chunks)")
             } catch (e: Exception) {
                 Log.e(TAG, "Error writing native GATT pairing data chunks", e)
             }
@@ -254,7 +214,7 @@ class BleDiscoveryService(
      * V2 SENDER: Start scanning for active receivers
      */
     fun startScanning() {
-        Log.d(TAG, "[BLE_STAGE] Start scanning")
+        Log.d(TAG, "startScanning")
         
         // 1. Scan in Simulation Registry
         simScanListener = { simReceiver ->
@@ -267,20 +227,11 @@ class BleDiscoveryService(
                 port = 0,
                 deviceType = simReceiver.deviceType
             )
-            Log.d(TAG, "[BLE_STAGE] Device discovered: id=${device.id}, name=${device.name}")
             listener.onDeviceDiscovered(device)
         }
         BleSimulationRegistry.registerScanListener(simScanListener!!)
 
-        // 2. Native BLE Scanning Permission & State Check
-        val missingPermissions = checkPermissions(isAdvertising = false)
-        if (missingPermissions.isNotEmpty()) {
-            val errMessage = "Denied required Bluetooth permission(s) before scanning: ${missingPermissions.joinToString(", ")}"
-            Log.e(TAG, "[BLE_PERMISSIONS] Cannot start scanning: $errMessage")
-            listener.onDiscoveryError("BLE Scanning Error: $errMessage")
-            return
-        }
-
+        // 2. Native BLE Scanning
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
             Log.w(TAG, "Bluetooth not enabled or supported. Running in BLE Simulation scanning mode only.")
             return
@@ -313,12 +264,12 @@ class BleDiscoveryService(
 
             override fun onScanFailed(errorCode: Int) {
                 val msg = "Native BLE Scan failed: errorCode $errorCode"
-                Log.e(TAG, "[BLE_STAGE] Scan failed: $msg")
+                Log.e(TAG, msg)
             }
         }
 
         scanner?.startScan(listOf(filter), settings, scanCallback)
-        Log.d(TAG, "[BLE_STAGE] Native BLE Scanning started")
+        Log.d(TAG, "Native BLE Scanning started")
     }
 
     fun stopScanning() {
@@ -340,89 +291,20 @@ class BleDiscoveryService(
     }
 
     private fun handleScanResult(result: ScanResult) {
-        val devAddr = result.device?.address ?: "UNKNOWN_ADDR"
-        val devName = result.device?.name ?: result.scanRecord?.deviceName ?: "UNKNOWN_NAME"
-        Log.d(TAG, "[BLE] ScanResult received: device=$devAddr ($devName), rssi=${result.rssi}")
-
-        val record = result.scanRecord
-        if (record == null) {
-            Log.d(TAG, "[BLE] ScanResult REJECTED for $devAddr: scanRecord is null")
-            return
-        }
-
-        // Try Service Data first (primary advertisement), then Manufacturer Data (scan response)
-        var payloadBytes = record.getServiceData(ParcelUuid(SERVICE_UUID))
-        if (payloadBytes == null) {
-            payloadBytes = record.getManufacturerSpecificData(MANUFACTURER_ID)
-        }
-
-        if (payloadBytes == null) {
-            val uuids = record.serviceUuids
-            if (uuids != null && uuids.contains(ParcelUuid(SERVICE_UUID))) {
-                Log.d(TAG, "[BLE] Advertisement with SERVICE_UUID detected without payload, registering: $devName ($devAddr)")
-                val device = Device(
-                    id = devAddr,
-                    name = devName,
-                    ip = "0.0.0.0",
-                    port = 0,
-                    deviceType = "phone"
-                )
-                listener.onDeviceDiscovered(device)
-                return
-            }
-            Log.d(TAG, "[BLE] ScanResult REJECTED for $devAddr: missing service/manufacturer payload for SERVICE_UUID. Present UUIDs: ${record.serviceUuids}")
-            return
-        }
+        val record = result.scanRecord ?: return
+        val manufacturerData = record.getManufacturerSpecificData(MANUFACTURER_ID) ?: return
         
-        val device = decodePayloadV2(payloadBytes, devAddr)
+        val device = decodePayloadV2(manufacturerData, result.device.address)
         if (device != null) {
-            Log.d(TAG, "[BLE] Device discovered & accepted: id=${device.id}, name=${device.name}")
             listener.onDeviceDiscovered(device)
-        } else {
-            Log.w(TAG, "[BLE] ScanResult REJECTED for $devAddr: failed to decode V2 payload bytes (len=${payloadBytes.size})")
         }
-    }
-
-    private fun checkPermissions(isAdvertising: Boolean): List<String> {
-        val missing = mutableListOf<String>()
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-            val scanGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_SCAN) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            val connectGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_CONNECT) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            val advertiseGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_ADVERTISE) == android.content.pm.PackageManager.PERMISSION_GRANTED
-
-            Log.d(TAG, "[BLE_PERMISSIONS] Android 12+ Permission Check Before Operation (isAdvertising=$isAdvertising):")
-            Log.d(TAG, "  BLUETOOTH_SCAN: $scanGranted")
-            Log.d(TAG, "  BLUETOOTH_CONNECT: $connectGranted")
-            Log.d(TAG, "  BLUETOOTH_ADVERTISE: $advertiseGranted")
-
-            if (isAdvertising && !advertiseGranted) {
-                missing.add(android.Manifest.permission.BLUETOOTH_ADVERTISE)
-            }
-            if (!isAdvertising && !scanGranted) {
-                missing.add(android.Manifest.permission.BLUETOOTH_SCAN)
-            }
-            if (!connectGranted) {
-                missing.add(android.Manifest.permission.BLUETOOTH_CONNECT)
-            }
-        } else {
-            val fineGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            val coarseGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
-            val locGranted = fineGranted || coarseGranted
-
-            Log.d(TAG, "[BLE_PERMISSIONS] Android <12 Location Permission Check: $locGranted")
-
-            if (!locGranted) {
-                missing.add(android.Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-        }
-        return missing
     }
 
     /**
      * V2 SENDER: Establish GATT Connection to claim session and receive pairing data
      */
     fun connectToGatt(targetDevice: Device) {
-        Log.d(TAG, "[BLE_STAGE] Handshake started (GATT connect to target device=${targetDevice.id})")
+        Log.d(TAG, "connectToGatt targetDevice=${targetDevice.id}")
 
         // 1. Simulation GATT Connection Handshake
         if (targetDevice.id.startsWith("SIM_")) {
@@ -430,35 +312,23 @@ class BleDiscoveryService(
             val simReceiver = BleSimulationRegistry.activeAdvertisements[sessionId]
             if (simReceiver != null) {
                 Thread {
-                    try {
-                        Thread.sleep(800) // Simulate connection delay
-                        simReceiver.onGattConnect { json ->
-                            // Simulate receiving the pairing data back
-                            Handler(Looper.getMainLooper()).post {
-                                try {
-                                    listener.onPairingDataReceived(json)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error in onPairingDataReceived: ${e.message}", e)
-                                }
-                            }
+                    Thread.sleep(800) // Simulate connection delay
+                    simReceiver.onGattConnect { json ->
+                        // Simulate receiving the pairing data back
+                        Handler(Looper.getMainLooper()).post {
+                            listener.onPairingDataReceived(json)
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Uncaught exception in SIM BLE thread: ${e.message}", e)
                     }
                 }.start()
             } else {
-                val err = "Simulated session no longer active"
-                Log.e(TAG, "[BLE_STAGE] Handshake failed: $err")
-                listener.onDiscoveryError(err)
+                listener.onDiscoveryError("Simulated session no longer active")
             }
             return
         }
 
         // 2. Real Native GATT Connection Handshake
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            val err = "Bluetooth not available for GATT connection"
-            Log.e(TAG, "[BLE_STAGE] Handshake failed: $err")
-            listener.onDiscoveryError(err)
+            listener.onDiscoveryError("Bluetooth not available for GATT connection")
             return
         }
 
@@ -476,10 +346,7 @@ class BleDiscoveryService(
                         gatt?.discoverServices()
                     } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                         Log.d(TAG, "Native GATT disconnected")
-                        gatt?.close()
-                        if (bluetoothGatt == gatt) {
-                            bluetoothGatt = null
-                        }
+                        bluetoothGatt = null
                     }
                 }
 
@@ -495,39 +362,23 @@ class BleDiscoveryService(
 
                 override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
                     super.onMtuChanged(gatt, mtu, status)
-                    Log.d(TAG, "Native GATT MTU size negotiated: $mtu (status=$status)")
+                    Log.d(TAG, "Native GATT MTU size negotiated: $mtu")
                     
                     // Register notifications for pairing data
                     val service = gatt?.getService(SERVICE_UUID)
                     val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
                     if (characteristic != null) {
-                        val notificationSet = gatt.setCharacteristicNotification(characteristic, true)
-                        Log.d(TAG, "setCharacteristicNotification result: $notificationSet")
+                        gatt.setCharacteristicNotification(characteristic, true)
                         
                         // Enable local descriptor CCCD notifications
-                        val descriptor = characteristic.getDescriptor(CCCD_DESCRIPTOR_UUID)
+                        val descriptor = characteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
                         if (descriptor != null) {
                             descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                            val writeInitiated = gatt.writeDescriptor(descriptor)
-                            Log.d(TAG, "Subscribed to Pairing Data characteristic notifications via writeDescriptor: $writeInitiated")
-                        } else {
-                            Log.e(TAG, "CCCD descriptor not found on characteristic")
-                            listener.onDiscoveryError("CCCD descriptor not found on target characteristic")
+                            gatt.writeDescriptor(descriptor)
                         }
+                        Log.d(TAG, "Subscribed to Pairing Data characteristic notifications")
                     } else {
                         listener.onDiscoveryError("Pairing characteristic not found on target device")
-                    }
-                }
-
-                override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
-                    super.onDescriptorWrite(gatt, descriptor, status)
-                    if (descriptor?.uuid == CCCD_DESCRIPTOR_UUID) {
-                        if (status == BluetoothGatt.GATT_SUCCESS) {
-                            Log.d(TAG, "GATT Client: CCCD descriptor write acknowledged by server. Notification subscription active.")
-                        } else {
-                            Log.e(TAG, "GATT Client: CCCD descriptor write failed with status $status")
-                            listener.onDiscoveryError("Failed to subscribe to pairing data notifications (status $status)")
-                        }
                     }
                 }
 
@@ -585,7 +436,7 @@ class BleDiscoveryService(
                         Log.d(TAG, "GATT Server: Client connected: ${device.address}")
                         
                         // First-Connect Wins Claim Policy
-                        synchronized(this@BleDiscoveryService) {
+                        synchronized(this) {
                             if (sessionState != SessionState.UNCLAIMED) {
                                 Log.w(TAG, "Rejecting extra client ${device.address} since session is already claimed")
                                 bluetoothGattServer?.cancelConnection(device)
@@ -597,18 +448,8 @@ class BleDiscoveryService(
                             connectedGattDevices.add(device)
                         }
 
-                        // Stop BLE Advertising immediately without destroying GATT server
-                        BleSimulationRegistry.unregisterReceiver(activeSessionId ?: "")
-                        try {
-                            if (advertiser != null && advertiseCallback != null) {
-                                advertiser?.stopAdvertising(advertiseCallback)
-                                Log.d(TAG, "BLE Advertisement stopped on first connect")
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error stopping advertiser: ${e.message}")
-                        } finally {
-                            advertiseCallback = null
-                        }
+                        // Stop BLE Advertising immediately
+                        stopAdvertising()
 
                         Handler(Looper.getMainLooper()).post {
                             activeSessionId?.let { listener.onSessionClaimed(it) }
@@ -619,70 +460,18 @@ class BleDiscoveryService(
                         if (device == activeClaimedGattDevice) {
                             activeClaimedGattDevice = null
                             sessionState = SessionState.UNCLAIMED
-                            isCccdSubscribed = false
                         }
-                    }
-                }
-
-                override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
-                    super.onMtuChanged(device, mtu)
-                    Log.d(TAG, "GATT Server: MTU negotiated to $mtu for device ${device?.address}")
-                    negotiatedMtu = mtu
-                }
-
-                override fun onDescriptorWriteRequest(
-                    device: BluetoothDevice?,
-                    requestId: Int,
-                    descriptor: BluetoothGattDescriptor?,
-                    preparedWrite: Boolean,
-                    responseNeeded: Boolean,
-                    offset: Int,
-                    value: ByteArray?
-                ) {
-                    super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
-                    val isCccd = descriptor?.uuid == CCCD_DESCRIPTOR_UUID
-                    if (isCccd) {
-                        val enableNotifications = value != null && value.isNotEmpty() && (value[0].toInt() != 0)
-                        Log.d(TAG, "GATT Server: CCCD Descriptor write request from ${device?.address}, enableNotifications=$enableNotifications")
-                        
-                        if (responseNeeded) {
-                            bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-                        }
-                        
-                        if (enableNotifications) {
-                            var pendingToTransmit: String? = null
-                            synchronized(this@BleDiscoveryService) {
-                                isCccdSubscribed = true
-                                pendingToTransmit = pendingPairingJson
-                                pendingPairingJson = null
-                            }
-                            
-                            if (pendingToTransmit != null) {
-                                Log.d(TAG, "GATT Server: CCCD subscription acknowledged. Transmitting buffered pairing data now.")
-                                performPairingDataTransmission(pendingToTransmit!!)
-                            }
-                        }
-                        return
-                    }
-
-                    if (responseNeeded) {
-                        bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                     }
                 }
             })
 
-            // Add Pairing service & characteristic with CCCD descriptor
+            // Add Pairing service & characteristic
             val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
             val characteristic = BluetoothGattCharacteristic(
                 CHARACTERISTIC_UUID,
                 BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
                 BluetoothGattCharacteristic.PERMISSION_READ
             )
-            val cccdDescriptor = BluetoothGattDescriptor(
-                CCCD_DESCRIPTOR_UUID,
-                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
-            )
-            characteristic.addDescriptor(cccdDescriptor)
             service.addCharacteristic(characteristic)
             bluetoothGattServer?.addService(service)
             Log.d(TAG, "Native BLE GATT Server hosted successfully")
@@ -702,9 +491,6 @@ class BleDiscoveryService(
             bluetoothGattServer = null
             connectedGattDevices.clear()
             activeClaimedGattDevice = null
-            isCccdSubscribed = false
-            pendingPairingJson = null
-            negotiatedMtu = 23
         }
     }
 

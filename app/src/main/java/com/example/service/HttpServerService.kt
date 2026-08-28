@@ -27,18 +27,6 @@ class HttpServerService(private val context: android.content.Context, private va
     @Volatile
     private var isRunning = false
 
-    @Volatile
-    private var expectedSessionId: String? = null
-
-    fun setExpectedSessionId(sessionId: String?) {
-        expectedSessionId = sessionId
-    }
-
-    fun isListening(): Boolean {
-        val socket = serverSocket
-        return isRunning && socket != null && socket.isBound && !socket.isClosed
-    }
-
     interface ServerListener {
         fun onDeviceConnected(device: Device)
         fun onDeviceDisconnected()
@@ -311,9 +299,11 @@ class HttpServerService(private val context: android.content.Context, private va
                 bytesWritten += bytesRead
                 remaining -= bytesRead
 
+                // Write offset marker to disk progressively
+                offsetFile.writeText(bytesWritten.toString())
+
                 val now = System.currentTimeMillis()
-                if (now - lastProgressUpdate > 150) { // Throttle updates and offset file writes
-                    offsetFile.writeText(bytesWritten.toString())
+                if (now - lastProgressUpdate > 150) { // Throttle updates to ~150ms for performance
                     listener.onFileTransferProgress(transferId, bytesWritten)
                     lastProgressUpdate = now
                 }

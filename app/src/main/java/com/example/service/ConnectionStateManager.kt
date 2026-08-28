@@ -16,25 +16,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 enum class FlipConnectionState {
-    IDLE,
-    STARTING_HOTSPOT,
-    HOTSPOT_READY,
-    SERVER_READY,
-    BOOTSTRAP_READY,
-    WAITING_FOR_PEER,
-    WIFI_CONNECTING,
-    WIFI_AVAILABLE,
-    HTTP_HANDSHAKE,
-    CONNECTED,
-    TRANSFERRING,
-    PAUSED,
-    CANCELLED,
-    FAILED,
     DISCONNECTED,
-
-    // Backwards-compatible aliases
     NETWORK_AVAILABLE,
     DEVICE_FOUND,
+    CONNECTED,
     READY
 }
 

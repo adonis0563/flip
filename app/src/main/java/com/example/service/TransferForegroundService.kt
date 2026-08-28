@@ -61,34 +61,30 @@ class TransferForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        try {
-            val action = intent?.action
-            val transferId = intent?.getStringExtra(EXTRA_TRANSFER_ID)
+        val action = intent?.action
+        val transferId = intent?.getStringExtra(EXTRA_TRANSFER_ID)
 
-            Log.d(TAG, "onStartCommand action=$action, transferId=$transferId")
+        Log.d(TAG, "onStartCommand action=$action, transferId=$transferId")
 
-            if (transferId != null) {
-                when (action) {
-                    ACTION_PAUSE -> {
-                        TransferManager.pauseTransfer(this, transferId)
-                    }
-                    ACTION_RESUME -> {
-                        TransferManager.resumeTransfer(this, transferId)
-                    }
-                    ACTION_CANCEL -> {
-                        TransferManager.cancelTransfer(this, transferId)
-                    }
+        if (transferId != null) {
+            when (action) {
+                ACTION_PAUSE -> {
+                    TransferManager.pauseTransfer(this, transferId)
+                }
+                ACTION_RESUME -> {
+                    TransferManager.resumeTransfer(this, transferId)
+                }
+                ACTION_CANCEL -> {
+                    TransferManager.cancelTransfer(this, transferId)
                 }
             }
-
-            // Always show foreground notification immediately to comply with Android OS
-            showInitialNotification()
-
-            // Trigger queue execution
-            startTransferQueueProcessor()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in onStartCommand: ${e.message}", e)
         }
+
+        // Always show foreground notification immediately to comply with Android OS
+        showInitialNotification()
+
+        // Trigger queue execution
+        startTransferQueueProcessor()
 
         return START_NOT_STICKY
     }
@@ -108,19 +104,15 @@ class TransferForegroundService : Service() {
     }
 
     private fun showInitialNotification() {
-        try {
-            val notification = buildNotification(null)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start foreground notification: ${e.message}", e)
+        val notification = buildNotification(null)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
         }
     }
 

@@ -33,13 +33,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     HttpServerService.ServerListener, BleDiscoveryService.DiscoveryListener {
 
     private val context = getApplication<Application>().applicationContext
-    val connectionStateManager = ConnectionStateManager(context)
-    val flipConnectionState = connectionStateManager.connectionState
-
     private val transferService = TransferService(context)
     private val bleService = BleDiscoveryService(context, this)
-    private val wifiHotspotManager = WifiHotspotManager(context)
-    private var currentSessionId: String? = null
     private var httpServerService: HttpServerService? = null
 
     // UI state flows
@@ -58,7 +53,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val _discoveredDevices = MutableStateFlow<List<Device>>(emptyList())
     val discoveredDevices: StateFlow<List<Device>> = _discoveredDevices.asStateFlow()
 
-    val transferQueue: StateFlow<List<TransferItem>> = TransferManager.transferQueue
+    private val _transferQueue = MutableStateFlow<List<TransferItem>>(emptyList())
+    val transferQueue: StateFlow<List<TransferItem>> = _transferQueue.asStateFlow()
 
     private val _toastMessage = MutableStateFlow<String?>(null)
     val toastMessage: StateFlow<String?> = _toastMessage.asStateFlow()
@@ -101,10 +97,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     init {
-        // Initialize TransferManager and restore state
-        TransferManager.init(context)
-        _remoteDevice.value = TransferManager.remoteDevice.value
-
         // Run orphaned offset markers cleanup on launch
         viewModelScope.launch(Dispatchers.IO) {
             StorageService.cleanupOrphanedMarkers()
@@ -121,23 +113,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         val devName = Build.MODEL ?: "Android Device"
         val localIp = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
         _localDevice.value = Device(id = devId, name = devName, ip = localIp, port = 8080)
-
-        // Observe ConnectionStateManager currentIp flow to update local device IP dynamically
-        viewModelScope.launch {
-            connectionStateManager.currentIp.collect { ip ->
-                val current = _localDevice.value
-                if (current != null && current.ip != ip) {
-                    _localDevice.value = current.copy(ip = ip)
-                }
-            }
-        }
-
-        // Synchronize remote device updates with TransferManager
-        viewModelScope.launch {
-            _remoteDevice.collect { device ->
-                TransferManager.setRemoteDevice(context, device)
-            }
-        }
     }
 
     fun clearToast() {
@@ -155,28 +130,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _role.value = "SENDER"
         _connectionState.value = ConnectionState.SEARCHING
         _discoveredDevices.value = emptyList()
-        TransferManager.clearQueue(context)
-        
-        connectionStateManager.updateNetworkStatus()
-        connectionStateManager.setHasDiscoveredDevices(false)
-        connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
-
-        // Senders scan for Receiver advertisements in V2
-        bleService.startScanning()
-    }
-
-    /**
-     * RECEIVER: Tap "Receive" role initiation
-     */
-    fun startReceiverMode() {
-        _role.value = "RECEIVER"
-        _connectionState.value = ConnectionState.SEARCHING
-        _discoveredDevices.value = emptyList()
-        TransferManager.clearQueue(context)
-
-        connectionStateManager.updateNetworkStatus()
-        connectionStateManager.setHasDiscoveredDevices(false)
-        connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
+        _transferQueue.value = emptyList()
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -191,18 +145,49 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
                 _localDevice.value = updatedLocal
 
-                // 2. Generate Session ID and Advertise over BLE
-                val sessionId = UUID.randomUUID().toString()
-                currentSessionId = sessionId
-                
+                // 2. Advertise over BLE
                 if (updatedLocal != null) {
                     bleService.startAdvertising(
-                        protocolVersion = "1.0",
-                        sessionId = sessionId,
-                        deviceName = updatedLocal.name,
-                        deviceType = "phone"
+                        localIp = updatedLocal.ip,
+                        port = updatedLocal.port,
+                        deviceId = updatedLocal.id,
+                        deviceName = updatedLocal.name
                     )
                 }
+            } catch (e: Exception) {
+                Log.e("FlipViewModel", "Failed to start sender server: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    showToast("Failed to start sender server: ${e.message}")
+                    resetToHome()
+                }
+            }
+        }
+    }
+
+    /**
+     * RECEIVER: Tap "Receive" role initiation
+     */
+    fun startReceiverMode() {
+        _role.value = "RECEIVER"
+        _connectionState.value = ConnectionState.SEARCHING
+        _discoveredDevices.value = emptyList()
+        _transferQueue.value = emptyList()
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 1. Bind and start local HTTP server
+                val server = HttpServerService(context, this@FlipViewModel)
+                val port = server.startServer()
+                httpServerService = server
+                _isServerRunning.value = true
+
+                // Update local device port info
+                val ip = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
+                val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
+                _localDevice.value = updatedLocal
+
+                // 2. Scan over BLE
+                bleService.startScanning()
             } catch (e: Exception) {
                 Log.e("FlipViewModel", "Failed to start receiver server: ${e.message}")
                 withContext(Dispatchers.Main) {
@@ -214,15 +199,31 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     /**
-     * Tapping a discovered receiver device to connect over BLE GATT
+     * Tapping a discovered sender device to connect
      */
     fun connectToDiscoveredDevice(target: Device) {
         _connectionState.value = ConnectionState.CONNECTING
-        connectionStateManager.setPeerStatus(PeerConnectionStatus.CONNECTED)
-        showToast("Connecting to ${target.name} over BLE...")
-        
+        val currentLocal = _localDevice.value ?: return
+
         viewModelScope.launch(Dispatchers.IO) {
-            bleService.connectToGatt(target)
+            transferService.connectToDevice(
+                remoteIp = target.ip,
+                remotePort = target.port,
+                localDevice = currentLocal,
+                onSuccess = { remote ->
+                    // Stop BLE scan since we are now connected
+                    bleService.stopScanning()
+                    _remoteDevice.value = remote
+                    _connectionState.value = ConnectionState.CONNECTED
+                    showToast("Connected to ${remote.name}")
+                    checkAndQueuePreSelected()
+                },
+                onError = { err ->
+                    Log.e("FlipViewModel", "Failed to connect: $err")
+                    _connectionState.value = ConnectionState.SEARCHING
+                    showToast("Connection failed: $err")
+                }
+            )
         }
     }
 
@@ -231,7 +232,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      */
     fun connectManually(ip: String, port: Int) {
         _connectionState.value = ConnectionState.CONNECTING
-        connectionStateManager.setPeerStatus(PeerConnectionStatus.CONNECTED)
         val currentLocal = _localDevice.value ?: return
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -244,13 +244,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     bleService.stopAdvertising()
                     _remoteDevice.value = remote
                     _connectionState.value = ConnectionState.CONNECTED
-                    connectionStateManager.setPeerStatus(PeerConnectionStatus.READY)
                     showToast("Connected to ${remote.name}")
                     checkAndQueuePreSelected()
                 },
                 onError = { err ->
                     _connectionState.value = ConnectionState.IDLE
-                    connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
                     showToast("Failed to connect: $err")
                 }
             )
@@ -273,15 +271,25 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     private fun performDisconnectCleanup() {
         // Cancel all pending or active transfers
-        TransferManager.cancelAllActiveTransfers(context)
+        viewModelScope.launch(Dispatchers.Default) {
+            synchronized(cancelledTransferIds) {
+                _transferQueue.value.forEach {
+                    if (it.status == TransferStatus.SENDING || it.status == TransferStatus.QUEUED || it.status == TransferStatus.PAUSED) {
+                        cancelledTransferIds.add(it.id)
+                    }
+                }
+            }
+            _transferQueue.value = _transferQueue.value.map {
+                if (it.status == TransferStatus.SENDING || it.status == TransferStatus.QUEUED || it.status == TransferStatus.PAUSED) {
+                    it.copy(status = TransferStatus.CANCELLED)
+                } else {
+                    it
+                }
+            }
+        }
 
         bleService.stopScanning()
         bleService.stopAdvertising()
-        bleService.disconnectGatt()
-
-        wifiHotspotManager.stopHotspot()
-        wifiHotspotManager.disconnectWifi()
-
         httpServerService?.stopServer()
         httpServerService = null
         _isServerRunning.value = false
@@ -289,10 +297,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _remoteDevice.value = null
         _connectionState.value = ConnectionState.IDLE
         _role.value = null
-
-        connectionStateManager.setPeerStatus(PeerConnectionStatus.IDLE)
-        connectionStateManager.setHasDiscoveredDevices(false)
-        connectionStateManager.updateNetworkStatus()
     }
 
     fun resetToHome() {
@@ -321,23 +325,165 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * Choose file and append to the send queue
      */
     fun addFileToTransferQueue(uri: Uri, fileName: String, fileSize: Long) {
-        TransferManager.addFileToTransferQueue(context, uri, fileName, fileSize)
+        val transferId = UUID.randomUUID().toString()
+        val newItem = TransferItem(
+            id = transferId,
+            fileName = fileName,
+            fileUri = uri.toString(),
+            fileSize = fileSize,
+            status = TransferStatus.QUEUED,
+            isIncoming = false
+        )
+
+        _transferQueue.value = _transferQueue.value + newItem
         showToast("Added $fileName to queue")
+
+        triggerQueueProcessing()
+    }
+
+    private fun triggerQueueProcessing() {
+        synchronized(this) {
+            if (!isQueueRunning) {
+                isQueueRunning = true
+                queueJob = viewModelScope.launch(Dispatchers.IO) {
+                    runQueueProcessor()
+                }
+            }
+        }
+    }
+
+    private suspend fun runQueueProcessor() {
+        try {
+            while (true) {
+                // Find first queued sending item
+                val queue = _transferQueue.value
+                val nextItem = queue.firstOrNull { it.status == TransferStatus.QUEUED }
+                if (nextItem == null) {
+                    isQueueRunning = false
+                    break
+                }
+
+                // Execute transfer
+                processSendItem(nextItem)
+            }
+        } finally {
+            isQueueRunning = false
+        }
+    }
+
+    private suspend fun processSendItem(item: TransferItem) {
+        val remote = _remoteDevice.value ?: run {
+            updateItemStatus(item.id, TransferStatus.FAILED, "No connected device")
+            return
+        }
+
+        // Update status to SENDING
+        updateItemStatus(item.id, TransferStatus.SENDING)
+
+        // 1. Perform Resume Handshake (Inquire Offset)
+        var offset = 0L
+        try {
+            offset = transferService.getReceiverOffset(remote.ip, remote.port, item.id, item.fileName)
+            Log.d("FlipViewModel", "Handshake succeeded. Resuming from offset: $offset")
+        } catch (e: Exception) {
+            Log.e("FlipViewModel", "Handshake failed: ${e.message}")
+            updateItemStatus(item.id, TransferStatus.FAILED, "Handshake failed: ${e.message}")
+            return
+        }
+
+        // 2. Begin Stream Upload
+        val completer = CompletableDeferred<Unit>()
+        
+        transferService.uploadFile(
+            remoteIp = remote.ip,
+            remotePort = remote.port,
+            transferId = item.id,
+            fileName = item.fileName,
+            fileUriStr = item.fileUri ?: "",
+            offset = offset,
+            totalSize = item.fileSize,
+            cancelCheck = {
+                synchronized(cancelledTransferIds) {
+                    cancelledTransferIds.contains(item.id)
+                }
+            },
+            onProgress = { bytesTransferred ->
+                updateItemProgress(item.id, bytesTransferred)
+            },
+            onSuccess = {
+                updateItemStatus(item.id, TransferStatus.COMPLETE)
+                
+                // Clean up if it is a temporary APK
+                if (item.fileUri?.contains("/Temp/APK") == true) {
+                    val keep = context.getSharedPreferences("flip_prefs", android.content.Context.MODE_PRIVATE).getBoolean("keep_extracted_apk", false)
+                    if (!keep) {
+                        try {
+                            val path = Uri.parse(item.fileUri).path
+                            if (path != null) {
+                                val tempFile = java.io.File(path)
+                                if (tempFile.exists()) {
+                                    tempFile.delete()
+                                    Log.d("FlipViewModel", "Cleaned up temporary APK: ${tempFile.absolutePath}")
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e("FlipViewModel", "Failed to clean up temporary APK: ${e.message}")
+                        }
+                    }
+                } else if (item.fileUri?.contains("/TempTransfer") == true) {
+                    try {
+                        val path = Uri.parse(item.fileUri).path
+                        if (path != null) {
+                            val tempFile = java.io.File(path)
+                            if (tempFile.exists()) {
+                                tempFile.delete()
+                                Log.d("FlipViewModel", "Cleaned up temporary transfer file: ${tempFile.absolutePath}")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e("FlipViewModel", "Failed to clean up temporary transfer file: ${e.message}")
+                    }
+                }
+                
+                completer.complete(Unit)
+            },
+            onError = { errMsg ->
+                // Check if it was manually paused
+                val currentStatus = _transferQueue.value.firstOrNull { it.id == item.id }?.status
+                if (currentStatus == TransferStatus.PAUSED) {
+                    // Let paused state stay
+                } else {
+                    updateItemStatus(item.id, TransferStatus.FAILED, errMsg)
+                }
+                completer.complete(Unit)
+            }
+        )
+
+        completer.await()
     }
 
     private fun updateItemStatus(id: String, status: TransferStatus, errMsg: String? = null) {
-        TransferManager.updateItemStatus(context, id, status, errMsg)
+        _transferQueue.value = _transferQueue.value.map {
+            if (it.id == id) it.copy(status = status, errorMessage = errMsg) else it
+        }
     }
 
     private fun updateItemProgress(id: String, bytesTransferred: Long) {
-        TransferManager.updateItemProgress(context, id, bytesTransferred)
+        _transferQueue.value = _transferQueue.value.map {
+            if (it.id == id) it.copy(bytesTransferred = bytesTransferred) else it
+        }
     }
 
     /**
      * Pause a sending transfer
      */
     fun pauseTransfer(id: String) {
-        TransferManager.pauseTransfer(context, id)
+        synchronized(cancelledTransferIds) {
+            cancelledTransferIds.add(id)
+        }
+        _transferQueue.value = _transferQueue.value.map {
+            if (it.id == id) it.copy(status = TransferStatus.PAUSED) else it
+        }
         showToast("Transfer paused")
     }
 
@@ -345,15 +491,43 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * Resume a sending transfer
      */
     fun resumeTransfer(id: String) {
-        TransferManager.resumeTransfer(context, id)
+        synchronized(cancelledTransferIds) {
+            cancelledTransferIds.remove(id)
+        }
+        _transferQueue.value = _transferQueue.value.map {
+            if (it.id == id) it.copy(status = TransferStatus.QUEUED, errorMessage = null) else it
+        }
         showToast("Resuming transfer...")
+        triggerQueueProcessing()
     }
 
     /**
      * Cancel an active or queued transfer
      */
     fun cancelTransfer(id: String) {
-        TransferManager.cancelTransfer(context, id)
+        val item = _transferQueue.value.firstOrNull { it.id == id } ?: return
+        
+        synchronized(cancelledTransferIds) {
+            cancelledTransferIds.add(id)
+        }
+
+        _transferQueue.value = _transferQueue.value.map {
+            if (it.id == id) it.copy(status = TransferStatus.CANCELLED) else it
+        }
+
+        // Notify receiver for cleanup
+        val remote = _remoteDevice.value
+        if (remote != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                transferService.notifyCancellation(remote.ip, remote.port, id)
+            }
+        }
+
+        // If it's incoming, clean up the local disk files
+        if (item.isIncoming) {
+            StorageService.cancelTransfer(item.id, item.fileName)
+        }
+
         showToast("Transfer cancelled")
     }
 
@@ -365,116 +539,13 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     override fun onDeviceDiscovered(device: Device) {
         val currentList = _discoveredDevices.value
         if (currentList.none { it.id == device.id }) {
-            val newList = currentList + device
-            _discoveredDevices.value = newList
-            connectionStateManager.setHasDiscoveredDevices(newList.isNotEmpty())
+            _discoveredDevices.value = currentList + device
         }
     }
 
     override fun onDiscoveryError(message: String) {
         Log.e("BLEDiscovery", message)
         _bleError.value = message
-    }
-
-    override fun onSessionClaimed(sessionId: String) {
-        Log.d("FlipViewModel", "onSessionClaimed: sessionId=$sessionId")
-        bleService.stopAdvertising()
-        
-        viewModelScope.launch(Dispatchers.Main) {
-            _connectionState.value = ConnectionState.CONNECTING
-            showToast("Session claimed! Starting Hotspot...")
-            
-            wifiHotspotManager.startHotspot(object : WifiHotspotManager.HotspotListener {
-                override fun onHotspotStarted(ssid: String, psw: String, ip: String) {
-                    Log.d("FlipViewModel", "Hotspot started: SSID=$ssid, Password=$psw, IP=$ip")
-                    val moshi = com.squareup.moshi.Moshi.Builder()
-                        .addLast(com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory())
-                        .build()
-                    val pairingMap = mapOf(
-                        "sessionId" to sessionId,
-                        "ssid" to ssid,
-                        "password" to psw,
-                        "ip" to ip,
-                        "port" to (httpServerService?.boundPort?.toDouble() ?: 8080.0)
-                    )
-                    val adapter = moshi.adapter(Map::class.java)
-                    val pairingJson = adapter.toJson(pairingMap)
-                    
-                    bleService.sendPairingData(pairingJson)
-                    showToast("Hotspot active. Waiting for sender to join...")
-                }
-
-                override fun onHotspotFailed(error: String) {
-                    Log.e("FlipViewModel", "Failed to start hotspot: $error")
-                    showToast("Failed to start hotspot: $error")
-                    resetToHome()
-                }
-            })
-        }
-    }
-
-    override fun onPairingDataReceived(pairingJson: String) {
-        Log.d("FlipViewModel", "onPairingDataReceived: $pairingJson")
-        try {
-            val moshi = com.squareup.moshi.Moshi.Builder()
-                .addLast(com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory())
-                .build()
-            val adapter = moshi.adapter(Map::class.java)
-            val pairingMap = adapter.fromJson(pairingJson) ?: throw IllegalArgumentException("Invalid JSON")
-            
-            val ssid = pairingMap["ssid"] as String
-            val password = pairingMap["password"] as String
-            val ip = pairingMap["ip"] as String
-            val port = (pairingMap["port"] as Double).toInt()
-            
-            showToast("Pairing data received! Joining Hotspot...")
-            _connectionState.value = ConnectionState.CONNECTING
-            
-            wifiHotspotManager.joinWifi(ssid, password, ip, object : WifiHotspotManager.WifiJoinListener {
-                override fun onJoined(joinedIp: String) {
-                    Log.d("FlipViewModel", "Joined Hotspot. Performing HTTP Handshake with $joinedIp:$port...")
-                    showToast("Connected to Wi-Fi. Performing Handshake...")
-                    
-                    val currentLocal = _localDevice.value ?: return
-                    viewModelScope.launch(Dispatchers.IO) {
-                        transferService.connectToDevice(
-                            remoteIp = joinedIp,
-                            remotePort = port,
-                            localDevice = currentLocal,
-                            onSuccess = { remote ->
-                                bleService.stopScanning()
-                                bleService.disconnectGatt()
-                                
-                                viewModelScope.launch(Dispatchers.Main) {
-                                    _remoteDevice.value = remote
-                                    _connectionState.value = ConnectionState.CONNECTED
-                                    connectionStateManager.setPeerStatus(PeerConnectionStatus.READY)
-                                    showToast("Connected to ${remote.name}!")
-                                    checkAndQueuePreSelected()
-                                }
-                            },
-                            onError = { err ->
-                                Log.e("FlipViewModel", "Handshake failed: $err")
-                                viewModelScope.launch(Dispatchers.Main) {
-                                    showToast("Handshake failed: $err")
-                                    resetToHome()
-                                }
-                            }
-                        )
-                    }
-                }
-
-                override fun onFailed(error: String) {
-                    Log.e("FlipViewModel", "Failed to join Wi-Fi Hotspot: $error")
-                    showToast("Failed to join Wi-Fi Hotspot: $error")
-                    resetToHome()
-                }
-            })
-        } catch (e: Exception) {
-            Log.e("FlipViewModel", "Error parsing pairing data: ${e.message}")
-            showToast("Pairing error: ${e.message}")
-            resetToHome()
-        }
     }
 
     // --- HTTP SERVER LISTENER CALLBACKS ---
@@ -485,7 +556,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             bleService.stopAdvertising()
             _remoteDevice.value = device
             _connectionState.value = ConnectionState.CONNECTED
-            connectionStateManager.setPeerStatus(PeerConnectionStatus.READY)
             showToast("Connected to ${device.name}")
             checkAndQueuePreSelected()
         }
@@ -513,7 +583,18 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onFileTransferStarted(transferId: String, fileName: String, fileSize: Long, isIncoming: Boolean) {
         viewModelScope.launch(Dispatchers.Main) {
-            TransferManager.addIncomingTransfer(context, transferId, fileName, fileSize)
+            // Check if item already exists
+            val existing = _transferQueue.value.any { it.id == transferId }
+            if (!existing) {
+                val item = TransferItem(
+                    id = transferId,
+                    fileName = fileName,
+                    fileSize = fileSize,
+                    status = TransferStatus.SENDING,
+                    isIncoming = true
+                )
+                _transferQueue.value = _transferQueue.value + item
+            }
         }
     }
 
@@ -537,7 +618,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         }
 
         viewModelScope.launch(Dispatchers.Main) {
-            val item = TransferManager.transferQueue.value.firstOrNull { it.id == transferId }
+            val item = _transferQueue.value.firstOrNull { it.id == transferId }
             updateItemStatus(transferId, TransferStatus.COMPLETE)
             if (item != null) {
                 showToast("Received and saved: ${item.fileName}")
@@ -556,7 +637,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onRemoteCancelled(transferId: String) {
         viewModelScope.launch(Dispatchers.Main) {
-            val item = TransferManager.transferQueue.value.firstOrNull { it.id == transferId }
+            val item = _transferQueue.value.firstOrNull { it.id == transferId }
             updateItemStatus(transferId, TransferStatus.CANCELLED)
             if (item != null) {
                 StorageService.cancelTransfer(transferId, item.fileName)
@@ -567,7 +648,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onCleared() {
         super.onCleared()
-        connectionStateManager.release()
         performDisconnectCleanup()
     }
 
@@ -576,19 +656,16 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         val updated = current.copy(ip = newIp)
         _localDevice.value = updated
         
-        // If we are in RECEIVER mode and advertising, restart advertising with the new IP!
-        if (_role.value == "RECEIVER" && _connectionState.value == ConnectionState.SEARCHING) {
+        // If we are in SENDER mode and advertising, restart advertising with the new IP!
+        if (_role.value == "SENDER" && _connectionState.value == ConnectionState.SEARCHING) {
             viewModelScope.launch(Dispatchers.IO) {
                 bleService.stopAdvertising()
-                val sessId = currentSessionId
-                if (sessId != null) {
-                    bleService.startAdvertising(
-                        protocolVersion = "1.0",
-                        sessionId = sessId,
-                        deviceName = updated.name,
-                        deviceType = "phone"
-                    )
-                }
+                bleService.startAdvertising(
+                    localIp = updated.ip,
+                    port = updated.port,
+                    deviceId = updated.id,
+                    deviceName = updated.name
+                )
             }
         }
     }

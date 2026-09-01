@@ -10,9 +10,6 @@ import com.example.database.AppDatabase
 import com.example.database.IndexedFile
 import com.example.database.IndexedFileDao
 import java.io.File
-import java.security.MessageDigest
-import java.io.InputStream
-import java.io.FileInputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -100,120 +97,13 @@ object FileScanner {
         }
     }
 
-    private fun calculateHash(context: Context, uriString: String?, pathStr: String?): String? {
-        var inputStream: InputStream? = null
-        try {
-            if (!pathStr.isNullOrBlank()) {
-                val file = File(pathStr)
-                if (file.exists() && file.isFile) {
-                    inputStream = FileInputStream(file)
-                }
-            }
-            if (inputStream == null && !uriString.isNullOrBlank()) {
-                inputStream = context.contentResolver.openInputStream(Uri.parse(uriString))
-            }
-            if (inputStream == null) return null
-
-            val digest = MessageDigest.getInstance("MD5")
-            val buffer = ByteArray(8192)
-            val read = inputStream.read(buffer)
-            if (read > 0) {
-                digest.update(buffer, 0, read)
-            }
-            val hashBytes = digest.digest()
-            return hashBytes.joinToString("") { "%02x".format(it) }
-        } catch (e: Exception) {
-            Log.e(TAG, "Hash calculation failed for path=$pathStr uri=$uriString", e)
-            return null
-        } finally {
-            try { inputStream?.close() } catch (e: Exception) {}
-        }
-    }
-
-    private fun addOrMergeFile(
-        context: Context,
-        fileList: MutableList<IndexedFile>,
-        name: String,
-        size: Long,
-        dateModified: Long,
-        uriString: String?,
-        path: String?,
-        mimeType: String,
-        category: String
-    ) {
-        if (size <= 0) return
-
-        // 1. Check for an existing match using filename + size + modified date (tolerance of 2 seconds)
-        val matchIndex = fileList.indexOfFirst { item ->
-            item.name.equals(name, ignoreCase = true) &&
-                    item.size == size &&
-                    Math.abs(item.dateAdded - dateModified) <= 2
-        }
-
-        if (matchIndex != -1) {
-            val existing = fileList[matchIndex]
-            
-            // Suspect false positive check if names match but we want to verify with hash
-            val existingHash = existing.hash ?: calculateHash(context, existing.uriString, existing.path)
-            val newHash = calculateHash(context, uriString, path)
-
-            val isSameFile = if (existingHash != null && newHash != null) {
-                existingHash == newHash
-            } else {
-                // If we couldn't get a hash for one or both, we assume they are the same file
-                // because filename, size, and modified date are identical.
-                true
-            }
-
-            if (isSameFile) {
-                // Merge/update the existing record
-                // Attach the URI if only the path was known, or vice versa
-                // Always prioritize content:// URI for uriString as it has better compatibility, but preserve path.
-                val mergedUri = if (existing.uriString.startsWith("content://")) {
-                    existing.uriString
-                } else if (uriString != null && uriString.startsWith("content://")) {
-                    uriString
-                } else {
-                    existing.uriString
-                }
-                val mergedPath = existing.path ?: path
-                val mergedHash = existingHash ?: newHash
-
-                fileList[matchIndex] = existing.copy(
-                    uriString = mergedUri,
-                    path = mergedPath,
-                    hash = mergedHash,
-                    mimeType = if (existing.mimeType == "application/octet-stream" && mimeType != "application/octet-stream") mimeType else existing.mimeType,
-                    category = if (existing.category == "Documents" && category != "Documents") category else existing.category
-                )
-                return
-            }
-        }
-
-        // No match found, insert new record
-        val fileHash = calculateHash(context, uriString, path)
-        fileList.add(
-            IndexedFile(
-                uriString = uriString ?: "",
-                path = path,
-                name = name,
-                size = size,
-                mimeType = mimeType,
-                category = category,
-                dateAdded = dateModified,
-                hash = fileHash
-            )
-        )
-    }
-
     private fun scanCategory(context: Context, category: String, contentUri: Uri, outputList: MutableList<IndexedFile>) {
         val projection = arrayOf(
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.MIME_TYPE,
-            MediaStore.MediaColumns.DATE_MODIFIED,
-            MediaStore.MediaColumns.DATA
+            MediaStore.MediaColumns.DATE_MODIFIED
         )
 
         try {
@@ -229,7 +119,6 @@ object FileScanner {
                 val sizeCol = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
                 val mimeCol = cursor.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
                 val dateCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)
-                val dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
 
                 while (cursor.moveToNext()) {
                     if (idCol == -1 || nameCol == -1 || sizeCol == -1 || mimeCol == -1 || dateCol == -1) continue
@@ -239,20 +128,17 @@ object FileScanner {
                     if (size <= 0) continue // Skip empty files
                     val mimeType = cursor.getString(mimeCol) ?: "application/octet-stream"
                     val dateAdded = cursor.getLong(dateCol)
-                    val path = if (dataCol != -1) cursor.getString(dataCol) else null
 
                     val fileUri = ContentUris.withAppendedId(contentUri, id)
-                    
-                    addOrMergeFile(
-                        context = context,
-                        fileList = outputList,
-                        name = name,
-                        size = size,
-                        dateModified = dateAdded,
-                        uriString = fileUri.toString(),
-                        path = path,
-                        mimeType = mimeType,
-                        category = category
+                    outputList.add(
+                        IndexedFile(
+                            uriString = fileUri.toString(),
+                            name = name,
+                            size = size,
+                            mimeType = mimeType,
+                            category = category,
+                            dateAdded = dateAdded
+                        )
                     )
                 }
             }
@@ -268,10 +154,10 @@ object FileScanner {
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.MIME_TYPE,
-            MediaStore.MediaColumns.DATE_MODIFIED,
-            MediaStore.MediaColumns.DATA
+            MediaStore.MediaColumns.DATE_MODIFIED
         )
 
+        // Select files that are not images, videos, audio and have common document extensions/mime types
         val documentExtensions = listOf(
             "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", 
             "txt", "zip", "rar", "tar", "gz", "7z", "epub", "csv", "json", "xml"
@@ -295,7 +181,6 @@ object FileScanner {
                 val sizeCol = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
                 val mimeCol = cursor.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
                 val dateCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)
-                val dataCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
 
                 while (cursor.moveToNext()) {
                     if (idCol == -1 || nameCol == -1 || sizeCol == -1 || mimeCol == -1 || dateCol == -1) continue
@@ -305,8 +190,8 @@ object FileScanner {
                     if (size <= 0) continue
                     val mimeType = cursor.getString(mimeCol) ?: "application/octet-stream"
                     val dateAdded = cursor.getLong(dateCol)
-                    val path = if (dataCol != -1) cursor.getString(dataCol) else null
 
+                    // Verify if it is indeed a document
                     val ext = name.substringAfterLast('.', "").lowercase()
                     val isDoc = mimeType.startsWith("text/") || 
                                 mimeType == "application/pdf" || 
@@ -319,17 +204,15 @@ object FileScanner {
 
                     if (isDoc && !mimeType.startsWith("image/") && !mimeType.startsWith("video/") && !mimeType.startsWith("audio/")) {
                         val fileUri = ContentUris.withAppendedId(contentUri, id)
-                        
-                        addOrMergeFile(
-                            context = context,
-                            fileList = outputList,
-                            name = name,
-                            size = size,
-                            dateModified = dateAdded,
-                            uriString = fileUri.toString(),
-                            path = path,
-                            mimeType = mimeType,
-                            category = "Documents"
+                        outputList.add(
+                            IndexedFile(
+                                uriString = fileUri.toString(),
+                                name = name,
+                                size = size,
+                                mimeType = mimeType,
+                                category = "Documents",
+                                dateAdded = dateAdded
+                            )
                         )
                     }
                 }
@@ -340,6 +223,7 @@ object FileScanner {
     }
 
     private fun scanFallbackDirectories(context: Context, currentList: MutableList<IndexedFile>, dao: IndexedFileDao) {
+        // Deep scanner targets
         val foldersToScan = listOf(
             Environment.DIRECTORY_DCIM,
             Environment.DIRECTORY_PICTURES,
@@ -349,29 +233,35 @@ object FileScanner {
             Environment.DIRECTORY_MUSIC
         )
 
+        val processedPathsOrUris = currentList.map { it.uriString }.toMutableSet()
+
         for (folderName in foldersToScan) {
             val folder = Environment.getExternalStoragePublicDirectory(folderName)
             if (folder.exists() && folder.isDirectory) {
-                scanDirRecursively(context, folder, folderName, currentList, depth = 0)
+                scanDirRecursively(folder, folderName, processedPathsOrUris, currentList, depth = 0)
             }
         }
     }
 
-    private fun scanDirRecursively(context: Context, dir: File, defaultCategoryName: String, outputList: MutableList<IndexedFile>, depth: Int) {
-        if (depth > 4) return 
+    private fun scanDirRecursively(dir: File, defaultCategoryName: String, processed: MutableSet<String>, outputList: MutableList<IndexedFile>, depth: Int) {
+        if (depth > 4) return // Guard against excessive nesting/infinite loops
         
         val files = try { dir.listFiles() } catch (e: Exception) { null } ?: return
         for (file in files) {
             if (file.name.startsWith(".")) continue
             if (file.isDirectory) {
-                scanDirRecursively(context, file, defaultCategoryName, outputList, depth + 1)
+                scanDirRecursively(file, defaultCategoryName, processed, outputList, depth + 1)
             } else {
+                val fileUriStr = Uri.fromFile(file).toString()
+                if (processed.contains(fileUriStr)) continue
+                
                 val size = file.length()
                 if (size <= 0) continue
 
                 val name = file.name
                 val ext = name.substringAfterLast('.', "").lowercase()
                 
+                // Categorize based on extension
                 val category = when (ext) {
                     "jpg", "jpeg", "png", "webp", "gif", "bmp" -> "Images"
                     "mp4", "mkv", "mov", "avi", "3gp", "webm" -> "Videos"
@@ -397,19 +287,17 @@ object FileScanner {
                     else -> "application/octet-stream"
                 }
 
-                val fileUriStr = Uri.fromFile(file).toString()
-                
-                addOrMergeFile(
-                    context = context,
-                    fileList = outputList,
-                    name = name,
-                    size = size,
-                    dateModified = file.lastModified() / 1000L,
-                    uriString = fileUriStr,
-                    path = file.absolutePath,
-                    mimeType = mimeType,
-                    category = category
+                outputList.add(
+                    IndexedFile(
+                        uriString = fileUriStr,
+                        name = name,
+                        size = size,
+                        mimeType = mimeType,
+                        category = category,
+                        dateAdded = file.lastModified() / 1000L
+                    )
                 )
+                processed.add(fileUriStr)
             }
         }
     }

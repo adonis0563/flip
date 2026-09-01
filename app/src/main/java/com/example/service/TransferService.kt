@@ -232,20 +232,6 @@ class TransferService(private val context: Context) {
                             Log.w(TAG, "[FILE_TRANSFER] Transfer cancelled by user check.")
                             throw IOException("Transfer cancelled")
                         }
-                        
-                        // Active blocking pause check to keep underlying connection open
-                        while (TransferManager.isPaused(transferId)) {
-                            if (cancelCheck()) {
-                                Log.w(TAG, "[FILE_TRANSFER] Transfer cancelled during pause.")
-                                throw IOException("Transfer cancelled")
-                            }
-                            try {
-                                Thread.sleep(100)
-                            } catch (e: InterruptedException) {
-                                throw IOException("Transfer interrupted")
-                            }
-                        }
-
                         val read = stream.read(buffer)
                         if (read == -1) {
                             Log.d(TAG, "[FILE_TRANSFER] End of stream reached.")

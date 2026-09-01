@@ -15,13 +15,11 @@ import androidx.room.RoomDatabase
 data class IndexedFile(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val uriString: String,
-    val path: String? = null,
     val name: String,
     val size: Long,
     val mimeType: String,
     val category: String, // "Images", "Videos", "Audio", "Documents", "Apps"
-    val dateAdded: Long,
-    val hash: String? = null
+    val dateAdded: Long
 )
 
 @Dao
@@ -40,12 +38,9 @@ interface IndexedFileDao {
 
     @Query("SELECT EXISTS(SELECT 1 FROM indexed_files WHERE uriString = :uriStr OR (name = :name AND size = :size))")
     suspend fun exists(uriStr: String, name: String, size: Long): Boolean
-
-    @Query("SELECT * FROM indexed_files WHERE name = :name AND size = :size AND abs(dateAdded - :dateAdded) <= 2 LIMIT 1")
-    suspend fun findMatch(name: String, size: Long, dateAdded: Long): IndexedFile?
 }
 
-@Database(entities = [IndexedFile::class], version = 2, exportSchema = false)
+@Database(entities = [IndexedFile::class], version = 1, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun indexedFileDao(): IndexedFileDao
 

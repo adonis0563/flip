@@ -58,7 +58,6 @@ import com.example.model.TransferStatus
 import com.example.service.QrCodeGenerator
 import com.example.service.StorageService
 import com.example.service.LocalFileItem
-import com.example.service.FlipConnectionState
 import coil.compose.AsyncImage
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -102,7 +101,6 @@ fun FlipAppContent(viewModel: FlipViewModel) {
     val transferQueue by viewModel.transferQueue.collectAsState()
     val toastMessage by viewModel.toastMessage.collectAsState()
     val bleError by viewModel.bleError.collectAsState()
-    val flipConnectionState by viewModel.flipConnectionState.collectAsState()
 
     val context = LocalContext.current
 
@@ -146,18 +144,6 @@ fun FlipAppContent(viewModel: FlipViewModel) {
             onGetStarted = { showSplash = false }
         )
     } else {
-        // Safe persistent top-level BackHandler to prevent system-exit race conditions in Compose
-        val canGoBack = connectionState == ConnectionState.SEARCHING || 
-                        connectionState == ConnectionState.CONNECTING ||
-                        connectionState == ConnectionState.CONNECTED
-        BackHandler(enabled = canGoBack) {
-            if (connectionState == ConnectionState.CONNECTED) {
-                viewModel.disconnect()
-            } else {
-                viewModel.resetToHome()
-            }
-        }
-
         Scaffold(
             modifier = Modifier.fillMaxSize(),
             contentWindowInsets = WindowInsets.safeDrawing,
@@ -173,7 +159,6 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                     ConnectionState.IDLE -> {
                         HomeScreen(
                             localDevice = localDevice,
-                            flipConnectionState = flipConnectionState,
                             onSendMode = { viewModel.startSenderMode() },
                             onReceiveMode = { viewModel.startReceiverMode() },
                             onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
@@ -182,6 +167,9 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                     }
 
                     ConnectionState.SEARCHING, ConnectionState.CONNECTING -> {
+                        BackHandler {
+                            viewModel.resetToHome()
+                        }
                         if (role == "SENDER") {
                             SenderWaitingScreen(
                                 localDevice = localDevice,
@@ -201,6 +189,9 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                     }
 
                     ConnectionState.CONNECTED -> {
+                        BackHandler {
+                            viewModel.disconnect()
+                        }
                         ConnectedScreen(
                             remoteDevice = remoteDevice,
                             transferQueue = transferQueue,
@@ -362,7 +353,6 @@ fun SplashScreen(onGetStarted: () -> Unit) {
 @Composable
 fun HomeScreen(
     localDevice: Device?,
-    flipConnectionState: FlipConnectionState,
     onSendMode: () -> Unit,
     onReceiveMode: () -> Unit,
     onManualConnect: (String, Int) -> Unit,
@@ -449,13 +439,7 @@ fun HomeScreen(
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Button(
-                onClick = {
-                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
-                        onSendMode()
-                    } else {
-                        showPrecheckDialogForSend = true
-                    }
-                },
+                onClick = { showPrecheckDialogForSend = true },
                 modifier = Modifier
                     .weight(1f)
                     .height(96.dp)
@@ -485,13 +469,7 @@ fun HomeScreen(
             }
 
             Button(
-                onClick = {
-                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
-                        onReceiveMode()
-                    } else {
-                        showPrecheckDialogForReceive = true
-                    }
-                },
+                onClick = { showPrecheckDialogForReceive = true },
                 modifier = Modifier
                     .weight(1f)
                     .height(96.dp)
@@ -653,35 +631,17 @@ fun HomeScreen(
                         color = MaterialTheme.colorScheme.primary,
                         style = MaterialTheme.typography.bodySmall
                     )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(
-                                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) Color(0xFF4CAF50) else Color(0xFFF44336),
-                                    CircleShape
-                                )
-                        )
-                        Text(
-                            text = if (flipConnectionState != FlipConnectionState.DISCONNECTED) "Connections ready" else "Waiting for network & Bluetooth...",
-                            color = if (flipConnectionState != FlipConnectionState.DISCONNECTED) Color(0xFF4CAF50) else MinTextMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
                 }
             },
             confirmButton = {
                 TextButton(
                     onClick = {
                         showPrecheckDialogForSend = false
-                        if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
-                            onSendMode()
-                        } else {
+                        val ip = localDevice?.ip ?: "127.0.0.1"
+                        if (ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()) {
                             showNoNetworkDialog = true
+                        } else {
+                            onSendMode()
                         }
                     }
                 ) {
@@ -732,35 +692,17 @@ fun HomeScreen(
                         color = MaterialTheme.colorScheme.primary,
                         style = MaterialTheme.typography.bodySmall
                     )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(
-                                    if (flipConnectionState != FlipConnectionState.DISCONNECTED) Color(0xFF4CAF50) else Color(0xFFF44336),
-                                    CircleShape
-                                )
-                        )
-                        Text(
-                            text = if (flipConnectionState != FlipConnectionState.DISCONNECTED) "Connections ready" else "Waiting for network & Bluetooth...",
-                            color = if (flipConnectionState != FlipConnectionState.DISCONNECTED) Color(0xFF4CAF50) else MinTextMuted,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
                 }
             },
             confirmButton = {
                 TextButton(
                     onClick = {
                         showPrecheckDialogForReceive = false
-                        if (flipConnectionState != FlipConnectionState.DISCONNECTED) {
-                            onReceiveMode()
-                        } else {
+                        val ip = localDevice?.ip ?: "127.0.0.1"
+                        if (ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()) {
                             showNoNetworkDialog = true
+                        } else {
+                            onReceiveMode()
                         }
                     }
                 ) {
@@ -1769,15 +1711,17 @@ fun InAppFilePickerContent(
     
     // Required permission based on category
     val permissionsToRequest = remember {
-        val list = mutableListOf<String>()
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            list.add(android.Manifest.permission.READ_MEDIA_IMAGES)
-            list.add(android.Manifest.permission.READ_MEDIA_VIDEO)
-            list.add(android.Manifest.permission.READ_MEDIA_AUDIO)
-            list.add(android.Manifest.permission.POST_NOTIFICATIONS)
+            listOf(
+                android.Manifest.permission.READ_MEDIA_IMAGES,
+                android.Manifest.permission.READ_MEDIA_VIDEO,
+                android.Manifest.permission.READ_MEDIA_AUDIO
+            )
+        } else {
+            listOf(
+                android.Manifest.permission.READ_EXTERNAL_STORAGE
+            )
         }
-        list.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
-        list
     }
     
     val multiplePermissionsState = rememberMultiplePermissionsState(permissions = permissionsToRequest)

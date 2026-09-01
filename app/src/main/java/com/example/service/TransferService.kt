@@ -47,7 +47,9 @@ class TransferService(private val context: Context) {
         val body = json.toRequestBody("application/json".toMediaTypeOrNull())
         val request = Request.Builder().url(url).post(body).build()
 
-        client.newCall(request).enqueue(object : Callback {
+        // ✅ FIX: Use handshakeClient (3s timeout) instead of main client (30m timeout)
+        // to prevent the UI from hanging for 30 minutes if the target IP is unreachable.
+        handshakeClient.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 Log.e(TAG, "Connection failed: ${e.message}")
                 onError(e.message ?: "Connection failed")

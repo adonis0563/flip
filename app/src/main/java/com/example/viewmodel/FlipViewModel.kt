@@ -131,6 +131,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * SENDER: Tap "Send" role initiation
      */
     fun startSenderMode() {
+        // ✅ FIX: Synchronously stop any existing server to prevent ghost leaks during rapid toggling
+        httpServerService?.stopServer()
+        httpServerService = null
+
         _role.value = "SENDER"
         _connectionState.value = ConnectionState.SEARCHING
         _discoveredDevices.value = emptyList()
@@ -141,6 +145,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 // 1. Bind and start local HTTP server
                 val server = HttpServerService(context, this@FlipViewModel)
                 val port = server.startServer()
+                
+                // ✅ FIX: Double-check that we are still in SENDER mode before assigning, 
+                // in case the user rapidly toggled to RECEIVER mode while this was starting.
+                if (_role.value != "SENDER") {
+                    server.stopServer() // Kill the ghost server immediately
+                    return@launch
+                }
+                
                 httpServerService = server
                 _isServerRunning.value = true
 
@@ -172,6 +184,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * RECEIVER: Tap "Receive" role initiation
      */
     fun startReceiverMode() {
+        // ✅ FIX: Synchronously stop any existing server to prevent ghost leaks during rapid toggling
+        httpServerService?.stopServer()
+        httpServerService = null
+
         _role.value = "RECEIVER"
         _connectionState.value = ConnectionState.SEARCHING
         _discoveredDevices.value = emptyList()
@@ -182,6 +198,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 // 1. Bind and start local HTTP server
                 val server = HttpServerService(context, this@FlipViewModel)
                 val port = server.startServer()
+                
+                // ✅ FIX: Double-check that we are still in RECEIVER mode before assigning, 
+                // in case the user rapidly toggled to SENDER mode while this was starting.
+                if (_role.value != "RECEIVER") {
+                    server.stopServer() // Kill the ghost server immediately
+                    return@launch
+                }
+                
                 httpServerService = server
                 _isServerRunning.value = true
 
@@ -567,6 +591,13 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     // --- HTTP SERVER LISTENER CALLBACKS ---
     override fun onDeviceConnected(device: Device) {
         viewModelScope.launch(Dispatchers.Main) {
+            // ✅ FIX: Enforce strict 1-to-1 connection. Reject new connections if already connected.
+            if (_remoteDevice.value != null && _connectionState.value == ConnectionState.CONNECTED) {
+                Log.w("FlipViewModel", "Rejected connection from ${device.name}: Already connected to another device.")
+                showToast("Connection rejected: Already in a session.")
+                return@launch
+            }
+
             // Stop scanning/advertising
             bleService.stopScanning()
             bleService.stopAdvertising()
@@ -647,7 +678,19 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     override fun onFileTransferFailed(transferId: String, errorMessage: String) {
         viewModelScope.launch(Dispatchers.Main) {
             updateItemStatus(transferId, TransferStatus.FAILED, errorMessage)
-            showToast("File transfer failed: $errorMessage")
+            
+            // ✅ FIX: If the error indicates the sender's socket broke (Zombie Connection), 
+            // gracefully disconnect instead of leaving the receiver stuck on the CONNECTED screen.
+            if (errorMessage.contains("failed", ignoreCase = true) || 
+                errorMessage.contains("timeout", ignoreCase = true) || 
+                errorMessage.contains("reset", ignoreCase = true) ||
+                errorMessage.contains("closed", ignoreCase = true) ||
+                errorMessage.contains("broken", ignoreCase = true)) {
+                performDisconnectCleanup()
+                showToast("Connection lost: $errorMessage")
+            } else {
+                showToast("File transfer failed: $errorMessage")
+            }
         }
     }
 

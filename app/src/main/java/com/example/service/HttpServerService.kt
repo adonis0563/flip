@@ -17,7 +17,9 @@ import java.util.concurrent.Executors
 
 class HttpServerService(private val context: android.content.Context, private val listener: ServerListener) {
     private var serverSocket: ServerSocket? = null
-    private val executor = Executors.newCachedThreadPool()
+    // ✅ FIX: Use a bounded thread pool to prevent OutOfMemoryError (DoS) from excessive connections.
+    // Max 10 threads is more than enough for local P2P transfers (realistically only 1-2 active).
+    private val executor = Executors.newFixedThreadPool(10)
     private val moshi = Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()
     private val deviceAdapter = moshi.adapter(Device::class.java)
 
@@ -45,36 +47,35 @@ class HttpServerService(private val context: android.content.Context, private va
     private var isCancelled = false
 
     fun startServer(): Int {
-        val portsToTry = listOf(8080, 8081, 8082, 8083)
-        for (port in portsToTry) {
-            try {
-                val sSocket = ServerSocket(port)
-                serverSocket = sSocket
-                boundPort = port
-                isRunning = true
+        try {
+            // ✅ FIX: Pass 0 to let the OS assign a guaranteed available ephemeral port.
+            // This completely eliminates port collision crashes.
+            val sSocket = ServerSocket(0)
+            serverSocket = sSocket
+            boundPort = sSocket.localPort
+            isRunning = true
 
-                // Start a background thread to accept connections
-                executor.submit {
-                    while (isRunning) {
-                        try {
-                            val clientSocket = sSocket.accept()
-                            executor.submit {
-                                handleClientSocket(clientSocket)
-                            }
-                        } catch (e: Exception) {
-                            if (!isRunning) break
-                            Log.e(TAG, "Error accepting socket connection: ${e.message}")
+            // Start a background thread to accept connections
+            executor.submit {
+                while (isRunning) {
+                    try {
+                        val clientSocket = sSocket.accept()
+                        executor.submit {
+                            handleClientSocket(clientSocket)
                         }
+                    } catch (e: Exception) {
+                        if (!isRunning) break
+                        Log.e(TAG, "Error accepting socket connection: ${e.message}")
                     }
                 }
-
-                Log.d(TAG, "Custom HTTP Server started successfully on port $port")
-                return port
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to bind to port $port: ${e.message}")
             }
+
+            Log.d(TAG, "Custom HTTP Server started successfully on port $boundPort")
+            return boundPort
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind to an available port: ${e.message}")
+            throw IllegalStateException("Unable to start HTTP server: ${e.message}")
         }
-        throw IllegalStateException("Unable to bind to any available port in $portsToTry")
     }
 
     fun stopServer() {

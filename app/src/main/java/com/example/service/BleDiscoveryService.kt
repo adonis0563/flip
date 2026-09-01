@@ -31,7 +31,9 @@ class BleDiscoveryService(
 
     companion object {
         private const val TAG = "BleDiscoveryService"
-        private const val MANUFACTURER_ID = 0xFFFF // Custom testing ID
+        // ✅ FIX: Use a safe, non-reserved 16-bit ID. 0xFFFF is reserved by Bluetooth SIG for testing 
+        // and may be blocked by strict OEM BLE filters. 0x0563 is a safe custom identifier.
+        private const val MANUFACTURER_ID = 0x0563 
         private val SERVICE_UUID = UUID.fromString("0000f119-0000-1000-8000-00805f9b34fb")
     }
 
@@ -174,16 +176,23 @@ class BleDiscoveryService(
         // Compact ID hash/slice
         val idBytes = id.take(8).padEnd(8, ' ').toByteArray(StandardCharsets.UTF_8)
         
-        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
         val maxNameLen = 10
-        val truncatedName = if (nameBytes.size > maxNameLen) nameBytes.copyOf(maxNameLen) else nameBytes
-        val paddedName = truncatedName.copyOf(maxNameLen)
+        
+        // ✅ FIX: Truncate by character to avoid slicing multi-byte UTF-8 characters (like emojis)
+        var truncatedNameStr = name
+        while (truncatedNameStr.toByteArray(StandardCharsets.UTF_8).size > maxNameLen) {
+            truncatedNameStr = truncatedNameStr.dropLast(1)
+        }
+        
+        val nameBytes = truncatedNameStr.toByteArray(StandardCharsets.UTF_8)
+        val paddedName = nameBytes.copyOf(maxNameLen) // Pads with 0x00 to exactly 10 bytes
 
         val out = ByteArray(4 + 2 + 8 + maxNameLen)
         System.arraycopy(ipBytes, 0, out, 0, 4)
         System.arraycopy(portBytes, 0, out, 4, 2)
         System.arraycopy(idBytes, 0, out, 6, 8)
         System.arraycopy(paddedName, 0, out, 14, maxNameLen)
+
         return out
     }
 

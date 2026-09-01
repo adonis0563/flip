@@ -100,16 +100,26 @@ class MainActivity : ComponentActivity() {
         if (intent == null) return
         val action = intent.action
         val type = intent.type
-
-        if (android.content.Intent.ACTION_SEND == action && type != null) {
-            val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+        
+        if (android.content.Intent.ACTION_SEND == action) {
+            // ✅ FIX: Handle shared text
+            val sharedText = intent.getStringExtra(android.content.Intent.EXTRA_TEXT)
+            if (!sharedText.isNullOrBlank()) {
+                viewModel.sendText(sharedText)
+                return
             }
-            streamUri?.let { uri ->
-                viewModel.importSharedFiles(listOf(uri))
+            
+            // Handle shared files
+            if (type != null) {
+                val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+                }
+                streamUri?.let { uri ->
+                    viewModel.importSharedFiles(listOf(uri))
+                }
             }
         } else if (android.content.Intent.ACTION_SEND_MULTIPLE == action && type != null) {
             val streamUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

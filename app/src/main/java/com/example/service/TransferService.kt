@@ -206,18 +206,23 @@ class TransferService(private val context: Context) {
                     if (offset > 0) {
                         Log.d(TAG, "[FILE_TRANSFER] Skipping stream to offset: $offset")
                         var remainingToSkip = offset
+                        val skipBuffer = ByteArray(64 * 1024) // 64KB buffer for skipping
+                        
                         while (remainingToSkip > 0) {
                             val skipped = stream.skip(remainingToSkip)
                             if (skipped > 0) {
                                 remainingToSkip -= skipped
                             } else {
-                                // skip returned 0, try reading a single byte
-                                if (stream.read() == -1) {
+                                // ✅ FIX: Read in chunks instead of single bytes to prevent massive slowdowns
+                                val bytesToRead = minOf(remainingToSkip, skipBuffer.size.toLong()).toInt()
+                                val read = stream.read(skipBuffer, 0, bytesToRead)
+                                if (read == -1) {
                                     break // EOF reached prematurely
                                 }
-                                remainingToSkip--
+                                remainingToSkip -= read
                             }
                         }
+                        
                         if (remainingToSkip > 0) {
                             throw IOException("Failed to skip input stream to offset $offset. Remaining: $remainingToSkip")
                         }

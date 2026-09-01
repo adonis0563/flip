@@ -76,8 +76,12 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val preSelectedFiles = java.util.Collections.synchronizedList(mutableListOf<LocalFileItem>())
 
     fun preSelectFiles(files: List<LocalFileItem>) {
-        preSelectedFiles.clear()
-        preSelectedFiles.addAll(files)
+        // ✅ FIX: Synchronize compound operations to prevent ConcurrentModificationException
+        // or silent data loss if checkAndQueuePreSelected() runs concurrently.
+        synchronized(preSelectedFiles) {
+            preSelectedFiles.clear()
+            preSelectedFiles.addAll(files)
+        }
         showToast("Pre-selected ${files.size} files. They will transfer automatically when connected.")
     }
 
@@ -454,6 +458,18 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     // Let paused state stay
                 } else {
                     updateItemStatus(item.id, TransferStatus.FAILED, errMsg)
+                    
+                    // ✅ FIX: If the error indicates a dropped connection, gracefully disconnect 
+                    // instead of leaving the sender stuck in the "CONNECTED" state forever.
+                    if (errMsg.contains("failed", ignoreCase = true) || 
+                        errMsg.contains("timeout", ignoreCase = true) || 
+                        errMsg.contains("reset", ignoreCase = true) ||
+                        errMsg.contains("closed", ignoreCase = true)) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            performDisconnectCleanup()
+                            showToast("Connection lost: $errMsg")
+                        }
+                    }
                 }
                 completer.complete(Unit)
             }

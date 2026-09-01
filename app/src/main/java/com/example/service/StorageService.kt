@@ -423,39 +423,59 @@ object StorageService {
             val pm = context.packageManager
             val pkgName = item.packageName ?: return null
             val appInfo = pm.getApplicationInfo(pkgName, 0)
-            val sourceApk = File(appInfo.publicSourceDir ?: appInfo.sourceDir ?: return null)
-            
-            if (!sourceApk.exists()) return null
             
             val tempDir = File(getFlipDirectory(), "Temp/APK")
             if (!tempDir.exists()) {
                 tempDir.mkdirs()
             }
+
+            val zipFileName = item.name.replace(".apk", "", ignoreCase = true) + "_bundle.apks"
+            val destZipFile = File(tempDir, zipFileName)
             
-            val destFile = File(tempDir, item.name)
-            onProgress("Extracting ${item.name}...", 0f)
+            onProgress("Packaging ${item.name}...", 0f)
+
+            val sourceFiles = mutableListOf<File>()
+            val baseApkPath = appInfo.publicSourceDir ?: appInfo.sourceDir ?: return null
+            sourceFiles.add(File(baseApkPath))
             
-            val totalSize = sourceApk.length()
+            appInfo.splitSourceDirs?.forEach { splitPath ->
+                sourceFiles.add(File(splitPath))
+            }
+
+            var totalBytesToCopy = 0L
+            sourceFiles.forEach { file -> 
+                if (file.exists()) totalBytesToCopy += file.length() 
+            }
+            
             var bytesCopied = 0L
-            
-            sourceApk.inputStream().use { input ->
-                destFile.outputStream().use { output ->
-                    val buffer = ByteArray(1024 * 64)
-                    var bytes = input.read(buffer)
-                    while (bytes >= 0) {
-                        output.write(buffer, 0, bytes)
-                        bytesCopied += bytes
-                        if (totalSize > 0) {
-                            onProgress("Extracting ${item.name}...", bytesCopied.toFloat() / totalSize)
+
+            java.util.zip.ZipOutputStream(java.io.FileOutputStream(destZipFile)).use { zos ->
+                sourceFiles.forEach { sourceFile ->
+                    if (!sourceFile.exists()) return@forEach
+                    
+                    val entryName = sourceFile.name
+                    zos.putNextEntry(java.util.zip.ZipEntry(entryName))
+                    
+                    java.io.FileInputStream(sourceFile).use { fis ->
+                        val buffer = ByteArray(1024 * 64)
+                        var bytes = fis.read(buffer)
+                        while (bytes >= 0) {
+                            zos.write(buffer, 0, bytes)
+                            bytesCopied += bytes
+                            if (totalBytesToCopy > 0) {
+                                onProgress("Packaging ${item.name}...", bytesCopied.toFloat() / totalBytesToCopy)
+                            }
+                            bytes = fis.read(buffer)
                         }
-                        bytes = input.read(buffer)
                     }
+                    zos.closeEntry()
                 }
             }
-            onProgress("Extraction complete", 1f)
-            return destFile
+
+            onProgress("Packaging complete", 1f)
+            return destZipFile
         } catch (e: Exception) {
-            Log.e("StorageService", "Failed to extract APK: ${e.message}")
+            Log.e("StorageService", "Failed to package APK: ${e.message}")
         }
         return null
     }

@@ -21,8 +21,10 @@ class TransferService(private val context: Context) {
     // Dedicated fast client with custom timeouts
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // Indefinite read timeout for large streams
-        .writeTimeout(0, TimeUnit.MILLISECONDS) // Indefinite write timeout for large streams
+        // ✅ FIX: Set finite timeouts to prevent indefinite queue freezing on network drops.
+        // 30 minutes is plenty for large local file transfers, but prevents infinite hangs.
+        .readTimeout(30, TimeUnit.MINUTES)
+        .writeTimeout(30, TimeUnit.MINUTES)
         .build()
 
     // 3-second timeout client for handshake checks

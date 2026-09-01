@@ -278,9 +278,10 @@ class HttpServerService(private val context: android.content.Context, private va
             if (remaining <= 0) {
                 remaining = Long.MAX_VALUE
             }
-
             var lastProgressUpdate = System.currentTimeMillis()
             var lastLogUpdate = System.currentTimeMillis()
+            var lastOffsetUpdate = System.currentTimeMillis()
+            val OFFSET_WRITE_INTERVAL_MS = 2000L // FIX: Throttle disk writes to every 2 seconds
 
             while (remaining > 0) {
                 val limit = minOf(buffer.size.toLong(), remaining).toInt()
@@ -289,30 +290,37 @@ class HttpServerService(private val context: android.content.Context, private va
                     Log.d(TAG, "[FILE_TRANSFER_RECEIVER] Input stream reached end of stream.")
                     break
                 }
-
                 if (isCancelled) {
                     Log.w(TAG, "[FILE_TRANSFER_RECEIVER] Upload cancelled locally")
                     throw InterruptedException("Cancelled")
                 }
-
                 outputStream.write(buffer, 0, bytesRead)
                 bytesWritten += bytesRead
                 remaining -= bytesRead
 
-                // Write offset marker to disk progressively
-                offsetFile.writeText(bytesWritten.toString())
-
                 val now = System.currentTimeMillis()
-                if (now - lastProgressUpdate > 150) { // Throttle updates to ~150ms for performance
+
+                // ✅ FIX: Throttle offset file writes to prevent flash storage thrashing
+                if (now - lastOffsetUpdate > OFFSET_WRITE_INTERVAL_MS) {
+                    offsetFile.writeText(bytesWritten.toString())
+                    lastOffsetUpdate = now
+                }
+
+                if (now - lastProgressUpdate > 150) { // Throttle UI updates to ~150ms for performance
                     listener.onFileTransferProgress(transferId, bytesWritten)
                     lastProgressUpdate = now
                 }
+                
                 // Log progress every 1 second
                 if (now - lastLogUpdate > 1000) {
                     Log.d(TAG, "[FILE_TRANSFER_RECEIVER] Bytes received and written: $bytesWritten / $fileSize (${if (fileSize > 0) (bytesWritten * 100f / fileSize).toInt() else 0}%)")
                     lastLogUpdate = now
                 }
             }
+
+            // ✅ FIX: Safety net. Ensure the absolute latest offset is saved if the loop exits 
+            // (e.g., due to cancellation, error, or sudden EOF) before the 2-second window elapsed.
+            offsetFile.writeText(bytesWritten.toString())
 
             outputStream.flush()
             success = true

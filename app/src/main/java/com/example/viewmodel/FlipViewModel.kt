@@ -1,6 +1,12 @@
 package com.example.viewmodel
 
 import android.app.Application
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import android.content.ClipboardManager
 import android.content.ClipData
 import android.content.Context
@@ -65,6 +71,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val _isServerRunning = MutableStateFlow(false)
     val isServerRunning: StateFlow<Boolean> = _isServerRunning.asStateFlow()
 
+    private val _showFileExplorer = MutableStateFlow(false)
+    val showFileExplorer: StateFlow<Boolean> = _showFileExplorer.asStateFlow()
+
+    // ✅ FIX: Signal to the UI that MediaStore has changed and files need to be re-queried
+    private val _refreshTrigger = MutableSharedFlow<Unit>(replay = 0)
+    val refreshTrigger: SharedFlow<Unit> = _refreshTrigger
+    private var mediaObserver: ContentObserver? = null
+
     // State lock for queue running
     private var queueJob: Job? = null
     @Volatile
@@ -117,6 +131,21 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         val devName = Build.MODEL ?: "Android Device"
         val localIp = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
         _localDevice.value = Device(id = devId, name = devName, ip = localIp, port = 8080)
+
+        // ✅ FIX: Listen for global MediaStore changes to instantly update the file explorer
+        mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                super.onChange(selfChange)
+                viewModelScope.launch {
+                    _refreshTrigger.emit(Unit)
+                }
+            }
+        }
+        context.contentResolver.registerContentObserver(
+            MediaStore.Files.getContentUri("external"),
+            true,
+            mediaObserver!!
+        )
     }
 
     fun clearToast() {
@@ -331,6 +360,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         performDisconnectCleanup()
     }
 
+    fun toggleFileExplorer() {
+        _showFileExplorer.value = !_showFileExplorer.value
+    }
+
     /**
      * Send plain text to the peer
      */
@@ -485,10 +518,15 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     
                     // ✅ FIX: If the error indicates a dropped connection, gracefully disconnect 
                     // instead of leaving the sender stuck in the "CONNECTED" state forever.
-                    if (errMsg.contains("failed", ignoreCase = true) || 
-                        errMsg.contains("timeout", ignoreCase = true) || 
-                        errMsg.contains("reset", ignoreCase = true) ||
-                        errMsg.contains("closed", ignoreCase = true)) {
+                    // ✅ FIX: Only drop connection on genuine network/socket errors. 
+                    // Removed generic "failed" which incorrectly caught file-specific errors like "Failed to open file stream".
+                    val isNetworkDrop = errMsg.contains("timeout", ignoreCase = true) || 
+                                        errMsg.contains("reset", ignoreCase = true) ||
+                                        errMsg.contains("closed", ignoreCase = true) ||
+                                        errMsg.contains("unreachable", ignoreCase = true) ||
+                                        errMsg.contains("failed to connect", ignoreCase = true)
+                                        
+                    if (isNetworkDrop) {
                         viewModelScope.launch(Dispatchers.Main) {
                             performDisconnectCleanup()
                             showToast("Connection lost: $errMsg")
@@ -681,11 +719,15 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             
             // ✅ FIX: If the error indicates the sender's socket broke (Zombie Connection), 
             // gracefully disconnect instead of leaving the receiver stuck on the CONNECTED screen.
-            if (errorMessage.contains("failed", ignoreCase = true) || 
-                errorMessage.contains("timeout", ignoreCase = true) || 
-                errorMessage.contains("reset", ignoreCase = true) ||
-                errorMessage.contains("closed", ignoreCase = true) ||
-                errorMessage.contains("broken", ignoreCase = true)) {
+            // ✅ FIX: Only drop connection on genuine network/socket errors.
+            val isNetworkDrop = errorMessage.contains("timeout", ignoreCase = true) || 
+                                errorMessage.contains("reset", ignoreCase = true) ||
+                                errorMessage.contains("closed", ignoreCase = true) ||
+                                errorMessage.contains("unreachable", ignoreCase = true) ||
+                                errorMessage.contains("failed to connect", ignoreCase = true) ||
+                                errorMessage.contains("broken", ignoreCase = true)
+                                
+            if (isNetworkDrop) {
                 performDisconnectCleanup()
                 showToast("Connection lost: $errorMessage")
             } else {
@@ -706,6 +748,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onCleared() {
+        mediaObserver?.let { context.contentResolver.unregisterContentObserver(it) }
         super.onCleared()
         performDisconnectCleanup()
     }
@@ -768,10 +811,15 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
             if (items.isNotEmpty()) {
                 if (_connectionState.value == ConnectionState.CONNECTED) {
-                    items.forEach { item ->
-                        addFileToTransferQueue(item.uri, item.name, item.size)
+                    // ✅ FIX: Only auto-send if we are the SENDER. Prevents connection drops when acting as Receiver.
+                    if (_role.value == "SENDER") {
+                        items.forEach { item ->
+                            addFileToTransferQueue(item.uri, item.name, item.size)
+                        }
+                        showToast("Imported ${items.size} shared files to transfer queue")
+                    } else {
+                        showToast("Cannot send files while in Receive mode. Please disconnect first.")
                     }
-                    showToast("Imported ${items.size} shared files to transfer queue")
                 } else {
                     preSelectFiles(items)
                     startSenderMode()

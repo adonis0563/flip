@@ -62,7 +62,6 @@ class TransferService(private val context: Context) {
                         try {
                             val remoteDevice = deviceAdapter.fromJson(responseBody)
                             if (remoteDevice != null) {
-                                // Keep remote configuration intact
                                 onSuccess(remoteDevice.copy(ip = remoteIp, port = remotePort))
                             } else {
                                 onError("Invalid response payload from device")

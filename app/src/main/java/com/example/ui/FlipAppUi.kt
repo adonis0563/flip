@@ -193,6 +193,7 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                             viewModel.disconnect()
                         }
                         ConnectedScreen(
+                            viewModel = viewModel,
                             remoteDevice = remoteDevice,
                             transferQueue = transferQueue,
                             onSendFile = { uri, name, size ->
@@ -218,6 +219,7 @@ fun FlipAppContent(viewModel: FlipViewModel) {
 
                 if (showStandaloneFilePicker) {
                     InAppFilePickerContent(
+                        viewModel = viewModel,
                         onDismiss = { showStandaloneFilePicker = false },
                         onSendFiles = { selectedFiles ->
                             viewModel.preSelectFiles(selectedFiles)
@@ -1636,6 +1638,7 @@ fun CustomFilterChip(
 @OptIn(ExperimentalPermissionsApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun InAppFilePickerContent(
+    viewModel: FlipViewModel,
     onDismiss: () -> Unit,
     onSendFiles: (List<LocalFileItem>) -> Unit,
     onLaunchSystemPicker: () -> Unit
@@ -1734,6 +1737,13 @@ fun InAppFilePickerContent(
     var scanStatusText by remember { mutableStateOf("") }
     var scanProgress by remember { mutableStateOf(0f) }
     var refreshTrigger by remember { mutableStateOf(0) }
+    
+    // ✅ FIX: Observe ViewModel's refresh trigger for instant auto-update
+    val viewModelRefreshTrigger by viewModel.refreshTrigger.collectAsState(initial = Unit)
+    LaunchedEffect(viewModelRefreshTrigger) {
+        refreshTrigger++
+    }
+    
     val scope = rememberCoroutineScope()
 
     fun triggerScan() {
@@ -1857,41 +1867,19 @@ fun InAppFilePickerContent(
                 when (selectedCategory) {
                     "Apps" -> StorageService.queryInstalledApps(context, showSystemApps = showSystemApps)
                     "Storage" -> StorageService.listDirectoryFiles(currentDirectory)
-                    "Documents" -> {
-                        val dbDocs = dao.getFilesByCategory("Documents").map { indexedFile ->
-                            LocalFileItem(
-                                id = indexedFile.id,
-                                uri = Uri.parse(indexedFile.uriString),
-                                name = indexedFile.name,
-                                size = indexedFile.size,
-                                mimeType = indexedFile.mimeType,
-                                category = "Documents",
-                                dateAdded = indexedFile.dateAdded
-                            )
-                        }
-                        (safDocuments + dbDocs).distinctBy { it.uri.toString() }
-                    }
-                    "Images", "Videos", "Audio" -> {
-                        dao.getFilesByCategory(selectedCategory).map { indexedFile ->
-                            LocalFileItem(
-                                id = indexedFile.id,
-                                uri = Uri.parse(indexedFile.uriString),
-                                name = indexedFile.name,
-                                size = indexedFile.size,
-                                mimeType = indexedFile.mimeType,
-                                category = selectedCategory,
-                                dateAdded = indexedFile.dateAdded
-                            )
+                    // ✅ FIX: Use StorageService.queryMediaFiles directly to fix duplicates and missing documents
+                    "Images", "Videos", "Audio", "Documents" -> {
+                        val mediaFiles = StorageService.queryMediaFiles(context, selectedCategory)
+                        if (selectedCategory == "Documents") {
+                            (safDocuments + mediaFiles).distinctBy { it.uri.toString() }
+                        } else {
+                            mediaFiles
                         }
                     }
                     else -> emptyList()
                 }
             } else {
-                if (selectedCategory == "Documents") {
-                    safDocuments
-                } else {
-                    emptyList()
-                }
+                if (selectedCategory == "Documents") safDocuments else emptyList()
             }
             
             withContext(Dispatchers.Main) {
@@ -2753,6 +2741,7 @@ fun InAppFilePickerContent(
 // -------------------------------------------------------------
 @Composable
 fun ConnectedScreen(
+    viewModel: FlipViewModel,
     remoteDevice: Device?,
     transferQueue: List<TransferItem>,
     onSendFile: (Uri, String, Long) -> Unit,
@@ -2778,6 +2767,7 @@ fun ConnectedScreen(
 
     if (showInAppFilePicker) {
         InAppFilePickerContent(
+            viewModel = viewModel,
             onDismiss = { showInAppFilePicker = false },
             onSendFiles = { selectedFiles ->
                 selectedFiles.forEach { file ->

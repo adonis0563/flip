@@ -215,6 +215,7 @@ object StorageService {
 
     fun queryMediaFiles(context: Context, category: String): List<LocalFileItem> {
         val list = mutableListOf<LocalFileItem>()
+        val seenIds = mutableSetOf<Long>() // ✅ FIX: Prevent duplicate files
         
         val contentUri = when (category) {
             "Images" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -236,13 +237,19 @@ object StorageService {
             "Videos" -> null
             "Audio" -> null
             else -> {
-                // Documents or general files
-                "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ${MediaStore.Files.FileColumns.MEDIA_TYPE_NONE} OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/%' OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'"
+                // ✅ FIX: Explicitly target standard docs, text, and Office formats (vnd.*).
+                // Excludes APKs since they have their own dedicated Apps tab.
+                """
+                    (${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/%' 
+                    OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'
+                    OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'vnd.%')
+                    AND ${MediaStore.Files.FileColumns.MIME_TYPE} != 'application/vnd.android.package-archive'
+                """.trimIndent()
             }
         }
 
         try {
-            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT 50"
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT 100"
             context.contentResolver.query(
                 contentUri,
                 projection,
@@ -258,10 +265,17 @@ object StorageService {
 
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idColumn)
+                    
+                    // ✅ FIX: Skip if we've already seen this ID (prevents MediaStore duplicates)
+                    if (!seenIds.add(id)) continue 
+                    
                     val name = cursor.getString(nameColumn) ?: "Unknown"
                     val size = cursor.getLong(sizeColumn)
                     val mimeType = cursor.getString(mimeColumn) ?: "application/octet-stream"
                     val dateAdded = cursor.getLong(dateColumn)
+
+                    // ✅ FIX: Filter out hidden files or 0-byte broken files/thumbnails
+                    if (name.startsWith(".") || size == 0L) continue
 
                     val fileUri = ContentUris.withAppendedId(contentUri, id)
                     list.add(

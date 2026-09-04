@@ -72,6 +72,18 @@ import androidx.compose.foundation.border
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+object FlipPalette {
+    val Background = Color.White
+    val Surface = Color.White
+    val Primary = Color(0xFF0052FF) // Electric Blue
+    val OnPrimary = Color.White
+    val TextPrimary = Color(0xFF0F172A) // Dark Slate
+    val TextMuted = Color(0xFF64748B) // Slate Gray
+    val Border = Color(0xFFE2E8F0) // Light Gray
+    val StatusGreen = Color(0xFF22C55E) // On / Connected / Hotspot Active
+    val StatusRed = Color(0xFFEF4444)   // Off / Disconnected / No Network
+}
+
 // Helper to extract file details (name and size) from a URI
 fun getFileDetails(context: Context, uri: Uri): Pair<String, Long> {
     var name = "unnamed_file"
@@ -360,398 +372,209 @@ fun HomeScreen(
     onManualConnect: (String, Int) -> Unit,
     onExploreFiles: () -> Unit
 ) {
+    var showMenu by remember { mutableStateOf(false) }
+    var showManualDialog by remember { mutableStateOf(false) }
     var manualIp by remember { mutableStateOf("") }
     var manualPort by remember { mutableStateOf("8080") }
-    var showPrecheckDialogForSend by remember { mutableStateOf(false) }
-    var showPrecheckDialogForReceive by remember { mutableStateOf(false) }
     var showNoNetworkDialog by remember { mutableStateOf(false) }
-    var showMobileDataDialog by remember { mutableStateOf(false) }
-    var pendingMode by remember { mutableStateOf<String?>(null) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Spacer(modifier = Modifier.height(16.dp))
+    val ip = localDevice?.ip ?: "127.0.0.1"
+    val isOffline = ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()
 
-        // Device profile card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            shape = RoundedCornerShape(20.dp)
-        ) {
+    Scaffold(
+        topBar = {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp),
+                    .statusBarsPadding()
+                    .padding(horizontal = 24.dp, vertical = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PhoneAndroid,
-                        contentDescription = "My Device",
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(16.dp))
-
-                Column {
-                    Text(
-                        text = localDevice?.name ?: "Android Device",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MinTextPrimary
-                        )
-                    )
-                    Text(
-                        text = "IP: ${localDevice?.ip ?: "Unknown"}",
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            color = MinTextSubtle
-                        )
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.weight(0.8f))
-
-        Text(
-            text = "Ready to flip?",
-            style = MaterialTheme.typography.headlineMedium.copy(
-                fontWeight = FontWeight.ExtraBold,
-                color = MinTextPrimary
-            )
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Send & Receive big CTA buttons
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Button(
-                onClick = { showPrecheckDialogForSend = true },
-                modifier = Modifier
-                    .weight(1f)
-                    .height(96.dp)
-                    .testTag("send_button"),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(24.dp)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.ArrowUpward,
-                        contentDescription = "Send Icon",
-                        tint = Color.White,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Send",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    )
-                }
-            }
-
-            Button(
-                onClick = { showPrecheckDialogForReceive = true },
-                modifier = Modifier
-                    .weight(1f)
-                    .height(96.dp)
-                    .testTag("receive_button"),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.secondary,
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(24.dp)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.ArrowDownward,
-                        contentDescription = "Receive Icon",
-                        tint = Color.White,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Receive",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        OutlinedButton(
-            onClick = onExploreFiles,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp)
-                .testTag("explore_files_button"),
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = MaterialTheme.colorScheme.primary
-            ),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
-        ) {
-            Icon(
-                imageVector = Icons.Default.Folder,
-                contentDescription = "Explore Files",
-                tint = MaterialTheme.colorScheme.primary
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "In-App File Explorer",
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.primary
-            )
-        }
-
-        Spacer(modifier = Modifier.weight(1f))
-
-        // Direct Connect manual card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            shape = RoundedCornerShape(20.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp)
-            ) {
                 Text(
-                    text = "Direct Connection Fallback",
-                    style = MaterialTheme.typography.labelLarge.copy(
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
+                    text = "FLIP",
+                    style = MaterialTheme.typography.headlineMedium.copy(
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 4.sp
+                    ),
+                    color = FlipPalette.Primary
                 )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    OutlinedTextField(
-                        value = manualIp,
-                        onValueChange = { manualIp = it },
-                        placeholder = { Text("Receiver IP (e.g. 192.168.1.5)") },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("manual_ip_input"),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            focusedTextColor = MinTextPrimary,
-                            unfocusedTextColor = MinTextPrimary
-                        ),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone)
-                    )
-
-                    Button(
-                        onClick = {
-                            val port = manualPort.toIntOrNull() ?: 8080
-                            if (manualIp.isNotBlank()) {
-                                onManualConnect(manualIp.trim(), port)
-                            }
-                        },
-                        modifier = Modifier
-                            .height(56.dp)
-                            .testTag("direct_connect_button"),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                            contentColor = MaterialTheme.colorScheme.primary
-                        ),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Connect",
-                            tint = MaterialTheme.colorScheme.primary
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.MoreVert, "Menu", tint = FlipPalette.TextPrimary)
+                    }
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Manual Connect") },
+                            onClick = { showMenu = false; showManualDialog = true }
                         )
                     }
                 }
             }
         }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 1. Device & Network Status Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = FlipPalette.Surface),
+                border = BorderStroke(1.dp, FlipPalette.Border),
+                shape = RoundedCornerShape(24.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(FlipPalette.Primary.copy(alpha = 0.1f), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Default.PhoneAndroid,
+                                "Device",
+                                tint = FlipPalette.Primary,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column {
+                            Text(
+                                text = localDevice?.name ?: "Android Device",
+                                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                                color = FlipPalette.TextPrimary
+                            )
+                            Text(
+                                text = ip,
+                                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                                color = FlipPalette.TextMuted
+                            )
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider(color = FlipPalette.Border)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Status Pill (Red for Offline, Green for Ready)
+                    val statusColor = if (isOffline) FlipPalette.StatusRed else FlipPalette.StatusGreen
+                    val statusText = if (isOffline) "Offline / No Network" else "Network Ready"
+                    val statusIcon = if (isOffline) Icons.Default.WifiOff else Icons.Default.Wifi
+                    
+                    Row(
+                        modifier = Modifier
+                            .background(statusColor.copy(alpha = 0.1f), RoundedCornerShape(50))
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(statusIcon, "Status", tint = statusColor, modifier = Modifier.size(16.dp))
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = statusColor
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            // 2. Primary CTA Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                // Send (Solid Blue)
+                Button(
+                    onClick = { if (isOffline) showNoNetworkDialog = true else onSendMode() },
+                    modifier = Modifier.weight(1f).height(110.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = FlipPalette.Primary),
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Default.ArrowUpward, "Send", tint = Color.White, modifier = Modifier.size(32.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Send", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold), color = Color.White)
+                    }
+                }
+
+                // Receive (Outlined Blue)
+                OutlinedButton(
+                    onClick = { if (isOffline) showNoNetworkDialog = true else onReceiveMode() },
+                    modifier = Modifier.weight(1f).height(110.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = FlipPalette.Primary),
+                    border = BorderStroke(2.dp, FlipPalette.Primary),
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Default.ArrowDownward, "Receive", tint = FlipPalette.Primary, modifier = Modifier.size(32.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Receive", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 3. Secondary Action
+            OutlinedButton(
+                onClick = onExploreFiles,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = FlipPalette.TextPrimary),
+                border = BorderStroke(1.dp, FlipPalette.Border),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(Icons.Default.Folder, "Files", tint = FlipPalette.TextMuted)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Browse Files", fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(modifier = Modifier.weight(0.5f))
+        }
     }
 
-    if (showPrecheckDialogForSend) {
+    // Manual Connect Dialog
+    if (showManualDialog) {
         AlertDialog(
-            onDismissRequest = { showPrecheckDialogForSend = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Connection Check",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Enable Connections", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
+            onDismissRequest = { showManualDialog = false },
+            title = { Text("Manual Connect", fontWeight = FontWeight.Bold, color = FlipPalette.TextPrimary) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "For maximum speed and efficiency, let this phone create a local Wi-Fi network for the transfer.",
-                        color = MinTextMuted
-                    )
-                    Text(
-                        text = "1. Turn on Mobile Hotspot on this phone.\n2. Have the receiver connect to your Hotspot's Wi-Fi.\n3. Keep Bluetooth on so they can pair automatically.",
-                        color = MinTextMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Current IP: ${localDevice?.ip ?: "Unknown"}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(value = manualIp, onValueChange = { manualIp = it }, label = { Text("IP Address") }, placeholder = { Text("e.g. 192.168.1.5") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = manualPort, onValueChange = { manualPort = it }, label = { Text("Port") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 }
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        showPrecheckDialogForSend = false
-                        val ip = localDevice?.ip ?: "127.0.0.1"
-                        if (ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()) {
-                            showNoNetworkDialog = true
-                        } else {
-                            onSendMode()
-                        }
-                    }
-                ) {
-                    Text("My Hotspot is Active", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
+                Button(onClick = { showManualDialog = false; onManualConnect(manualIp.trim(), manualPort.toIntOrNull() ?: 8080) }, colors = ButtonDefaults.buttonColors(containerColor = FlipPalette.Primary)) { Text("Connect") }
             },
             dismissButton = {
-                TextButton(onClick = { showPrecheckDialogForSend = false }) {
-                    Text("Cancel", color = MinTextSubtle)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
+                TextButton(onClick = { showManualDialog = false }) { Text("Cancel", color = FlipPalette.TextMuted) }
+            }
         )
     }
 
-    if (showPrecheckDialogForReceive) {
-        AlertDialog(
-            onDismissRequest = { showPrecheckDialogForReceive = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Connection Check",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Enable Connections", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "Please connect this phone to the sender's local Wi-Fi or Mobile Hotspot before proceeding.",
-                        color = MinTextMuted
-                    )
-                    Text(
-                        text = "1. Turn on Wi-Fi on this phone.\n2. Connect to the sender's Mobile Hotspot network.\n3. Make sure Bluetooth is enabled.",
-                        color = MinTextMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Current IP: ${localDevice?.ip ?: "Unknown"}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showPrecheckDialogForReceive = false
-                        val ip = localDevice?.ip ?: "127.0.0.1"
-                        if (ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()) {
-                            showNoNetworkDialog = true
-                        } else {
-                            onReceiveMode()
-                        }
-                    }
-                ) {
-                    Text("I'm Connected to Hotspot", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPrecheckDialogForReceive = false }) {
-                    Text("Cancel", color = MinTextSubtle)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
-        )
-    }
-
+    // No Network Dialog
     if (showNoNetworkDialog) {
         AlertDialog(
             onDismissRequest = { showNoNetworkDialog = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.WifiOff,
-                        contentDescription = "No Network Warning",
-                        tint = MaterialTheme.colorScheme.error
-                    )
-                    Text("Connect to Wi-Fi or Hotspot", fontWeight = FontWeight.Bold, color = MinTextPrimary)
+            title = { 
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Icon(Icons.Default.WifiOff, "Warning", tint = FlipPalette.StatusRed)
+                    Text("No Network", fontWeight = FontWeight.Bold, color = FlipPalette.TextPrimary)
                 }
             },
-            text = {
-                Text(
-                    text = "Your device has a loopback or offline IP (${localDevice?.ip ?: "127.0.0.1"}). Please connect to a Wi-Fi network or enable/connect to a personal Hotspot first.",
-                    color = MinTextMuted
-                )
-            },
+            text = { Text("Please connect to a Wi-Fi network or enable a Mobile Hotspot to start flipping.", color = FlipPalette.TextMuted) },
             confirmButton = {
-                TextButton(
-                    onClick = { showNoNetworkDialog = false }
-                ) {
-                    Text("OK", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
+                Button(onClick = { showNoNetworkDialog = false }, colors = ButtonDefaults.buttonColors(containerColor = FlipPalette.Primary)) { Text("OK") }
+            }
         )
     }
 }

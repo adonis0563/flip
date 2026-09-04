@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.util.UUID
+import android.net.wifi.p2p.WifiP2pDevice
 
 enum class ConnectionState {
     IDLE,
@@ -42,6 +43,50 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val transferService = TransferService(context)
     private val bleService = BleDiscoveryService(context, this)
     private var httpServerService: HttpServerService? = null
+    private var _pendingTargetDevice: Device? = null
+
+    private val _wifiDirectPeers = MutableStateFlow<List<WifiP2pDevice>>(emptyList())
+    private val wifiDirectService = WifiDirectService(context, object : WifiDirectService.DirectListener {
+        override fun onPeerDiscovered(device: WifiP2pDevice) {
+            val current = _wifiDirectPeers.value
+            if (current.none { it.deviceAddress == device.deviceAddress }) {
+                _wifiDirectPeers.value = current + device
+            }
+        }
+
+        override fun onConnectionEstablished(groupOwnerIp: String) {
+            if (_role.value == "SENDER") {
+                val currentLocal = _localDevice.value ?: return
+                val targetPort = _pendingTargetDevice?.port ?: 8080 // ✅ FIX: Use the ephemeral port advertised via BLE
+                
+                viewModelScope.launch(Dispatchers.IO) {
+                    transferService.connectToDevice(
+                        remoteIp = groupOwnerIp, // "192.168.49.1"
+                        remotePort = targetPort, // ✅ FIX: Dynamic port, NOT hardcoded 8080
+                        localDevice = currentLocal,
+                        onSuccess = { remote ->
+                            _pendingTargetDevice = null // ✅ FIX: Clean up
+                            bleService.stopScanning()
+                            _remoteDevice.value = remote
+                            _connectionState.value = ConnectionState.CONNECTED
+                            showToast("Connected to ${remote.name}")
+                            checkAndQueuePreSelected()
+                        },
+                        onError = { err ->
+                            _pendingTargetDevice = null // ✅ FIX: Clean up
+                            Log.e("FlipViewModel", "Failed to connect: $err")
+                            _connectionState.value = ConnectionState.SEARCHING
+                            showToast("Connection failed: $err")
+                        }
+                    )
+                }
+            }
+        }
+
+        override fun onDisconnected() {
+            performDisconnectCleanup()
+        }
+    })
 
     // UI state flows
     private val _connectionState = MutableStateFlow(ConnectionState.IDLE)
@@ -160,7 +205,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * SENDER: Tap "Send" role initiation
      */
     fun startSenderMode() {
-        // ✅ FIX: Synchronously stop any existing server to prevent ghost leaks during rapid toggling
         httpServerService?.stopServer()
         httpServerService = null
 
@@ -169,51 +213,15 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _discoveredDevices.value = emptyList()
         _transferQueue.value = emptyList()
 
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // 1. Bind and start local HTTP server
-                val server = HttpServerService(context, this@FlipViewModel)
-                val port = server.startServer()
-                
-                // ✅ FIX: Double-check that we are still in SENDER mode before assigning, 
-                // in case the user rapidly toggled to RECEIVER mode while this was starting.
-                if (_role.value != "SENDER") {
-                    server.stopServer() // Kill the ghost server immediately
-                    return@launch
-                }
-                
-                httpServerService = server
-                _isServerRunning.value = true
-
-                // Update local device port info
-                val ip = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
-                val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
-                _localDevice.value = updatedLocal
-
-                // 2. Advertise over BLE
-                if (updatedLocal != null) {
-                    bleService.startAdvertising(
-                        localIp = updatedLocal.ip,
-                        port = updatedLocal.port,
-                        deviceId = updatedLocal.id,
-                        deviceName = updatedLocal.name
-                    )
-                }
-            } catch (e: Exception) {
-                Log.e("FlipViewModel", "Failed to start sender server: ${e.message}")
-                withContext(Dispatchers.Main) {
-                    showToast("Failed to start sender server: ${e.message}")
-                    resetToHome()
-                }
-            }
-        }
+        bleService.startScanning()
+        wifiDirectService.register()
+        wifiDirectService.discoverPeers()
     }
 
     /**
      * RECEIVER: Tap "Receive" role initiation
      */
     fun startReceiverMode() {
-        // ✅ FIX: Synchronously stop any existing server to prevent ghost leaks during rapid toggling
         httpServerService?.stopServer()
         httpServerService = null
 
@@ -221,6 +229,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _connectionState.value = ConnectionState.SEARCHING
         _discoveredDevices.value = emptyList()
         _transferQueue.value = emptyList()
+
+        wifiDirectService.register()
+        wifiDirectService.discoverPeers()
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -243,8 +254,15 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
                 _localDevice.value = updatedLocal
 
-                // 2. Scan over BLE
-                bleService.startScanning()
+                // 2. Advertise over BLE
+                if (updatedLocal != null) {
+                    bleService.startAdvertising(
+                        localIp = updatedLocal.ip,
+                        port = updatedLocal.port,
+                        deviceId = updatedLocal.id,
+                        deviceName = updatedLocal.name
+                    )
+                }
             } catch (e: Exception) {
                 Log.e("FlipViewModel", "Failed to start receiver server: ${e.message}")
                 withContext(Dispatchers.Main) {
@@ -259,28 +277,22 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * Tapping a discovered sender device to connect
      */
     fun connectToDiscoveredDevice(target: Device) {
+        _pendingTargetDevice = target // ✅ FIX: Save the target so we know its ephemeral port
         _connectionState.value = ConnectionState.CONNECTING
-        val currentLocal = _localDevice.value ?: return
-
-        viewModelScope.launch(Dispatchers.IO) {
-            transferService.connectToDevice(
-                remoteIp = target.ip,
-                remotePort = target.port,
-                localDevice = currentLocal,
-                onSuccess = { remote ->
-                    // Stop BLE scan since we are now connected
-                    bleService.stopScanning()
-                    _remoteDevice.value = remote
-                    _connectionState.value = ConnectionState.CONNECTED
-                    showToast("Connected to ${remote.name}")
-                    checkAndQueuePreSelected()
-                },
-                onError = { err ->
-                    Log.e("FlipViewModel", "Failed to connect: $err")
-                    _connectionState.value = ConnectionState.SEARCHING
-                    showToast("Connection failed: $err")
-                }
-            )
+        
+        // ✅ FIX: Robust matching using device name only (MAC addresses never match UUIDs)
+        val matchingPeer = _wifiDirectPeers.value.find { peer -> 
+            peer.deviceName.equals(target.name, ignoreCase = true) || 
+            peer.deviceName.contains(target.name, ignoreCase = true) 
+        }
+        
+        if (matchingPeer != null) {
+            wifiDirectService.connectToDevice(matchingPeer)
+            showToast("Initiating Wi-Fi Direct connection to ${target.name}...")
+        } else {
+            Log.e("FlipViewModel", "Wi-Fi Direct peer not found for ${target.name}")
+            _connectionState.value = ConnectionState.SEARCHING
+            showToast("Wi-Fi Direct peer not found. Ensure Wi-Fi is turned on.")
         }
     }
 
@@ -347,6 +359,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
         bleService.stopScanning()
         bleService.stopAdvertising()
+        wifiDirectService.unregister()
         httpServerService?.stopServer()
         httpServerService = null
         _isServerRunning.value = false

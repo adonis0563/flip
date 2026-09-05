@@ -237,19 +237,53 @@ object StorageService {
             "Videos" -> null
             "Audio" -> null
             else -> {
-                // ✅ FIX: Explicitly target standard docs, text, and Office formats (vnd.*).
-                // Excludes APKs since they have their own dedicated Apps tab.
+                // ✅ FIX: Broadened Documents filter to catch:
+                // 1. Standard MIME types (application/*, text/*)
+                // 2. NULL MIME_TYPE files with common document extensions (USB transfers, old downloads)
+                // 3. Excludes APKs (they have their own Apps tab)
+                // ✅ FIX: Removed dead "vnd.%" clause — real vnd types already match "application/%"
                 """
-                    (${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/%' 
-                    OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'
-                    OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'vnd.%')
-                    AND ${MediaStore.Files.FileColumns.MIME_TYPE} != 'application/vnd.android.package-archive'
+                    (
+                        ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/%'
+                        OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'
+                        OR (
+                            ${MediaStore.Files.FileColumns.MIME_TYPE} IS NULL
+                            AND (
+                                ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.pdf'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.doc'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.docx'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.xls'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.xlsx'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.ppt'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.pptx'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.txt'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.csv'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.rtf'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.odt'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.ods'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.odp'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.zip'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.rar'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.7z'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.tar'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.gz'
+                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.epub'
+                            )
+                        )
+                    )
+                    AND (
+                        ${MediaStore.Files.FileColumns.MIME_TYPE} IS NULL
+                        OR ${MediaStore.Files.FileColumns.MIME_TYPE} != 'application/vnd.android.package-archive'
+                    )
                 """.trimIndent()
             }
         }
 
         try {
-            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT 100"
+            // ✅ FIX: Removed "LIMIT 100" from sortOrder. Modern Android strictly validates 
+            // the sortOrder parameter and rejects LIMIT clauses, causing silent query failures.
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+            
             context.contentResolver.query(
                 contentUri,
                 projection,

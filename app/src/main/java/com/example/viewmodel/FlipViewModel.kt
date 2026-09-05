@@ -86,6 +86,18 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         override fun onDisconnected() {
             performDisconnectCleanup()
         }
+
+        override fun onDiscoveryFailed(message: String) {
+            viewModelScope.launch(Dispatchers.Main) {
+                Log.w("FlipViewModel", "Wi-Fi Direct discovery failed: $message")
+                showToast(message)
+                // In SENDER mode, the local HTTP server and QR pairing remain active.
+                // Avoid resetting connection state so the sender session stays open for QR/manual connections.
+                if (_role.value != "SENDER") {
+                    _connectionState.value = ConnectionState.IDLE
+                }
+            }
+        }
     })
 
     // UI state flows
@@ -248,6 +260,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 
                 httpServerService = server
                 _isServerRunning.value = true
+                wifiDirectService.localHttpPort = port
 
                 // Update local device port info
                 val ip = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
@@ -277,22 +290,27 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * Tapping a discovered sender device to connect
      */
     fun connectToDiscoveredDevice(target: Device) {
-        _pendingTargetDevice = target // ✅ FIX: Save the target so we know its ephemeral port
+        _pendingTargetDevice = target
         _connectionState.value = ConnectionState.CONNECTING
         
-        // ✅ FIX: Robust matching using device name only (MAC addresses never match UUIDs)
-        val matchingPeer = _wifiDirectPeers.value.find { peer -> 
-            peer.deviceName.equals(target.name, ignoreCase = true) || 
-            peer.deviceName.contains(target.name, ignoreCase = true) 
+        // ✅ ROBUSTNESS FIX: Multi-factor matching to prevent wrong-device connections
+        val matchingPeer = _wifiDirectPeers.value.find { peer ->
+            // Primary: Exact name match (most reliable)
+            peer.deviceName.equals(target.name, ignoreCase = true) ||
+            // Secondary: Name contains target name AND no other peer has the same name
+            (peer.deviceName.contains(target.name, ignoreCase = true) && 
+             _wifiDirectPeers.value.count { it.deviceName.contains(target.name, ignoreCase = true) } == 1)
         }
         
         if (matchingPeer != null) {
+            // ✅ ROBUSTNESS FIX: Log the match for debugging
+            Log.d("FlipViewModel", "Matched Wi-Fi Direct peer: ${matchingPeer.deviceName} (${matchingPeer.deviceAddress}) to BLE device: ${target.name} (${target.id})")
             wifiDirectService.connectToDevice(matchingPeer)
             showToast("Initiating Wi-Fi Direct connection to ${target.name}...")
         } else {
             Log.e("FlipViewModel", "Wi-Fi Direct peer not found for ${target.name}")
             _connectionState.value = ConnectionState.SEARCHING
-            showToast("Wi-Fi Direct peer not found. Ensure Wi-Fi is turned on.")
+            showToast("Wi-Fi Direct peer not found. Ensure Wi-Fi is turned on and both devices are nearby.")
         }
     }
 
@@ -635,7 +653,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onDiscoveryError(message: String) {
-        Log.e("BLEDiscovery", message)
+        if (message.contains("disabled", ignoreCase = true) || message.contains("not supported", ignoreCase = true)) {
+            Log.w("BLEDiscovery", message)
+        } else {
+            Log.e("BLEDiscovery", message)
+        }
         _bleError.value = message
     }
 

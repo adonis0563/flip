@@ -7,6 +7,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -154,7 +155,7 @@ class HttpServerService(private val context: android.content.Context, private va
 
             when {
                 path == "/connect" && method == "POST" -> {
-                    val body = readBodyAsString(input, contentLength)
+                    val body = readBodyAsString(input, contentLength, maxAllowedBytes = 50_000) // 50KB max for device JSON
                     val device = deviceAdapter.fromJson(body)
                     if (device != null) {
                         listener.onDeviceConnected(device)
@@ -176,7 +177,7 @@ class HttpServerService(private val context: android.content.Context, private va
                     sendResponse(output, 200, "OK", "text/plain", "Disconnected".toByteArray())
                 }
                 path == "/text" && method == "POST" -> {
-                    val text = readBodyAsString(input, contentLength)
+                    val text = readBodyAsString(input, contentLength, maxAllowedBytes = 100_000) // 100KB max for text
                     listener.onTextReceived(text)
                     sendResponse(output, 200, "OK", "text/plain", "OK".toByteArray())
                 }
@@ -225,8 +226,14 @@ class HttpServerService(private val context: android.content.Context, private va
         }
     }
 
-    private fun readBodyAsString(input: InputStream, contentLength: Long): String {
+    private fun readBodyAsString(input: InputStream, contentLength: Long, maxAllowedBytes: Long = 1_000_000): String {
+        // ✅ SECURITY FIX: Validate content length to prevent OOM/DoS
         if (contentLength <= 0) return ""
+        if (contentLength > maxAllowedBytes) {
+            Log.w(TAG, "[SECURITY] Rejected oversized payload: ${contentLength} bytes (max: $maxAllowedBytes)")
+            throw IOException("Payload too large: ${contentLength} bytes")
+        }
+        
         val bytes = ByteArray(contentLength.toInt())
         var totalRead = 0
         while (totalRead < contentLength) {
@@ -245,7 +252,25 @@ class HttpServerService(private val context: android.content.Context, private va
     ) {
         val transferId = headers["x-transfer-id"] ?: ""
         val rawFileName = headers["x-file-name"] ?: "unnamed_file"
-        val fileName = try { URLDecoder.decode(rawFileName, "UTF-8") } catch (e: Exception) { rawFileName }
+        // ✅ SECURITY FIX: Sanitize filename to prevent path traversal attacks
+        val fileName = try { 
+            val decoded = URLDecoder.decode(rawFileName, "UTF-8")
+            // Strip any path separators, parent directory references, and null bytes
+            decoded.replace(Regex("[/\\\\]"), "_")  // Replace slashes with underscores
+                   .replace(Regex("\\.\\."), "_")   // Replace .. with underscore
+                   .replace(Regex("[\\x00]"), "")   // Remove null bytes
+                   .trim()
+                   .ifEmpty { "unnamed_file" }      // Fallback if empty after sanitization
+        } catch (e: Exception) { 
+            "unnamed_file" 
+        }
+
+        // ✅ SECURITY FIX: Additional validation - reject if still suspicious
+        if (fileName.contains("..") || fileName.startsWith("/") || fileName.startsWith("\\")) {
+            Log.w(TAG, "[SECURITY] Rejected suspicious filename: $rawFileName")
+            sendResponse(output, 400, "Bad Request", "text/plain", "Invalid filename".toByteArray())
+            return
+        }
         val fileSizeStr = headers["x-file-size"] ?: "0"
         val fileSize = fileSizeStr.toLongOrNull() ?: 0L
         val offsetStr = headers["x-file-offset"] ?: "0"

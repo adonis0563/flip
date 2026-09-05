@@ -1,12 +1,16 @@
 package com.example.service
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.example.model.Device
 import java.nio.charset.StandardCharsets
 import java.util.*
@@ -46,9 +50,19 @@ class BleDiscoveryService(
     }
 
     fun startAdvertising(localIp: String, port: Int, deviceId: String, deviceName: String) {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            listener.onDiscoveryError("Bluetooth is disabled or not supported")
+        if (bluetoothAdapter == null) {
+            listener.onDiscoveryError("Bluetooth is not supported on this device")
             return
+        }
+        if (!bluetoothAdapter.isEnabled) {
+            listener.onDiscoveryError("Bluetooth is disabled. Please enable Bluetooth.")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+                listener.onDiscoveryError("Missing Bluetooth advertise permission")
+                return
+            }
         }
         advertiser = bluetoothAdapter.bluetoothLeAdvertiser
         if (advertiser == null) {
@@ -84,7 +98,15 @@ class BleDiscoveryService(
             }
         }
 
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        try {
+            advertiser?.startAdvertising(settings, data, advertiseCallback)
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException while starting BLE advertising: ${e.message}")
+            listener.onDiscoveryError("Bluetooth permission denied")
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception while starting BLE advertising: ${e.message}")
+            listener.onDiscoveryError("Failed to start BLE advertising: ${e.message}")
+        }
     }
 
     fun stopAdvertising() {
@@ -101,9 +123,19 @@ class BleDiscoveryService(
     }
 
     fun startScanning() {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            listener.onDiscoveryError("Bluetooth is disabled or not supported")
+        if (bluetoothAdapter == null) {
+            listener.onDiscoveryError("Bluetooth is not supported on this device")
             return
+        }
+        if (!bluetoothAdapter.isEnabled) {
+            listener.onDiscoveryError("Bluetooth is disabled. Please enable Bluetooth.")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                listener.onDiscoveryError("Missing Bluetooth scan permission")
+                return
+            }
         }
         scanner = bluetoothAdapter.bluetoothLeScanner
         if (scanner == null) {
@@ -136,8 +168,16 @@ class BleDiscoveryService(
             }
         }
 
-        scanner?.startScan(listOf(filter), settings, scanCallback)
-        Log.d(TAG, "BLE Scanning started")
+        try {
+            scanner?.startScan(listOf(filter), settings, scanCallback)
+            Log.d(TAG, "BLE Scan started")
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException while starting BLE scan: ${e.message}")
+            listener.onDiscoveryError("Bluetooth scan permission denied")
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception while starting BLE scan: ${e.message}")
+            listener.onDiscoveryError("Failed to start BLE scan: ${e.message}")
+        }
     }
 
     fun stopScanning() {

@@ -1,11 +1,19 @@
 package com.example.ui
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import android.provider.MediaStore
+import android.provider.Settings
+import android.util.Log
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
@@ -151,6 +159,45 @@ fun FlipAppContent(viewModel: FlipViewModel) {
     val prefs = remember(context) { context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE) }
     var showSplash by remember { mutableStateOf(!prefs.getBoolean("onboarding_complete", false)) }
 
+    // Permission launcher to ensure required Wi-Fi and Bluetooth permissions are granted before starting discovery
+    var pendingModeAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val modePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        pendingModeAction?.invoke()
+        pendingModeAction = null
+    }
+
+    val requestModeWithPermissions: (() -> Unit) -> Unit = { action ->
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            }
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        }
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+        if (needed.isNotEmpty()) {
+            pendingModeAction = action
+            modePermissionLauncher.launch(needed.toTypedArray())
+        } else {
+            action()
+        }
+    }
+
     if (showSplash) {
         SplashScreen(
             onGetStarted = { showSplash = false }
@@ -171,8 +218,8 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                     ConnectionState.IDLE -> {
                         HomeScreen(
                             localDevice = localDevice,
-                            onSendMode = { viewModel.startSenderMode() },
-                            onReceiveMode = { viewModel.startReceiverMode() },
+                            onSendMode = { requestModeWithPermissions { viewModel.startSenderMode() } },
+                            onReceiveMode = { requestModeWithPermissions { viewModel.startReceiverMode() } },
                             onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
                             onExploreFiles = { showStandaloneFilePicker = true }
                         )
@@ -185,6 +232,7 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                         if (role == "SENDER") {
                             SenderWaitingScreen(
                                 localDevice = localDevice,
+                                bleError = bleError,
                                 onUpdateIp = { viewModel.updateLocalIpAddress(it) },
                                 onCancel = { viewModel.resetToHome() }
                             )
@@ -585,6 +633,7 @@ fun HomeScreen(
 @Composable
 fun SenderWaitingScreen(
     localDevice: Device?,
+    bleError: String? = null,
     onUpdateIp: (String) -> Unit,
     onCancel: () -> Unit
 ) {
@@ -696,6 +745,53 @@ fun SenderWaitingScreen(
                     fontWeight = FontWeight.Bold
                 )
             )
+        }
+
+        if (bleError != null) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Bluetooth Status",
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                        Text(
+                            text = bleError,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (bleError.contains("disabled", ignoreCase = true) || bleError.contains("enable", ignoreCase = true)) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                try {
+                                    context.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                                } catch (e: Exception) {
+                                    try {
+                                        context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                                    } catch (ex: Exception) {
+                                        Log.e("SenderScreen", "Error opening Bluetooth settings: ${ex.message}")
+                                    }
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.align(Alignment.End)
+                        ) {
+                            Text("Enable Bluetooth", color = Color.White)
+                        }
+                    }
+                }
+            }
         }
 
         // Toggle Segment Bar
@@ -930,6 +1026,7 @@ fun ReceiverScanningScreen(
     var showScanOverlay by remember { mutableStateOf(false) }
 
     val cameraPermissionState = rememberPermissionState(android.Manifest.permission.CAMERA)
+    val context = LocalContext.current
 
     LaunchedEffect(showScanOverlay) {
         if (showScanOverlay && !cameraPermissionState.status.isGranted) {
@@ -970,21 +1067,43 @@ fun ReceiverScanningScreen(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Warning,
-                        contentDescription = "Bluetooth Error",
-                        tint = MaterialTheme.colorScheme.error
-                    )
-                    Text(
-                        text = "Bluetooth issue: $bleError. Please make sure Bluetooth and Location are enabled on your device.",
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Bluetooth Error",
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                        Text(
+                            text = bleError,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (bleError.contains("disabled", ignoreCase = true) || bleError.contains("enable", ignoreCase = true)) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                try {
+                                    context.startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                                } catch (e: Exception) {
+                                    try {
+                                        context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                                    } catch (ex: Exception) {
+                                        Log.e("ReceiverScreen", "Error opening Bluetooth settings: ${ex.message}")
+                                    }
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.align(Alignment.End)
+                        ) {
+                            Text("Enable Bluetooth", color = Color.White)
+                        }
+                    }
                 }
             }
         }

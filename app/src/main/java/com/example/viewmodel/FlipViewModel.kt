@@ -98,6 +98,34 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 }
             }
         }
+
+        override fun onNonGoDeviceFound(nonGoIp: String, httpPort: Int) {
+            // ✅ I'm the Sender AND I'm the Group Owner. The Receiver (non-GO) announced itself via UDP.
+            if (_role.value == "SENDER") {
+                val currentLocal = _localDevice.value ?: return
+                viewModelScope.launch(Dispatchers.IO) {
+                    transferService.connectToDevice(
+                        remoteIp = nonGoIp,
+                        remotePort = httpPort,
+                        localDevice = currentLocal,
+                        onSuccess = { remote ->
+                            _pendingTargetDevice = null
+                            bleService.stopScanning()
+                            _remoteDevice.value = remote
+                            _connectionState.value = ConnectionState.CONNECTED
+                            showToast("Connected to ${remote.name}")
+                            checkAndQueuePreSelected()
+                        },
+                        onError = { err ->
+                            _pendingTargetDevice = null
+                            Log.e("FlipViewModel", "Failed to connect to non-GO: $err")
+                            _connectionState.value = ConnectionState.SEARCHING
+                            showToast("Connection failed: $err")
+                        }
+                    )
+                }
+            }
+        }
     })
 
     // UI state flows

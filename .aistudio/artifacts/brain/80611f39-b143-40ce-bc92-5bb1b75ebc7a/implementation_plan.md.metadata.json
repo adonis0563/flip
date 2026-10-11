@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for the BLE and Wi-Fi Direct overhaul in Flip, integrating ConnectionCoordinator, WifiDirectRepository, BleConnectionManager, and PermissionsHelper into MainActivity and Flip architecture without breaking Compose UI or existing functionality.",
-  "updatedAt":  "2026-10-03T19:31:42.023414195Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

@@ -1,12 +1,6 @@
 package com.example.viewmodel
 
 import android.app.Application
-import android.database.ContentObserver
-import android.os.Handler
-import android.os.Looper
-import android.provider.MediaStore
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.MutableSharedFlow
 import android.content.ClipboardManager
 import android.content.ClipData
 import android.content.Context
@@ -26,7 +20,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.util.UUID
-import android.net.wifi.p2p.WifiP2pDevice
 
 enum class ConnectionState {
     IDLE,
@@ -43,90 +36,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val transferService = TransferService(context)
     private val bleService = BleDiscoveryService(context, this)
     private var httpServerService: HttpServerService? = null
-    private var _pendingTargetDevice: Device? = null
-
-    private val _wifiDirectPeers = MutableStateFlow<List<WifiP2pDevice>>(emptyList())
-    private val wifiDirectService = WifiDirectService(context, object : WifiDirectService.DirectListener {
-        override fun onPeerDiscovered(device: WifiP2pDevice) {
-            val current = _wifiDirectPeers.value
-            if (current.none { it.deviceAddress == device.deviceAddress }) {
-                _wifiDirectPeers.value = current + device
-            }
-        }
-
-        override fun onConnectionEstablished(groupOwnerIp: String) {
-            if (_role.value == "SENDER") {
-                val currentLocal = _localDevice.value ?: return
-                val targetPort = _pendingTargetDevice?.port ?: 8080 // ✅ FIX: Use the ephemeral port advertised via BLE
-                
-                viewModelScope.launch(Dispatchers.IO) {
-                    transferService.connectToDevice(
-                        remoteIp = groupOwnerIp, // "192.168.49.1"
-                        remotePort = targetPort, // ✅ FIX: Dynamic port, NOT hardcoded 8080
-                        localDevice = currentLocal,
-                        onSuccess = { remote ->
-                            _pendingTargetDevice = null // ✅ FIX: Clean up
-                            bleService.stopScanning()
-                            _remoteDevice.value = remote
-                            _connectionState.value = ConnectionState.CONNECTED
-                            showToast("Connected to ${remote.name}")
-                            checkAndQueuePreSelected()
-                        },
-                        onError = { err ->
-                            _pendingTargetDevice = null // ✅ FIX: Clean up
-                            Log.e("FlipViewModel", "Failed to connect: $err")
-                            _connectionState.value = ConnectionState.SEARCHING
-                            showToast("Connection failed: $err")
-                        }
-                    )
-                }
-            }
-        }
-
-        override fun onDisconnected() {
-            performDisconnectCleanup()
-        }
-
-        override fun onDiscoveryFailed(message: String) {
-            viewModelScope.launch(Dispatchers.Main) {
-                Log.w("FlipViewModel", "Wi-Fi Direct discovery failed: $message")
-                showToast(message)
-                // In SENDER mode, the local HTTP server and QR pairing remain active.
-                // Avoid resetting connection state so the sender session stays open for QR/manual connections.
-                if (_role.value != "SENDER") {
-                    _connectionState.value = ConnectionState.IDLE
-                }
-            }
-        }
-
-        override fun onNonGoDeviceFound(nonGoIp: String, httpPort: Int) {
-            // ✅ I'm the Sender AND I'm the Group Owner. The Receiver (non-GO) announced itself via UDP.
-            if (_role.value == "SENDER") {
-                val currentLocal = _localDevice.value ?: return
-                viewModelScope.launch(Dispatchers.IO) {
-                    transferService.connectToDevice(
-                        remoteIp = nonGoIp,
-                        remotePort = httpPort,
-                        localDevice = currentLocal,
-                        onSuccess = { remote ->
-                            _pendingTargetDevice = null
-                            bleService.stopScanning()
-                            _remoteDevice.value = remote
-                            _connectionState.value = ConnectionState.CONNECTED
-                            showToast("Connected to ${remote.name}")
-                            checkAndQueuePreSelected()
-                        },
-                        onError = { err ->
-                            _pendingTargetDevice = null
-                            Log.e("FlipViewModel", "Failed to connect to non-GO: $err")
-                            _connectionState.value = ConnectionState.SEARCHING
-                            showToast("Connection failed: $err")
-                        }
-                    )
-                }
-            }
-        }
-    })
 
     // UI state flows
     private val _connectionState = MutableStateFlow(ConnectionState.IDLE)
@@ -156,14 +65,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val _isServerRunning = MutableStateFlow(false)
     val isServerRunning: StateFlow<Boolean> = _isServerRunning.asStateFlow()
 
-    private val _showFileExplorer = MutableStateFlow(false)
-    val showFileExplorer: StateFlow<Boolean> = _showFileExplorer.asStateFlow()
-
-    // ✅ FIX: Signal to the UI that MediaStore has changed and files need to be re-queried
-    private val _refreshTrigger = MutableSharedFlow<Unit>(replay = 0)
-    val refreshTrigger: SharedFlow<Unit> = _refreshTrigger
-    private var mediaObserver: ContentObserver? = null
-
     // State lock for queue running
     private var queueJob: Job? = null
     @Volatile
@@ -175,12 +76,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val preSelectedFiles = java.util.Collections.synchronizedList(mutableListOf<LocalFileItem>())
 
     fun preSelectFiles(files: List<LocalFileItem>) {
-        // ✅ FIX: Synchronize compound operations to prevent ConcurrentModificationException
-        // or silent data loss if checkAndQueuePreSelected() runs concurrently.
-        synchronized(preSelectedFiles) {
-            preSelectedFiles.clear()
-            preSelectedFiles.addAll(files)
-        }
+        preSelectedFiles.clear()
+        preSelectedFiles.addAll(files)
         showToast("Pre-selected ${files.size} files. They will transfer automatically when connected.")
     }
 
@@ -216,21 +113,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         val devName = Build.MODEL ?: "Android Device"
         val localIp = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
         _localDevice.value = Device(id = devId, name = devName, ip = localIp, port = 8080)
-
-        // ✅ FIX: Listen for global MediaStore changes to instantly update the file explorer
-        mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
-            override fun onChange(selfChange: Boolean) {
-                super.onChange(selfChange)
-                viewModelScope.launch {
-                    _refreshTrigger.emit(Unit)
-                }
-            }
-        }
-        context.contentResolver.registerContentObserver(
-            MediaStore.Files.getContentUri("external"),
-            true,
-            mediaObserver!!
-        )
     }
 
     fun clearToast() {
@@ -245,50 +127,18 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * SENDER: Tap "Send" role initiation
      */
     fun startSenderMode() {
-        httpServerService?.stopServer()
-        httpServerService = null
-
         _role.value = "SENDER"
         _connectionState.value = ConnectionState.SEARCHING
         _discoveredDevices.value = emptyList()
         _transferQueue.value = emptyList()
-
-        bleService.startScanning()
-        wifiDirectService.register()
-        wifiDirectService.discoverPeers()
-    }
-
-    /**
-     * RECEIVER: Tap "Receive" role initiation
-     */
-    fun startReceiverMode() {
-        httpServerService?.stopServer()
-        httpServerService = null
-
-        _role.value = "RECEIVER"
-        _connectionState.value = ConnectionState.SEARCHING
-        _discoveredDevices.value = emptyList()
-        _transferQueue.value = emptyList()
-
-        wifiDirectService.register()
-        wifiDirectService.discoverPeers()
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 // 1. Bind and start local HTTP server
                 val server = HttpServerService(context, this@FlipViewModel)
                 val port = server.startServer()
-                
-                // ✅ FIX: Double-check that we are still in RECEIVER mode before assigning, 
-                // in case the user rapidly toggled to SENDER mode while this was starting.
-                if (_role.value != "RECEIVER") {
-                    server.stopServer() // Kill the ghost server immediately
-                    return@launch
-                }
-                
                 httpServerService = server
                 _isServerRunning.value = true
-                wifiDirectService.localHttpPort = port
 
                 // Update local device port info
                 val ip = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
@@ -305,6 +155,40 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     )
                 }
             } catch (e: Exception) {
+                Log.e("FlipViewModel", "Failed to start sender server: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    showToast("Failed to start sender server: ${e.message}")
+                    resetToHome()
+                }
+            }
+        }
+    }
+
+    /**
+     * RECEIVER: Tap "Receive" role initiation
+     */
+    fun startReceiverMode() {
+        _role.value = "RECEIVER"
+        _connectionState.value = ConnectionState.SEARCHING
+        _discoveredDevices.value = emptyList()
+        _transferQueue.value = emptyList()
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 1. Bind and start local HTTP server
+                val server = HttpServerService(context, this@FlipViewModel)
+                val port = server.startServer()
+                httpServerService = server
+                _isServerRunning.value = true
+
+                // Update local device port info
+                val ip = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
+                val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
+                _localDevice.value = updatedLocal
+
+                // 2. Scan over BLE
+                bleService.startScanning()
+            } catch (e: Exception) {
                 Log.e("FlipViewModel", "Failed to start receiver server: ${e.message}")
                 withContext(Dispatchers.Main) {
                     showToast("Failed to start receiver server: ${e.message}")
@@ -318,27 +202,28 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
      * Tapping a discovered sender device to connect
      */
     fun connectToDiscoveredDevice(target: Device) {
-        _pendingTargetDevice = target
         _connectionState.value = ConnectionState.CONNECTING
-        
-        // ✅ ROBUSTNESS FIX: Multi-factor matching to prevent wrong-device connections
-        val matchingPeer = _wifiDirectPeers.value.find { peer ->
-            // Primary: Exact name match (most reliable)
-            peer.deviceName.equals(target.name, ignoreCase = true) ||
-            // Secondary: Name contains target name AND no other peer has the same name
-            (peer.deviceName.contains(target.name, ignoreCase = true) && 
-             _wifiDirectPeers.value.count { it.deviceName.contains(target.name, ignoreCase = true) } == 1)
-        }
-        
-        if (matchingPeer != null) {
-            // ✅ ROBUSTNESS FIX: Log the match for debugging
-            Log.d("FlipViewModel", "Matched Wi-Fi Direct peer: ${matchingPeer.deviceName} (${matchingPeer.deviceAddress}) to BLE device: ${target.name} (${target.id})")
-            wifiDirectService.connectToDevice(matchingPeer)
-            showToast("Initiating Wi-Fi Direct connection to ${target.name}...")
-        } else {
-            Log.e("FlipViewModel", "Wi-Fi Direct peer not found for ${target.name}")
-            _connectionState.value = ConnectionState.SEARCHING
-            showToast("Wi-Fi Direct peer not found. Ensure Wi-Fi is turned on and both devices are nearby.")
+        val currentLocal = _localDevice.value ?: return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            transferService.connectToDevice(
+                remoteIp = target.ip,
+                remotePort = target.port,
+                localDevice = currentLocal,
+                onSuccess = { remote ->
+                    // Stop BLE scan since we are now connected
+                    bleService.stopScanning()
+                    _remoteDevice.value = remote
+                    _connectionState.value = ConnectionState.CONNECTED
+                    showToast("Connected to ${remote.name}")
+                    checkAndQueuePreSelected()
+                },
+                onError = { err ->
+                    Log.e("FlipViewModel", "Failed to connect: $err")
+                    _connectionState.value = ConnectionState.SEARCHING
+                    showToast("Connection failed: $err")
+                }
+            )
         }
     }
 
@@ -405,7 +290,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
         bleService.stopScanning()
         bleService.stopAdvertising()
-        wifiDirectService.unregister()
         httpServerService?.stopServer()
         httpServerService = null
         _isServerRunning.value = false
@@ -417,10 +301,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     fun resetToHome() {
         performDisconnectCleanup()
-    }
-
-    fun toggleFileExplorer() {
-        _showFileExplorer.value = !_showFileExplorer.value
     }
 
     /**
@@ -574,23 +454,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     // Let paused state stay
                 } else {
                     updateItemStatus(item.id, TransferStatus.FAILED, errMsg)
-                    
-                    // ✅ FIX: If the error indicates a dropped connection, gracefully disconnect 
-                    // instead of leaving the sender stuck in the "CONNECTED" state forever.
-                    // ✅ FIX: Only drop connection on genuine network/socket errors. 
-                    // Removed generic "failed" which incorrectly caught file-specific errors like "Failed to open file stream".
-                    val isNetworkDrop = errMsg.contains("timeout", ignoreCase = true) || 
-                                        errMsg.contains("reset", ignoreCase = true) ||
-                                        errMsg.contains("closed", ignoreCase = true) ||
-                                        errMsg.contains("unreachable", ignoreCase = true) ||
-                                        errMsg.contains("failed to connect", ignoreCase = true)
-                                        
-                    if (isNetworkDrop) {
-                        viewModelScope.launch(Dispatchers.Main) {
-                            performDisconnectCleanup()
-                            showToast("Connection lost: $errMsg")
-                        }
-                    }
                 }
                 completer.complete(Unit)
             }
@@ -681,24 +544,13 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onDiscoveryError(message: String) {
-        if (message.contains("disabled", ignoreCase = true) || message.contains("not supported", ignoreCase = true)) {
-            Log.w("BLEDiscovery", message)
-        } else {
-            Log.e("BLEDiscovery", message)
-        }
+        Log.e("BLEDiscovery", message)
         _bleError.value = message
     }
 
     // --- HTTP SERVER LISTENER CALLBACKS ---
     override fun onDeviceConnected(device: Device) {
         viewModelScope.launch(Dispatchers.Main) {
-            // ✅ FIX: Enforce strict 1-to-1 connection. Reject new connections if already connected.
-            if (_remoteDevice.value != null && _connectionState.value == ConnectionState.CONNECTED) {
-                Log.w("FlipViewModel", "Rejected connection from ${device.name}: Already connected to another device.")
-                showToast("Connection rejected: Already in a session.")
-                return@launch
-            }
-
             // Stop scanning/advertising
             bleService.stopScanning()
             bleService.stopAdvertising()
@@ -779,23 +631,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     override fun onFileTransferFailed(transferId: String, errorMessage: String) {
         viewModelScope.launch(Dispatchers.Main) {
             updateItemStatus(transferId, TransferStatus.FAILED, errorMessage)
-            
-            // ✅ FIX: If the error indicates the sender's socket broke (Zombie Connection), 
-            // gracefully disconnect instead of leaving the receiver stuck on the CONNECTED screen.
-            // ✅ FIX: Only drop connection on genuine network/socket errors.
-            val isNetworkDrop = errorMessage.contains("timeout", ignoreCase = true) || 
-                                errorMessage.contains("reset", ignoreCase = true) ||
-                                errorMessage.contains("closed", ignoreCase = true) ||
-                                errorMessage.contains("unreachable", ignoreCase = true) ||
-                                errorMessage.contains("failed to connect", ignoreCase = true) ||
-                                errorMessage.contains("broken", ignoreCase = true)
-                                
-            if (isNetworkDrop) {
-                performDisconnectCleanup()
-                showToast("Connection lost: $errorMessage")
-            } else {
-                showToast("File transfer failed: $errorMessage")
-            }
+            showToast("File transfer failed: $errorMessage")
         }
     }
 
@@ -811,7 +647,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onCleared() {
-        mediaObserver?.let { context.contentResolver.unregisterContentObserver(it) }
         super.onCleared()
         performDisconnectCleanup()
     }
@@ -874,15 +709,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
             if (items.isNotEmpty()) {
                 if (_connectionState.value == ConnectionState.CONNECTED) {
-                    // ✅ FIX: Only auto-send if we are the SENDER. Prevents connection drops when acting as Receiver.
-                    if (_role.value == "SENDER") {
-                        items.forEach { item ->
-                            addFileToTransferQueue(item.uri, item.name, item.size)
-                        }
-                        showToast("Imported ${items.size} shared files to transfer queue")
-                    } else {
-                        showToast("Cannot send files while in Receive mode. Please disconnect first.")
+                    items.forEach { item ->
+                        addFileToTransferQueue(item.uri, item.name, item.size)
                     }
+                    showToast("Imported ${items.size} shared files to transfer queue")
                 } else {
                     preSelectFiles(items)
                     startSenderMode()

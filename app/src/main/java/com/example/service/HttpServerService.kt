@@ -7,7 +7,6 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -18,9 +17,7 @@ import java.util.concurrent.Executors
 
 class HttpServerService(private val context: android.content.Context, private val listener: ServerListener) {
     private var serverSocket: ServerSocket? = null
-    // ✅ FIX: Use a bounded thread pool to prevent OutOfMemoryError (DoS) from excessive connections.
-    // Max 10 threads is more than enough for local P2P transfers (realistically only 1-2 active).
-    private val executor = Executors.newFixedThreadPool(10)
+    private val executor = Executors.newCachedThreadPool()
     private val moshi = Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()
     private val deviceAdapter = moshi.adapter(Device::class.java)
 
@@ -48,35 +45,36 @@ class HttpServerService(private val context: android.content.Context, private va
     private var isCancelled = false
 
     fun startServer(): Int {
-        try {
-            // ✅ FIX: Pass 0 to let the OS assign a guaranteed available ephemeral port.
-            // This completely eliminates port collision crashes.
-            val sSocket = ServerSocket(0)
-            serverSocket = sSocket
-            boundPort = sSocket.localPort
-            isRunning = true
+        val portsToTry = listOf(8080, 8081, 8082, 8083)
+        for (port in portsToTry) {
+            try {
+                val sSocket = ServerSocket(port)
+                serverSocket = sSocket
+                boundPort = port
+                isRunning = true
 
-            // Start a background thread to accept connections
-            executor.submit {
-                while (isRunning) {
-                    try {
-                        val clientSocket = sSocket.accept()
-                        executor.submit {
-                            handleClientSocket(clientSocket)
+                // Start a background thread to accept connections
+                executor.submit {
+                    while (isRunning) {
+                        try {
+                            val clientSocket = sSocket.accept()
+                            executor.submit {
+                                handleClientSocket(clientSocket)
+                            }
+                        } catch (e: Exception) {
+                            if (!isRunning) break
+                            Log.e(TAG, "Error accepting socket connection: ${e.message}")
                         }
-                    } catch (e: Exception) {
-                        if (!isRunning) break
-                        Log.e(TAG, "Error accepting socket connection: ${e.message}")
                     }
                 }
-            }
 
-            Log.d(TAG, "Custom HTTP Server started successfully on port $boundPort")
-            return boundPort
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to bind to an available port: ${e.message}")
-            throw IllegalStateException("Unable to start HTTP server: ${e.message}")
+                Log.d(TAG, "Custom HTTP Server started successfully on port $port")
+                return port
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to bind to port $port: ${e.message}")
+            }
         }
+        throw IllegalStateException("Unable to bind to any available port in $portsToTry")
     }
 
     fun stopServer() {
@@ -155,7 +153,7 @@ class HttpServerService(private val context: android.content.Context, private va
 
             when {
                 path == "/connect" && method == "POST" -> {
-                    val body = readBodyAsString(input, contentLength, maxAllowedBytes = 50_000) // 50KB max for device JSON
+                    val body = readBodyAsString(input, contentLength)
                     val device = deviceAdapter.fromJson(body)
                     if (device != null) {
                         listener.onDeviceConnected(device)
@@ -177,7 +175,7 @@ class HttpServerService(private val context: android.content.Context, private va
                     sendResponse(output, 200, "OK", "text/plain", "Disconnected".toByteArray())
                 }
                 path == "/text" && method == "POST" -> {
-                    val text = readBodyAsString(input, contentLength, maxAllowedBytes = 100_000) // 100KB max for text
+                    val text = readBodyAsString(input, contentLength)
                     listener.onTextReceived(text)
                     sendResponse(output, 200, "OK", "text/plain", "OK".toByteArray())
                 }
@@ -226,14 +224,8 @@ class HttpServerService(private val context: android.content.Context, private va
         }
     }
 
-    private fun readBodyAsString(input: InputStream, contentLength: Long, maxAllowedBytes: Long = 1_000_000): String {
-        // ✅ SECURITY FIX: Validate content length to prevent OOM/DoS
+    private fun readBodyAsString(input: InputStream, contentLength: Long): String {
         if (contentLength <= 0) return ""
-        if (contentLength > maxAllowedBytes) {
-            Log.w(TAG, "[SECURITY] Rejected oversized payload: ${contentLength} bytes (max: $maxAllowedBytes)")
-            throw IOException("Payload too large: ${contentLength} bytes")
-        }
-        
         val bytes = ByteArray(contentLength.toInt())
         var totalRead = 0
         while (totalRead < contentLength) {
@@ -252,25 +244,7 @@ class HttpServerService(private val context: android.content.Context, private va
     ) {
         val transferId = headers["x-transfer-id"] ?: ""
         val rawFileName = headers["x-file-name"] ?: "unnamed_file"
-        // ✅ SECURITY FIX: Sanitize filename to prevent path traversal attacks
-        val fileName = try { 
-            val decoded = URLDecoder.decode(rawFileName, "UTF-8")
-            // Strip any path separators, parent directory references, and null bytes
-            decoded.replace(Regex("[/\\\\]"), "_")  // Replace slashes with underscores
-                   .replace(Regex("\\.\\."), "_")   // Replace .. with underscore
-                   .replace(Regex("[\\x00]"), "")   // Remove null bytes
-                   .trim()
-                   .ifEmpty { "unnamed_file" }      // Fallback if empty after sanitization
-        } catch (e: Exception) { 
-            "unnamed_file" 
-        }
-
-        // ✅ SECURITY FIX: Additional validation - reject if still suspicious
-        if (fileName.contains("..") || fileName.startsWith("/") || fileName.startsWith("\\")) {
-            Log.w(TAG, "[SECURITY] Rejected suspicious filename: $rawFileName")
-            sendResponse(output, 400, "Bad Request", "text/plain", "Invalid filename".toByteArray())
-            return
-        }
+        val fileName = try { URLDecoder.decode(rawFileName, "UTF-8") } catch (e: Exception) { rawFileName }
         val fileSizeStr = headers["x-file-size"] ?: "0"
         val fileSize = fileSizeStr.toLongOrNull() ?: 0L
         val offsetStr = headers["x-file-offset"] ?: "0"
@@ -304,10 +278,9 @@ class HttpServerService(private val context: android.content.Context, private va
             if (remaining <= 0) {
                 remaining = Long.MAX_VALUE
             }
+
             var lastProgressUpdate = System.currentTimeMillis()
             var lastLogUpdate = System.currentTimeMillis()
-            var lastOffsetUpdate = System.currentTimeMillis()
-            val OFFSET_WRITE_INTERVAL_MS = 2000L // FIX: Throttle disk writes to every 2 seconds
 
             while (remaining > 0) {
                 val limit = minOf(buffer.size.toLong(), remaining).toInt()
@@ -316,37 +289,30 @@ class HttpServerService(private val context: android.content.Context, private va
                     Log.d(TAG, "[FILE_TRANSFER_RECEIVER] Input stream reached end of stream.")
                     break
                 }
+
                 if (isCancelled) {
                     Log.w(TAG, "[FILE_TRANSFER_RECEIVER] Upload cancelled locally")
                     throw InterruptedException("Cancelled")
                 }
+
                 outputStream.write(buffer, 0, bytesRead)
                 bytesWritten += bytesRead
                 remaining -= bytesRead
 
+                // Write offset marker to disk progressively
+                offsetFile.writeText(bytesWritten.toString())
+
                 val now = System.currentTimeMillis()
-
-                // ✅ FIX: Throttle offset file writes to prevent flash storage thrashing
-                if (now - lastOffsetUpdate > OFFSET_WRITE_INTERVAL_MS) {
-                    offsetFile.writeText(bytesWritten.toString())
-                    lastOffsetUpdate = now
-                }
-
-                if (now - lastProgressUpdate > 150) { // Throttle UI updates to ~150ms for performance
+                if (now - lastProgressUpdate > 150) { // Throttle updates to ~150ms for performance
                     listener.onFileTransferProgress(transferId, bytesWritten)
                     lastProgressUpdate = now
                 }
-                
                 // Log progress every 1 second
                 if (now - lastLogUpdate > 1000) {
                     Log.d(TAG, "[FILE_TRANSFER_RECEIVER] Bytes received and written: $bytesWritten / $fileSize (${if (fileSize > 0) (bytesWritten * 100f / fileSize).toInt() else 0}%)")
                     lastLogUpdate = now
                 }
             }
-
-            // ✅ FIX: Safety net. Ensure the absolute latest offset is saved if the loop exits 
-            // (e.g., due to cancellation, error, or sudden EOF) before the 2-second window elapsed.
-            offsetFile.writeText(bytesWritten.toString())
 
             outputStream.flush()
             success = true

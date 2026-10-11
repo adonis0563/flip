@@ -21,10 +21,8 @@ class TransferService(private val context: Context) {
     // Dedicated fast client with custom timeouts
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
-        // ✅ FIX: Set finite timeouts to prevent indefinite queue freezing on network drops.
-        // 30 minutes is plenty for large local file transfers, but prevents infinite hangs.
-        .readTimeout(30, TimeUnit.MINUTES)
-        .writeTimeout(30, TimeUnit.MINUTES)
+        .readTimeout(0, TimeUnit.MILLISECONDS) // Indefinite read timeout for large streams
+        .writeTimeout(0, TimeUnit.MILLISECONDS) // Indefinite write timeout for large streams
         .build()
 
     // 3-second timeout client for handshake checks
@@ -47,9 +45,7 @@ class TransferService(private val context: Context) {
         val body = json.toRequestBody("application/json".toMediaTypeOrNull())
         val request = Request.Builder().url(url).post(body).build()
 
-        // ✅ FIX: Use handshakeClient (3s timeout) instead of main client (30m timeout)
-        // to prevent the UI from hanging for 30 minutes if the target IP is unreachable.
-        handshakeClient.newCall(request).enqueue(object : Callback {
+        client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 Log.e(TAG, "Connection failed: ${e.message}")
                 onError(e.message ?: "Connection failed")
@@ -62,6 +58,7 @@ class TransferService(private val context: Context) {
                         try {
                             val remoteDevice = deviceAdapter.fromJson(responseBody)
                             if (remoteDevice != null) {
+                                // Keep remote configuration intact
                                 onSuccess(remoteDevice.copy(ip = remoteIp, port = remotePort))
                             } else {
                                 onError("Invalid response payload from device")
@@ -207,23 +204,18 @@ class TransferService(private val context: Context) {
                     if (offset > 0) {
                         Log.d(TAG, "[FILE_TRANSFER] Skipping stream to offset: $offset")
                         var remainingToSkip = offset
-                        val skipBuffer = ByteArray(64 * 1024) // 64KB buffer for skipping
-                        
                         while (remainingToSkip > 0) {
                             val skipped = stream.skip(remainingToSkip)
                             if (skipped > 0) {
                                 remainingToSkip -= skipped
                             } else {
-                                // ✅ FIX: Read in chunks instead of single bytes to prevent massive slowdowns
-                                val bytesToRead = minOf(remainingToSkip, skipBuffer.size.toLong()).toInt()
-                                val read = stream.read(skipBuffer, 0, bytesToRead)
-                                if (read == -1) {
+                                // skip returned 0, try reading a single byte
+                                if (stream.read() == -1) {
                                     break // EOF reached prematurely
                                 }
-                                remainingToSkip -= read
+                                remainingToSkip--
                             }
                         }
-                        
                         if (remainingToSkip > 0) {
                             throw IOException("Failed to skip input stream to offset $offset. Remaining: $remainingToSkip")
                         }

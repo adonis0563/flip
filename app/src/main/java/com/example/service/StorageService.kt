@@ -215,7 +215,6 @@ object StorageService {
 
     fun queryMediaFiles(context: Context, category: String): List<LocalFileItem> {
         val list = mutableListOf<LocalFileItem>()
-        val seenIds = mutableSetOf<Long>() // ✅ FIX: Prevent duplicate files
         
         val contentUri = when (category) {
             "Images" -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -237,53 +236,13 @@ object StorageService {
             "Videos" -> null
             "Audio" -> null
             else -> {
-                // ✅ FIX: Broadened Documents filter to catch:
-                // 1. Standard MIME types (application/*, text/*)
-                // 2. NULL MIME_TYPE files with common document extensions (USB transfers, old downloads)
-                // 3. Excludes APKs (they have their own Apps tab)
-                // ✅ FIX: Removed dead "vnd.%" clause — real vnd types already match "application/%"
-                """
-                    (
-                        ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/%'
-                        OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'
-                        OR (
-                            ${MediaStore.Files.FileColumns.MIME_TYPE} IS NULL
-                            AND (
-                                ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.pdf'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.doc'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.docx'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.xls'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.xlsx'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.ppt'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.pptx'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.txt'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.csv'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.rtf'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.odt'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.ods'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.odp'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.zip'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.rar'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.7z'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.tar'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.gz'
-                                OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.epub'
-                            )
-                        )
-                    )
-                    AND (
-                        ${MediaStore.Files.FileColumns.MIME_TYPE} IS NULL
-                        OR ${MediaStore.Files.FileColumns.MIME_TYPE} != 'application/vnd.android.package-archive'
-                    )
-                """.trimIndent()
+                // Documents or general files
+                "${MediaStore.Files.FileColumns.MEDIA_TYPE} = ${MediaStore.Files.FileColumns.MEDIA_TYPE_NONE} OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/%' OR ${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'"
             }
         }
 
         try {
-            // ✅ FIX: Removed "LIMIT 100" from sortOrder. Modern Android strictly validates 
-            // the sortOrder parameter and rejects LIMIT clauses, causing silent query failures.
-            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
-            
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT 50"
             context.contentResolver.query(
                 contentUri,
                 projection,
@@ -299,17 +258,10 @@ object StorageService {
 
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idColumn)
-                    
-                    // ✅ FIX: Skip if we've already seen this ID (prevents MediaStore duplicates)
-                    if (!seenIds.add(id)) continue 
-                    
                     val name = cursor.getString(nameColumn) ?: "Unknown"
                     val size = cursor.getLong(sizeColumn)
                     val mimeType = cursor.getString(mimeColumn) ?: "application/octet-stream"
                     val dateAdded = cursor.getLong(dateColumn)
-
-                    // ✅ FIX: Filter out hidden files or 0-byte broken files/thumbnails
-                    if (name.startsWith(".") || size == 0L) continue
 
                     val fileUri = ContentUris.withAppendedId(contentUri, id)
                     list.add(
@@ -471,59 +423,39 @@ object StorageService {
             val pm = context.packageManager
             val pkgName = item.packageName ?: return null
             val appInfo = pm.getApplicationInfo(pkgName, 0)
+            val sourceApk = File(appInfo.publicSourceDir ?: appInfo.sourceDir ?: return null)
+            
+            if (!sourceApk.exists()) return null
             
             val tempDir = File(getFlipDirectory(), "Temp/APK")
             if (!tempDir.exists()) {
                 tempDir.mkdirs()
             }
-
-            val zipFileName = item.name.replace(".apk", "", ignoreCase = true) + "_bundle.apks"
-            val destZipFile = File(tempDir, zipFileName)
             
-            onProgress("Packaging ${item.name}...", 0f)
-
-            val sourceFiles = mutableListOf<File>()
-            val baseApkPath = appInfo.publicSourceDir ?: appInfo.sourceDir ?: return null
-            sourceFiles.add(File(baseApkPath))
+            val destFile = File(tempDir, item.name)
+            onProgress("Extracting ${item.name}...", 0f)
             
-            appInfo.splitSourceDirs?.forEach { splitPath ->
-                sourceFiles.add(File(splitPath))
-            }
-
-            var totalBytesToCopy = 0L
-            sourceFiles.forEach { file -> 
-                if (file.exists()) totalBytesToCopy += file.length() 
-            }
-            
+            val totalSize = sourceApk.length()
             var bytesCopied = 0L
-
-            java.util.zip.ZipOutputStream(java.io.FileOutputStream(destZipFile)).use { zos ->
-                sourceFiles.forEach { sourceFile ->
-                    if (!sourceFile.exists()) return@forEach
-                    
-                    val entryName = sourceFile.name
-                    zos.putNextEntry(java.util.zip.ZipEntry(entryName))
-                    
-                    java.io.FileInputStream(sourceFile).use { fis ->
-                        val buffer = ByteArray(1024 * 64)
-                        var bytes = fis.read(buffer)
-                        while (bytes >= 0) {
-                            zos.write(buffer, 0, bytes)
-                            bytesCopied += bytes
-                            if (totalBytesToCopy > 0) {
-                                onProgress("Packaging ${item.name}...", bytesCopied.toFloat() / totalBytesToCopy)
-                            }
-                            bytes = fis.read(buffer)
+            
+            sourceApk.inputStream().use { input ->
+                destFile.outputStream().use { output ->
+                    val buffer = ByteArray(1024 * 64)
+                    var bytes = input.read(buffer)
+                    while (bytes >= 0) {
+                        output.write(buffer, 0, bytes)
+                        bytesCopied += bytes
+                        if (totalSize > 0) {
+                            onProgress("Extracting ${item.name}...", bytesCopied.toFloat() / totalSize)
                         }
+                        bytes = input.read(buffer)
                     }
-                    zos.closeEntry()
                 }
             }
-
-            onProgress("Packaging complete", 1f)
-            return destZipFile
+            onProgress("Extraction complete", 1f)
+            return destFile
         } catch (e: Exception) {
-            Log.e("StorageService", "Failed to package APK: ${e.message}")
+            Log.e("StorageService", "Failed to extract APK: ${e.message}")
         }
         return null
     }

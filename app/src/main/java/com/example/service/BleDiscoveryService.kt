@@ -1,16 +1,12 @@
 package com.example.service
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
 import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
-import androidx.core.content.ContextCompat
 import com.example.model.Device
 import java.nio.charset.StandardCharsets
 import java.util.*
@@ -35,9 +31,7 @@ class BleDiscoveryService(
 
     companion object {
         private const val TAG = "BleDiscoveryService"
-        // ✅ FIX: Use a safe, non-reserved 16-bit ID. 0xFFFF is reserved by Bluetooth SIG for testing 
-        // and may be blocked by strict OEM BLE filters. 0x0563 is a safe custom identifier.
-        private const val MANUFACTURER_ID = 0x0563 
+        private const val MANUFACTURER_ID = 0xFFFF // Custom testing ID
         private val SERVICE_UUID = UUID.fromString("0000f119-0000-1000-8000-00805f9b34fb")
     }
 
@@ -50,19 +44,9 @@ class BleDiscoveryService(
     }
 
     fun startAdvertising(localIp: String, port: Int, deviceId: String, deviceName: String) {
-        if (bluetoothAdapter == null) {
-            listener.onDiscoveryError("Bluetooth is not supported on this device")
+        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+            listener.onDiscoveryError("Bluetooth is disabled or not supported")
             return
-        }
-        if (!bluetoothAdapter.isEnabled) {
-            listener.onDiscoveryError("Bluetooth is disabled. Please enable Bluetooth.")
-            return
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
-                listener.onDiscoveryError("Missing Bluetooth advertise permission")
-                return
-            }
         }
         advertiser = bluetoothAdapter.bluetoothLeAdvertiser
         if (advertiser == null) {
@@ -98,15 +82,7 @@ class BleDiscoveryService(
             }
         }
 
-        try {
-            advertiser?.startAdvertising(settings, data, advertiseCallback)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException while starting BLE advertising: ${e.message}")
-            listener.onDiscoveryError("Bluetooth permission denied")
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception while starting BLE advertising: ${e.message}")
-            listener.onDiscoveryError("Failed to start BLE advertising: ${e.message}")
-        }
+        advertiser?.startAdvertising(settings, data, advertiseCallback)
     }
 
     fun stopAdvertising() {
@@ -123,19 +99,9 @@ class BleDiscoveryService(
     }
 
     fun startScanning() {
-        if (bluetoothAdapter == null) {
-            listener.onDiscoveryError("Bluetooth is not supported on this device")
+        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+            listener.onDiscoveryError("Bluetooth is disabled or not supported")
             return
-        }
-        if (!bluetoothAdapter.isEnabled) {
-            listener.onDiscoveryError("Bluetooth is disabled. Please enable Bluetooth.")
-            return
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                listener.onDiscoveryError("Missing Bluetooth scan permission")
-                return
-            }
         }
         scanner = bluetoothAdapter.bluetoothLeScanner
         if (scanner == null) {
@@ -168,16 +134,8 @@ class BleDiscoveryService(
             }
         }
 
-        try {
-            scanner?.startScan(listOf(filter), settings, scanCallback)
-            Log.d(TAG, "BLE Scan started")
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException while starting BLE scan: ${e.message}")
-            listener.onDiscoveryError("Bluetooth scan permission denied")
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception while starting BLE scan: ${e.message}")
-            listener.onDiscoveryError("Failed to start BLE scan: ${e.message}")
-        }
+        scanner?.startScan(listOf(filter), settings, scanCallback)
+        Log.d(TAG, "BLE Scanning started")
     }
 
     fun stopScanning() {
@@ -216,23 +174,16 @@ class BleDiscoveryService(
         // Compact ID hash/slice
         val idBytes = id.take(8).padEnd(8, ' ').toByteArray(StandardCharsets.UTF_8)
         
+        val nameBytes = name.toByteArray(StandardCharsets.UTF_8)
         val maxNameLen = 10
-        
-        // ✅ FIX: Truncate by character to avoid slicing multi-byte UTF-8 characters (like emojis)
-        var truncatedNameStr = name
-        while (truncatedNameStr.toByteArray(StandardCharsets.UTF_8).size > maxNameLen) {
-            truncatedNameStr = truncatedNameStr.dropLast(1)
-        }
-        
-        val nameBytes = truncatedNameStr.toByteArray(StandardCharsets.UTF_8)
-        val paddedName = nameBytes.copyOf(maxNameLen) // Pads with 0x00 to exactly 10 bytes
+        val truncatedName = if (nameBytes.size > maxNameLen) nameBytes.copyOf(maxNameLen) else nameBytes
+        val paddedName = truncatedName.copyOf(maxNameLen)
 
         val out = ByteArray(4 + 2 + 8 + maxNameLen)
         System.arraycopy(ipBytes, 0, out, 0, 4)
         System.arraycopy(portBytes, 0, out, 4, 2)
         System.arraycopy(idBytes, 0, out, 6, 8)
         System.arraycopy(paddedName, 0, out, 14, maxNameLen)
-
         return out
     }
 

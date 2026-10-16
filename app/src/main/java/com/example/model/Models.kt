@@ -15,7 +15,8 @@ data class Device(
     val ip: String,
     val port: Int,
     val deviceType: String = "Android",
-    val lastSeen: Long = System.currentTimeMillis()
+    val lastSeen: Long = System.currentTimeMillis(),
+    val sid: String = ""
 )
 
 data class TransferItem(

@@ -14,7 +14,7 @@ object NetworkUtils {
                     if (!address.isLoopbackAddress && address is Inet4Address) {
                         val ip = address.hostAddress
                         // Filter for common private local networks
-                        if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+                        if (ip != null && (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172."))) {
                             return ip
                         }
                     }
@@ -25,7 +25,10 @@ object NetworkUtils {
                 val addresses = Collections.list(networkInterface.inetAddresses)
                 for (address in addresses) {
                     if (!address.isLoopbackAddress && address is Inet4Address) {
-                        return address.hostAddress
+                        val ip = address.hostAddress
+                        if (ip != null) {
+                            return ip
+                        }
                     }
                 }
             }

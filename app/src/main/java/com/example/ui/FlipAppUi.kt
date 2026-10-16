@@ -1,14 +1,24 @@
 package com.example.ui
 
+import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.provider.OpenableColumns
 import android.provider.MediaStore
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
+import com.example.service.AutoJoinState
 import android.widget.Toast
 import kotlinx.coroutines.launch
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
@@ -58,6 +68,10 @@ import com.example.model.TransferStatus
 import com.example.service.QrCodeGenerator
 import com.example.service.StorageService
 import com.example.service.LocalFileItem
+import com.example.model.FileEntry
+import com.example.viewmodel.IncomingFileRequest
+import com.example.repository.FileRepository
+import android.util.LruCache
 import coil.compose.AsyncImage
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
@@ -101,10 +115,59 @@ fun FlipAppContent(viewModel: FlipViewModel) {
     val transferQueue by viewModel.transferQueue.collectAsState()
     val toastMessage by viewModel.toastMessage.collectAsState()
     val bleError by viewModel.bleError.collectAsState()
+    val pendingIncomingRequest by viewModel.pendingIncomingRequest.collectAsState()
+    val pendingShareRequest by viewModel.pendingShareRequest.collectAsState()
+    val autoJoinState by viewModel.autoJoinState.collectAsState()
 
     val context = LocalContext.current
 
     var showStandaloneFilePicker by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var showConnectedSuccess by remember { mutableStateOf(false) }
+
+    // Android 13+ Notification permission request rationale
+    var showNotificationRationaleDialog by remember { mutableStateOf(false) }
+    var hasPromptedNotificationPermission by remember { mutableStateOf(false) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(
+                context,
+                "Notifications disabled. Incoming files will prompt inside the app.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    LaunchedEffect(connectionState) {
+        if (connectionState == ConnectionState.CONNECTED) {
+            showConnectedSuccess = true
+            if (!hasPromptedNotificationPermission) {
+                hasPromptedNotificationPermission = true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val hasPerm = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (!hasPerm) {
+                        showNotificationRationaleDialog = true
+                    }
+                }
+            }
+        } else {
+            showConnectedSuccess = false
+        }
+    }
+
+    val openExplorerRequested by viewModel.openExplorerEvent.collectAsState()
+    LaunchedEffect(openExplorerRequested) {
+        if (openExplorerRequested) {
+            showStandaloneFilePicker = true
+            viewModel.consumeOpenExplorer()
+        }
+    }
 
     val standaloneFilePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
@@ -139,31 +202,39 @@ fun FlipAppContent(viewModel: FlipViewModel) {
     val prefs = remember(context) { context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE) }
     var showSplash by remember { mutableStateOf(!prefs.getBoolean("onboarding_complete", false)) }
 
-    if (showSplash) {
-        SplashScreen(
-            onGetStarted = { showSplash = false }
-        )
-    } else {
-        Scaffold(
-            modifier = Modifier.fillMaxSize(),
-            contentWindowInsets = WindowInsets.safeDrawing,
-            containerColor = MaterialTheme.colorScheme.background
-        ) { innerPadding ->
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .background(MaterialTheme.colorScheme.background)
-            ) {
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        contentWindowInsets = WindowInsets.safeDrawing,
+        containerColor = MaterialTheme.colorScheme.background
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .background(MaterialTheme.colorScheme.background)
+        ) {
+            if (showSplash) {
+                SplashScreen(
+                    onGetStarted = { showSplash = false }
+                )
+            } else {
                 when (connectionState) {
                     ConnectionState.IDLE -> {
-                        HomeScreen(
-                            localDevice = localDevice,
-                            onSendMode = { viewModel.startSenderMode() },
-                            onReceiveMode = { viewModel.startReceiverMode() },
-                            onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
-                            onExploreFiles = { showStandaloneFilePicker = true }
-                        )
+                        if (showSettings) {
+                            SettingsScreen(
+                                onBack = { showSettings = false }
+                            )
+                        } else {
+                            HomeScreen(
+                                localDevice = localDevice,
+                                onSendMode = { viewModel.startSenderMode() },
+                                onReceiveMode = { viewModel.startReceiverMode() },
+                                onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
+                                onExploreFiles = { showStandaloneFilePicker = true },
+                                onRenameDevice = { viewModel.updateDeviceName(it) },
+                                onOpenSettings = { showSettings = true }
+                            )
+                        }
                     }
 
                     ConnectionState.SEARCHING, ConnectionState.CONNECTING -> {
@@ -181,6 +252,7 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                                 discoveredDevices = discoveredDevices,
                                 bleError = bleError,
                                 localDevice = localDevice,
+                                autoJoinState = autoJoinState,
                                 onSelectDevice = { viewModel.connectToDiscoveredDevice(it) },
                                 onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
                                 onCancel = { viewModel.resetToHome() }
@@ -206,6 +278,17 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                             onCancelItem = { id -> viewModel.cancelTransfer(id) },
                             onDisconnect = { viewModel.disconnect() }
                         )
+
+                        AnimatedVisibility(
+                            visible = showConnectedSuccess,
+                            enter = fadeIn(tween(180)),
+                            exit = fadeOut(tween(300)) + scaleOut(targetScale = 0.96f)
+                        ) {
+                            ConnectedSuccessOverlay(
+                                remoteDevice = remoteDevice,
+                                onFinished = { showConnectedSuccess = false }
+                            )
+                        }
                     }
 
                     ConnectionState.DISCONNECTED -> {
@@ -226,6 +309,128 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                         onLaunchSystemPicker = {
                             standaloneFilePickerLauncher.launch(arrayOf("*/*"))
                         }
+                    )
+                }
+
+                // In-App Incoming File Transfer Request Prompt (when app is in foreground)
+                pendingIncomingRequest?.let { req ->
+                    val sizeStr = if (req.fileSize > 0) android.text.format.Formatter.formatFileSize(context, req.fileSize) else ""
+                    val subtitle = if (sizeStr.isNotEmpty()) "${req.fileName} ($sizeStr)" else req.fileName
+                    AlertDialog(
+                        onDismissRequest = { viewModel.declineIncomingRequest(req.transferId) },
+                        title = {
+                            Text(
+                                text = "${req.senderName} wants to send",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        },
+                        text = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = subtitle,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = "Accept this incoming file transfer?",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = { viewModel.acceptIncomingRequest(req.transferId) },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary
+                                )
+                            ) {
+                                Text("Accept", fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(
+                                onClick = { viewModel.declineIncomingRequest(req.transferId) },
+                                colors = ButtonDefaults.textButtonColors(contentColor = AccentRed)
+                            ) {
+                                Text("Decline", color = AccentRed)
+                            }
+                        },
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                }
+
+                // Notification Permission Rationale Dialog
+                if (showNotificationRationaleDialog) {
+                    AlertDialog(
+                        onDismissRequest = {
+                            showNotificationRationaleDialog = false
+                            Toast.makeText(
+                                context,
+                                "Notifications disabled. Incoming files will prompt inside the app.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        },
+                        title = {
+                            Text(
+                                text = "Enable Notifications",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        },
+                        text = {
+                            Text(
+                                text = "Flip uses notifications to keep transfers active in the background and let you accept incoming files without keeping the app open.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    showNotificationRationaleDialog = false
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary
+                                )
+                            ) {
+                                Text("Allow", fontWeight = FontWeight.Bold)
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(
+                                onClick = {
+                                    showNotificationRationaleDialog = false
+                                    Toast.makeText(
+                                        context,
+                                        "Notifications disabled. Incoming files will prompt inside the app.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                },
+                                colors = ButtonDefaults.textButtonColors(contentColor = AccentRed)
+                            ) {
+                                Text("Not Now", color = AccentRed)
+                            }
+                        },
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                }
+
+                // Share Confirmation Sheet (when sharing from another app while connected)
+                pendingShareRequest?.let { req ->
+                    ShareConfirmationSheet(
+                        request = req,
+                        onConfirm = { viewModel.confirmPendingShare() },
+                        onCancel = { viewModel.cancelPendingShare() }
                     )
                 }
             }
@@ -284,7 +489,7 @@ fun SplashScreen(onGetStarted: () -> Unit) {
         Text(
             text = "A zero-account, local-first file & text sharing app.",
             style = MaterialTheme.typography.bodyLarge.copy(
-                color = MinTextMuted,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
             ),
             modifier = Modifier.padding(horizontal = 16.dp)
@@ -303,13 +508,13 @@ fun SplashScreen(onGetStarted: () -> Unit) {
                 onCheckedChange = { dontShowAgain = it },
                 colors = CheckboxDefaults.colors(
                     checkedColor = MaterialTheme.colorScheme.primary,
-                    uncheckedColor = MinTextMuted
+                    uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = "Don't show this again",
-                style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)
+                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
             )
         }
 
@@ -331,14 +536,15 @@ fun SplashScreen(onGetStarted: () -> Unit) {
                 .testTag("get_started_button"),
             colors = ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = Color.White
+                contentColor = MaterialTheme.colorScheme.onPrimary
             ),
             shape = RoundedCornerShape(16.dp)
         ) {
             Text(
                 text = "Get Started",
                 style = MaterialTheme.typography.titleMedium.copy(
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimary
                 )
             )
         }
@@ -356,70 +562,184 @@ fun HomeScreen(
     onSendMode: () -> Unit,
     onReceiveMode: () -> Unit,
     onManualConnect: (String, Int) -> Unit,
-    onExploreFiles: () -> Unit
+    onExploreFiles: () -> Unit,
+    onRenameDevice: (String) -> Unit = {},
+    onOpenSettings: () -> Unit = {}
 ) {
-    var manualIp by remember { mutableStateOf("") }
-    var manualPort by remember { mutableStateOf("8080") }
-    var showPrecheckDialogForSend by remember { mutableStateOf(false) }
-    var showPrecheckDialogForReceive by remember { mutableStateOf(false) }
-    var showNoNetworkDialog by remember { mutableStateOf(false) }
-    var showMobileDataDialog by remember { mutableStateOf(false) }
-    var pendingMode by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+    var isOnWifi by remember {
+        mutableStateOf(run {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val activeNetwork = cm?.activeNetwork
+            val caps = activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        })
+    }
+
+    DisposableEffect(context) {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                isOnWifi = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+            }
+            override fun onLost(network: Network) {
+                val activeNetwork = cm?.activeNetwork
+                val caps = activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                isOnWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            }
+            override fun onAvailable(network: Network) {
+                val caps = cm?.getNetworkCapabilities(network)
+                isOnWifi = caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            }
+        }
+        try {
+            cm?.registerDefaultNetworkCallback(callback)
+        } catch (e: Exception) {
+            // Safe fallback if network callback cannot be registered
+        }
+        onDispose {
+            try {
+                cm?.unregisterNetworkCallback(callback)
+            } catch (e: Exception) {
+                // Ignore cleanup errors
+            }
+        }
+    }
+
+    var showRenameDialog by remember { mutableStateOf(false) }
+    var renameInput by remember(localDevice?.name) { mutableStateOf(localDevice?.name ?: "") }
+
+    if (showRenameDialog) {
+        AlertDialog(
+            onDismissRequest = { showRenameDialog = false },
+            title = {
+                Text(
+                    text = "Rename Device",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            },
+            text = {
+                OutlinedTextField(
+                    value = renameInput,
+                    onValueChange = { renameInput = it },
+                    label = { Text("Device Name") },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                        focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                        unfocusedTextColor = MaterialTheme.colorScheme.onSurface
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("device_rename_input")
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmed = renameInput.trim()
+                        if (trimmed.isNotEmpty()) {
+                            onRenameDevice(trimmed)
+                        }
+                        showRenameDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    ),
+                    modifier = Modifier.testTag("device_rename_save_button")
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showRenameDialog = false },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = AccentRed
+                    )
+                ) {
+                    Text("Cancel", color = AccentRed)
+                }
+            }
+        )
+    }
+
+    var activeConnectionSheet by remember { mutableStateOf<ReadinessMode?>(null) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(16.dp))
+        // Top bar: 56dp height, centered Flip title, settings button on left
+        HomeTopBar(onOpenSettings = onOpenSettings)
 
-        // Device profile card
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Single-line device card: device name, small status dot (green when on wifi), tap to rename
         Card(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .clickable {
+                    renameInput = localDevice?.name ?: ""
+                    showRenameDialog = true
+                }
+                .testTag("device_card"),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            shape = RoundedCornerShape(20.dp)
+            shape = RoundedCornerShape(16.dp)
         ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(20.dp),
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                Text(
+                    text = localDevice?.name ?: "Android Device",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+
+                Spacer(modifier = Modifier.width(8.dp))
+
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
-                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PhoneAndroid,
-                        contentDescription = "My Device",
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(16.dp))
-
-                Column {
-                    Text(
-                        text = localDevice?.name ?: "Android Device",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MinTextPrimary
+                        .size(8.dp)
+                        .background(
+                            color = if (isOnWifi) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline,
+                            shape = CircleShape
                         )
-                    )
-                    Text(
-                        text = "IP: ${localDevice?.ip ?: "Unknown"}",
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            color = MinTextSubtle
-                        )
-                    )
-                }
+                )
+
+                Spacer(modifier = Modifier.weight(1f, fill = true))
+
+                Icon(
+                    imageVector = Icons.Default.Edit,
+                    contentDescription = "Rename device",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp)
+                )
             }
         }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Device Storage card
+        StorageCard(
+            onViewDetails = onExploreFiles
+        )
 
         Spacer(modifier = Modifier.weight(0.8f))
 
@@ -427,7 +747,7 @@ fun HomeScreen(
             text = "Ready to flip?",
             style = MaterialTheme.typography.headlineMedium.copy(
                 fontWeight = FontWeight.ExtraBold,
-                color = MinTextPrimary
+                color = MaterialTheme.colorScheme.onBackground
             )
         )
 
@@ -439,14 +759,20 @@ fun HomeScreen(
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Button(
-                onClick = { showPrecheckDialogForSend = true },
+                onClick = {
+                    if (ConnectionChecker.isReadyForMode(context, ReadinessMode.SEND)) {
+                        onSendMode()
+                    } else {
+                        activeConnectionSheet = ReadinessMode.SEND
+                    }
+                },
                 modifier = Modifier
                     .weight(1f)
                     .height(96.dp)
                     .testTag("send_button"),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = Color.White
+                    contentColor = MaterialTheme.colorScheme.onPrimary
                 ),
                 shape = RoundedCornerShape(24.dp)
             ) {
@@ -454,7 +780,7 @@ fun HomeScreen(
                     Icon(
                         imageVector = Icons.Default.ArrowUpward,
                         contentDescription = "Send Icon",
-                        tint = Color.White,
+                        tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(28.dp)
                     )
                     Spacer(modifier = Modifier.height(4.dp))
@@ -462,21 +788,27 @@ fun HomeScreen(
                         text = "Send",
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            color = MaterialTheme.colorScheme.onPrimary
                         )
                     )
                 }
             }
 
             Button(
-                onClick = { showPrecheckDialogForReceive = true },
+                onClick = {
+                    if (ConnectionChecker.isReadyForMode(context, ReadinessMode.RECEIVE)) {
+                        onReceiveMode()
+                    } else {
+                        activeConnectionSheet = ReadinessMode.RECEIVE
+                    }
+                },
                 modifier = Modifier
                     .weight(1f)
                     .height(96.dp)
                     .testTag("receive_button"),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.secondary,
-                    contentColor = Color.White
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    contentColor = MaterialTheme.colorScheme.onSurface
                 ),
                 shape = RoundedCornerShape(24.dp)
             ) {
@@ -484,7 +816,7 @@ fun HomeScreen(
                     Icon(
                         imageVector = Icons.Default.ArrowDownward,
                         contentDescription = "Receive Icon",
-                        tint = Color.White,
+                        tint = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.size(28.dp)
                     )
                     Spacer(modifier = Modifier.height(4.dp))
@@ -492,7 +824,7 @@ fun HomeScreen(
                         text = "Receive",
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     )
                 }
@@ -509,247 +841,39 @@ fun HomeScreen(
                 .testTag("explore_files_button"),
             shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = MaterialTheme.colorScheme.primary
+                contentColor = MaterialTheme.colorScheme.onBackground
             ),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
         ) {
             Icon(
                 imageVector = Icons.Default.Folder,
                 contentDescription = "Explore Files",
-                tint = MaterialTheme.colorScheme.primary
+                tint = MaterialTheme.colorScheme.onBackground
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = "In-App File Explorer",
                 style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.primary
+                color = MaterialTheme.colorScheme.onBackground
             )
         }
 
         Spacer(modifier = Modifier.weight(1f))
+    }
 
-        // Direct Connect manual card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            shape = RoundedCornerShape(20.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp)
-            ) {
-                Text(
-                    text = "Direct Connection Fallback",
-                    style = MaterialTheme.typography.labelLarge.copy(
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    OutlinedTextField(
-                        value = manualIp,
-                        onValueChange = { manualIp = it },
-                        placeholder = { Text("Receiver IP (e.g. 192.168.1.5)") },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("manual_ip_input"),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            focusedTextColor = MinTextPrimary,
-                            unfocusedTextColor = MinTextPrimary
-                        ),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone)
-                    )
-
-                    Button(
-                        onClick = {
-                            val port = manualPort.toIntOrNull() ?: 8080
-                            if (manualIp.isNotBlank()) {
-                                onManualConnect(manualIp.trim(), port)
-                            }
-                        },
-                        modifier = Modifier
-                            .height(56.dp)
-                            .testTag("direct_connect_button"),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                            contentColor = MaterialTheme.colorScheme.primary
-                        ),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Connect",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
+    activeConnectionSheet?.let { mode ->
+        ConnectionReadinessSheet(
+            mode = mode,
+            onDismiss = { activeConnectionSheet = null },
+            onContinue = {
+                val currentMode = activeConnectionSheet
+                activeConnectionSheet = null
+                if (currentMode == ReadinessMode.SEND) {
+                    onSendMode()
+                } else if (currentMode == ReadinessMode.RECEIVE) {
+                    onReceiveMode()
                 }
             }
-        }
-    }
-
-    if (showPrecheckDialogForSend) {
-        AlertDialog(
-            onDismissRequest = { showPrecheckDialogForSend = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Connection Check",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Enable Connections", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "For maximum speed and efficiency, let this phone create a local Wi-Fi network for the transfer.",
-                        color = MinTextMuted
-                    )
-                    Text(
-                        text = "1. Turn on Mobile Hotspot on this phone.\n2. Have the receiver connect to your Hotspot's Wi-Fi.\n3. Keep Bluetooth on so they can pair automatically.",
-                        color = MinTextMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Current IP: ${localDevice?.ip ?: "Unknown"}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showPrecheckDialogForSend = false
-                        val ip = localDevice?.ip ?: "127.0.0.1"
-                        if (ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()) {
-                            showNoNetworkDialog = true
-                        } else {
-                            onSendMode()
-                        }
-                    }
-                ) {
-                    Text("My Hotspot is Active", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPrecheckDialogForSend = false }) {
-                    Text("Cancel", color = MinTextSubtle)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
-        )
-    }
-
-    if (showPrecheckDialogForReceive) {
-        AlertDialog(
-            onDismissRequest = { showPrecheckDialogForReceive = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Connection Check",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Enable Connections", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "Please connect this phone to the sender's local Wi-Fi or Mobile Hotspot before proceeding.",
-                        color = MinTextMuted
-                    )
-                    Text(
-                        text = "1. Turn on Wi-Fi on this phone.\n2. Connect to the sender's Mobile Hotspot network.\n3. Make sure Bluetooth is enabled.",
-                        color = MinTextMuted,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Current IP: ${localDevice?.ip ?: "Unknown"}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showPrecheckDialogForReceive = false
-                        val ip = localDevice?.ip ?: "127.0.0.1"
-                        if (ip == "127.0.0.1" || ip.startsWith("127.0.0") || ip.isBlank()) {
-                            showNoNetworkDialog = true
-                        } else {
-                            onReceiveMode()
-                        }
-                    }
-                ) {
-                    Text("I'm Connected to Hotspot", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPrecheckDialogForReceive = false }) {
-                    Text("Cancel", color = MinTextSubtle)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
-        )
-    }
-
-    if (showNoNetworkDialog) {
-        AlertDialog(
-            onDismissRequest = { showNoNetworkDialog = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.WifiOff,
-                        contentDescription = "No Network Warning",
-                        tint = MaterialTheme.colorScheme.error
-                    )
-                    Text("Connect to Wi-Fi or Hotspot", fontWeight = FontWeight.Bold, color = MinTextPrimary)
-                }
-            },
-            text = {
-                Text(
-                    text = "Your device has a loopback or offline IP (${localDevice?.ip ?: "127.0.0.1"}). Please connect to a Wi-Fi network or enable/connect to a personal Hotspot first.",
-                    color = MinTextMuted
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = { showNoNetworkDialog = false }
-                ) {
-                    Text("OK", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
         )
     }
 }
@@ -764,7 +888,7 @@ fun SenderWaitingScreen(
     onCancel: () -> Unit
 ) {
     val context = LocalContext.current
-    val pairingPayload = "flip://ip=${localDevice?.ip}&port=${localDevice?.port}&id=${localDevice?.id}&name=${localDevice?.name}"
+    val pairingPayload = "flip://ip=${localDevice?.ip}&port=${localDevice?.port}&id=${localDevice?.id}&name=${localDevice?.name}&sid=${localDevice?.sid ?: com.example.service.DeviceIdentity.currentSessionId}"
 
     // Generate local QR Code
     val qrBitmap = remember(pairingPayload) {
@@ -777,20 +901,21 @@ fun SenderWaitingScreen(
         "$lastSegment${localDevice?.port ?: "8080"}"
     }
 
-    var selectedQrTab by remember { mutableStateOf(0) } // 0 = App Pairing, 1 = Hotspot Wi-Fi
+    var selectedQrTab by remember { mutableStateOf(0) } // 0 = App Pairing, 1 = First time
+    var showQrFallback by remember { mutableStateOf(false) }
     var showIpEditDialog by remember { mutableStateOf(false) }
     var editingIp by remember { mutableStateOf(localDevice?.ip ?: "") }
 
     if (showIpEditDialog) {
         AlertDialog(
             onDismissRequest = { showIpEditDialog = false },
-            title = { Text("Correct Server IP", fontWeight = FontWeight.Bold) },
+            title = { Text("Correct Server IP", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
                         text = "If your detected IP is wrong, correct it here so receivers can connect over Wi-Fi and BLE.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MinTextMuted
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     OutlinedTextField(
                         value = editingIp,
@@ -800,8 +925,10 @@ fun SenderWaitingScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = MinTextPrimary,
-                            unfocusedTextColor = MinTextPrimary
+                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline
                         )
                     )
                 }
@@ -813,14 +940,21 @@ fun SenderWaitingScreen(
                             onUpdateIp(editingIp.trim())
                         }
                         showIpEditDialog = false
-                    }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    )
                 ) {
-                    Text("Update & Restart BLE")
+                    Text("Update & Restart BLE", color = MaterialTheme.colorScheme.onPrimary)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showIpEditDialog = false }) {
-                    Text("Cancel", color = MinTextSubtle)
+                TextButton(
+                    onClick = { showIpEditDialog = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = AccentRed)
+                ) {
+                    Text("Cancel", color = AccentRed)
                 }
             },
             containerColor = MaterialTheme.colorScheme.surface,
@@ -867,7 +1001,7 @@ fun SenderWaitingScreen(
             Text(
                 text = "Waiting for receiver...",
                 style = MaterialTheme.typography.bodyMedium.copy(
-                    color = MinTextMuted,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontWeight = FontWeight.Bold
                 )
             )
@@ -882,7 +1016,7 @@ fun SenderWaitingScreen(
                 .padding(4.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            listOf("App Pairing QR", "Hotspot Wi-Fi").forEachIndexed { index, title ->
+            listOf("App Pairing", "First time").forEachIndexed { index, title ->
                 val isSelected = selectedQrTab == index
                 Box(
                     modifier = Modifier
@@ -897,17 +1031,18 @@ fun SenderWaitingScreen(
                         text = title,
                         style = MaterialTheme.typography.labelMedium.copy(
                             fontWeight = FontWeight.Bold,
-                            color = if (isSelected) Color.White else MinTextMuted
+                            color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     )
                 }
             }
         }
 
-        // Beautiful Card presenting the QR Code and Details
+        // Beautiful Card presenting Animation or QR Code fallback and Details
         Card(
             modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MinAccentBlueLight),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
             shape = RoundedCornerShape(24.dp)
         ) {
             Column(
@@ -918,42 +1053,84 @@ fun SenderWaitingScreen(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 if (selectedQrTab == 0) {
-                    if (qrBitmap != null) {
-                        Surface(
-                            color = Color.White,
-                            shape = RoundedCornerShape(16.dp),
-                            modifier = Modifier
-                                .size(190.dp)
-                                .padding(4.dp)
+                    if (showQrFallback) {
+                        // QR Code Fallback
+                        if (qrBitmap != null) {
+                            Surface(
+                                color = Color.White,
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier
+                                    .size(190.dp)
+                                    .padding(4.dp)
+                            ) {
+                                Image(
+                                    bitmap = qrBitmap.asImageBitmap(),
+                                    contentDescription = "Pairing QR Code",
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(190.dp)
+                                    .background(MaterialTheme.colorScheme.background, RoundedCornerShape(16.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("QR Error", color = AccentRed)
+                            }
+                        }
+
+                        // Text link to switch back to animation
+                        TextButton(
+                            onClick = { showQrFallback = false },
+                            modifier = Modifier.testTag("hide_qr_fallback_link")
                         ) {
-                            Image(
-                                bitmap = qrBitmap.asImageBitmap(),
-                                contentDescription = "Pairing QR Code",
-                                modifier = Modifier.fillMaxSize()
+                            Text(
+                                text = "Hide QR",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             )
                         }
                     } else {
-                        Box(
-                            modifier = Modifier
-                                .size(190.dp)
-                                .background(MaterialTheme.colorScheme.background, RoundedCornerShape(16.dp)),
-                            contentAlignment = Alignment.Center
+                        // Pulsing Hotspot / Radio animation
+                        PulsingRadioAnimation(
+                            modifier = Modifier.padding(vertical = 4.dp),
+                            size = 190.dp,
+                            waveColor = MaterialTheme.colorScheme.primary
+                        )
+
+                        // Small "Show QR instead" text link
+                        TextButton(
+                            onClick = { showQrFallback = true },
+                            modifier = Modifier.testTag("show_qr_fallback_link")
                         ) {
-                            Text("QR Error", color = AccentRed)
+                            Text(
+                                text = "Show QR instead",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            )
                         }
                     }
 
                     Text(
-                        text = "Receiver can scan this QR code within the Flip app, or connect using the info below:",
+                        text = if (showQrFallback) {
+                            "Receiver can scan this QR code within the Flip app, or connect using the info below:"
+                        } else {
+                            "Broadcasting via BLE. Nearby receivers will detect this device automatically."
+                        },
                         style = MaterialTheme.typography.bodySmall.copy(
-                            color = MinAccentBlueDark.copy(alpha = 0.8f),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center
                         )
                     )
 
                     // 4-Digit Connection code
                     Surface(
-                        color = MinAccentBlueDark.copy(alpha = 0.08f),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Column(
@@ -962,13 +1139,16 @@ fun SenderWaitingScreen(
                         ) {
                             Text(
                                 text = "CONNECT CODE",
-                                style = MaterialTheme.typography.labelSmall.copy(color = MinAccentBlueDark.copy(alpha = 0.7f), letterSpacing = 2.sp)
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    letterSpacing = 2.sp
+                                )
                             )
                             Text(
                                 text = connectCode,
                                 style = MaterialTheme.typography.titleLarge.copy(
                                     fontWeight = FontWeight.Black,
-                                    color = MinAccentBlueDark,
+                                    color = MaterialTheme.colorScheme.onSurface,
                                     fontFamily = FontFamily.Monospace
                                 )
                             )
@@ -983,7 +1163,7 @@ fun SenderWaitingScreen(
                         Text(
                             text = "Server IP: ${localDevice?.ip}:${localDevice?.port}",
                             style = MaterialTheme.typography.bodySmall.copy(
-                                color = MinAccentBlueDark.copy(alpha = 0.8f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontFamily = FontFamily.Monospace
                             )
                         )
@@ -998,95 +1178,45 @@ fun SenderWaitingScreen(
                             Icon(
                                 imageVector = Icons.Default.Edit,
                                 contentDescription = "Edit Server IP",
-                                tint = MinAccentBlueDark,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(14.dp)
                             )
                         }
                     }
                 } else {
-                    Icon(
-                        imageVector = Icons.Default.Wifi,
-                        contentDescription = "Hotspot",
-                        tint = MinAccentBlueDark,
-                        modifier = Modifier.size(48.dp)
+                    // Tab 2: "First time" Gated Hotspot Tab
+                    FirstTimeHotspotTab(
+                        localDevice = localDevice,
+                        onRequestReturnToAppPairing = { message ->
+                            selectedQrTab = 0
+                            if (message.isNotBlank()) {
+                                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                            }
+                        }
                     )
-
-                    Text(
-                        text = "📶 How to connect via Hotspot",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MinAccentBlueDark
-                        ),
-                        textAlign = TextAlign.Center
-                    )
-
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Text(
-                            text = "On this device (sender):",
-                            style = MaterialTheme.typography.bodyMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = MinAccentBlueDark
-                            )
-                        )
-                        Text(
-                            text = "1. Open Settings → Mobile Hotspot\n2. Enable your hotspot\n3. Note your hotspot name & password",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = MinAccentBlueDark.copy(alpha = 0.9f)
-                            ),
-                            lineHeight = 18.sp
-                        )
-
-                        Divider(color = MinAccentBlueDark.copy(alpha = 0.2f), thickness = 1.dp)
-
-                        Text(
-                            text = "On the other device (receiver):",
-                            style = MaterialTheme.typography.bodyMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = MinAccentBlueDark
-                            )
-                        )
-                        Text(
-                            text = "1. Open Settings → Wi-Fi\n2. Connect to this device's hotspot\n3. Return to Flip and tap \"Receive\"",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = MinAccentBlueDark.copy(alpha = 0.9f)
-                            ),
-                            lineHeight = 18.sp
-                        )
-
-                        Divider(color = MinAccentBlueDark.copy(alpha = 0.2f), thickness = 1.dp)
-
-                        Text(
-                            text = "Once connected to the same hotspot, Flip will find each other automatically over BLE.",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                fontStyle = FontStyle.Italic,
-                                color = MinAccentBlueDark.copy(alpha = 0.8f)
-                            ),
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
                 }
             }
         }
 
         Spacer(modifier = Modifier.weight(1f))
 
-        Button(
+        OutlinedButton(
             onClick = onCancel,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
                 .testTag("cancel_advertising_button"),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+            colors = ButtonDefaults.outlinedButtonColors(
+                contentColor = AccentRed
             ),
+            border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
             shape = RoundedCornerShape(16.dp)
         ) {
-            Text("Cancel")
+            Text(
+                "Cancel", 
+                color = AccentRed, 
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+            )
         }
     }
 }
@@ -1097,10 +1227,12 @@ fun ReceiverScanningScreen(
     discoveredDevices: List<Device>,
     bleError: String?,
     localDevice: Device?,
+    autoJoinState: AutoJoinState = AutoJoinState.Idle,
     onSelectDevice: (Device) -> Unit,
     onManualConnect: (String, Int) -> Unit,
     onCancel: () -> Unit
 ) {
+    val context = LocalContext.current
     var manualCode by remember { mutableStateOf("") }
     var showScanOverlay by remember { mutableStateOf(false) }
 
@@ -1164,347 +1296,271 @@ fun ReceiverScanningScreen(
             }
         }
 
-        if (showScanOverlay) {
-            // Highly immersive camera overlay / QR scanning module
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1.2f)
-                    .background(Color.Black, RoundedCornerShape(24.dp))
-                    .clip(RoundedCornerShape(24.dp))
-            ) {
-                // Animated Scanning line fallback
-                val infiniteTransition = rememberInfiniteTransition()
-                val offsetLine by infiniteTransition.animateFloat(
-                    initialValue = 0.1f,
-                    targetValue = 0.9f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(2000, easing = LinearEasing),
-                        repeatMode = RepeatMode.Reverse
-                    )
-                )
-
-                Column(
-                    modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.Center,
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(240.dp)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Color.DarkGray)
-                    ) {
-                        // Show actual camera preview if permission is granted
-                        if (cameraPermissionState.status.isGranted) {
-                            CameraPreview(
-                                modifier = Modifier.fillMaxSize(),
-                                onQrCodeScanned = { qrResult ->
-                                    if (qrResult.startsWith("flip://")) {
-                                        try {
-                                            val ip = qrResult.substringAfter("ip=").substringBefore("&")
-                                            val port = qrResult.substringAfter("port=").substringBefore("&").toIntOrNull() ?: 8080
-                                            onManualConnect(ip, port)
-                                            showScanOverlay = false
-                                        } catch (e: Exception) {
-                                            // Ignore
-                                        }
-                                    }
-                                }
-                            )
-                        } else {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = "Camera permission needed to scan QR code.",
-                                    color = Color.White,
-                                    textAlign = TextAlign.Center,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.padding(16.dp)
-                                )
-                            }
-                        }
-
-                        // Pulsing scanning laser line on top of camera preview
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .fillMaxHeight(0.015f)
-                                .align(Alignment.TopCenter)
-                                .offset(y = (offsetLine * 240).dp)
-                                .background(MaterialTheme.colorScheme.primary)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "Point camera at Sender's QR Code",
-                        color = Color.White.copy(alpha = 0.8f),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    // Input scanner shortcut for emulator convenience
-                    OutlinedTextField(
-                        value = manualCode,
-                        onValueChange = { 
-                            manualCode = it
-                            // Auto-extract URI connections
-                            if (it.startsWith("flip://")) {
-                                try {
-                                    val ip = it.substringAfter("ip=").substringBefore("&")
-                                    val port = it.substringAfter("port=").substringBefore("&").toIntOrNull() ?: 8080
-                                    onManualConnect(ip, port)
-                                } catch (e: Exception) {
-                                    // Ignore
-                                }
-                            }
-                        },
-                        placeholder = { Text("Paste pairing URL (for testing)", color = Color.Gray) },
-                        modifier = Modifier
-                            .fillMaxWidth(0.9f)
-                            .padding(8.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            focusedTextColor = Color.White
-                        )
-                    )
-                }
-
-                IconButton(
-                    onClick = { showScanOverlay = false },
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(12.dp)
-                        .background(Color.DarkGray.copy(alpha = 0.6f), CircleShape)
-                ) {
-                    Icon(imageVector = Icons.Default.Close, contentDescription = "Close Scanner", tint = Color.White)
-                }
-            }
-        } else {
-            // BLE Discovered Senders List
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1.2f),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                shape = RoundedCornerShape(24.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(16.dp)
+        // Auto-join status banners
+        when (autoJoinState) {
+            is AutoJoinState.Joining -> {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                    shape = RoundedCornerShape(12.dp)
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.padding(14.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text(
-                            text = "Nearby Devices",
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = MinTextPrimary
-                            )
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.dp
                         )
-                        IconButton(onClick = { showScanOverlay = true }) {
-                            Icon(
-                                imageVector = Icons.Default.QrCodeScanner,
-                                contentDescription = "Open Scanner",
-                                tint = MaterialTheme.colorScheme.primary
+                        Column {
+                            Text(
+                                text = "Joining ${autoJoinState.peerName}'s hotspot...",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = autoJoinState.message,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
+                                style = MaterialTheme.typography.bodySmall
                             )
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    if (discoveredDevices.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f),
-                            contentAlignment = Alignment.Center
+                }
+            }
+            is AutoJoinState.Handshake -> {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.dp
+                        )
+                        Text(
+                            text = "Connecting to ${autoJoinState.peerName}...",
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            }
+            is AutoJoinState.Disconnected -> {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Disconnected",
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                        Text(
+                            text = autoJoinState.reason ?: "Connection lost, hotspot may have turned off",
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+            is AutoJoinState.Failed -> {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                CircularProgressIndicator(
-                                    color = MaterialTheme.colorScheme.primary,
-                                    strokeWidth = 2.dp,
-                                    modifier = Modifier.size(24.dp)
-                                )
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Text(
-                                    text = "Searching over BLE...",
-                                    style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)
-                                )
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Connection Failed",
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Text(
+                                text = autoJoinState.reason,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (autoJoinState.needsRePair) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(
+                                onClick = { showScanOverlay = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                modifier = Modifier.align(Alignment.End)
+                            ) {
+                                Text("Re-pair with device", color = MaterialTheme.colorScheme.onError)
                             }
                         }
-                    } else {
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(10.dp),
-                            modifier = Modifier.fillMaxSize()
-                        ) {
-                            items(discoveredDevices) { device ->
-                                Card(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { onSelectDevice(device) }
-                                        .testTag("device_list_item"),
-                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                                    shape = RoundedCornerShape(14.dp)
+                    }
+                }
+            }
+            else -> {}
+        }
+
+        if (showScanOverlay) {
+            PairingScannerDialog(
+                onDismiss = { showScanOverlay = false },
+                onLegacyConnect = { ip, port ->
+                    onManualConnect(ip, port)
+                }
+            )
+        }
+
+        // BLE Discovered Senders List
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1.2f),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            shape = RoundedCornerShape(24.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Nearby Devices",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    )
+                    IconButton(onClick = { showScanOverlay = true }) {
+                        Icon(
+                            imageVector = Icons.Default.QrCodeScanner,
+                            contentDescription = "Open Scanner",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                if (discoveredDevices.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(
+                                color = MaterialTheme.colorScheme.primary,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Searching over BLE...",
+                                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            )
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(discoveredDevices) { device ->
+                            val pairedPeer = remember(device.id) {
+                                com.example.service.HotspotCredentialStore.getPairedPeer(context, device.id)
+                            }
+
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSelectDevice(device) }
+                                    .testTag("device_list_item"),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                                shape = RoundedCornerShape(14.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(
-                                        modifier = Modifier.padding(14.dp),
-                                        verticalAlignment = Alignment.CenterVertically
+                                    Box(
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), CircleShape),
+                                        contentAlignment = Alignment.Center
                                     ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(36.dp)
-                                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), CircleShape),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.PhoneAndroid,
-                                                contentDescription = "Device",
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                        }
-                                        Spacer(modifier = Modifier.width(12.dp))
-                                        Column {
+                                        Icon(
+                                            imageVector = Icons.Default.PhoneAndroid,
+                                            contentDescription = "Device",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text(
+                                            text = device.name,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        if (pairedPeer != null) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                Surface(
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    color = if (pairedPeer.needsRePair) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                                ) {
+                                                    Text(
+                                                        text = if (pairedPeer.needsRePair) "Needs re-pair" else "Paired · ${pairedPeer.shortCode}",
+                                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                                        color = if (pairedPeer.needsRePair) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                    )
+                                                }
+                                            }
+                                        } else {
                                             Text(
-                                                text = device.name,
-                                                color = MinTextPrimary,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Text(
-                                                text = "IP: ${device.ip}",
-                                                color = MinTextMuted,
+                                                text = "Tap to connect",
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 style = MaterialTheme.typography.bodySmall
                                             )
                                         }
-                                        Spacer(modifier = Modifier.weight(1f))
-                                        Icon(
-                                            imageVector = Icons.Default.ChevronRight,
-                                            contentDescription = "Connect",
-                                            tint = MinTextMuted
-                                        )
                                     }
+                                    Spacer(modifier = Modifier.weight(1f))
+                                    Icon(
+                                        imageVector = Icons.Default.ChevronRight,
+                                        contentDescription = "Connect",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Hotspot Quick Connection Assistant Block
-        val localIp = localDevice?.ip ?: ""
-        val calculatedGatewayIp = remember(localIp) {
-            if (localIp.contains(".") && localIp.split(".").size == 4) {
-                val parts = localIp.split(".")
-                "${parts[0]}.${parts[1]}.${parts[2]}.1"
-            } else {
-                null
-            }
-        }
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
-            shape = RoundedCornerShape(20.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.SettingsInputAntenna,
-                        contentDescription = "Hotspot",
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Text(
-                        text = "Hotspot Quick Connection",
-                        style = MaterialTheme.typography.titleSmall.copy(
-                            color = MinTextPrimary,
-                            fontWeight = FontWeight.Bold
-                        )
-                    )
-                }
-
-                Text(
-                    text = "If connected to the sender's mobile hotspot, click below to instantly connect to the host device (usually the .1 gateway on your subnet).",
-                    style = MaterialTheme.typography.bodySmall.copy(color = MinTextMuted)
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    // Button 1: Dynamic Subnet Gateway (Highly likely to be the correct host)
-                    if (calculatedGatewayIp != null) {
-                        Button(
-                            onClick = { onManualConnect(calculatedGatewayIp, 8080) },
-                            modifier = Modifier.weight(1.3f).height(48.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
-                                contentColor = MaterialTheme.colorScheme.primary
-                            ),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
-                        ) {
-                            Text(
-                                text = "Host: $calculatedGatewayIp",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
-                    }
-
-                    // Button 2: Android Standard Hotspot Default (192.168.43.1)
-                    if (calculatedGatewayIp != "192.168.43.1") {
-                        Button(
-                            onClick = { onManualConnect("192.168.43.1", 8080) },
-                            modifier = Modifier.weight(1f).height(48.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                                contentColor = MinTextPrimary
-                            ),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
-                        ) {
-                            Text(
-                                text = "Android: .43.1",
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        }
-                    }
-
-                    // Button 3: Alternative Hotspot Default (192.168.49.1)
-                    if (calculatedGatewayIp != "192.168.49.1") {
-                        Button(
-                            onClick = { onManualConnect("192.168.49.1", 8080) },
-                            modifier = Modifier.weight(1f).height(48.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                                contentColor = MinTextPrimary
-                            ),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
-                        ) {
-                            Text(
-                                text = "Alternative: .49.1",
-                                style = MaterialTheme.typography.labelSmall
-                            )
                         }
                     }
                 }
@@ -1534,7 +1590,7 @@ fun ReceiverScanningScreen(
                     OutlinedTextField(
                         value = manualCode,
                         onValueChange = { manualCode = it },
-                        placeholder = { Text("Enter 4-Digit Code", color = MinTextMuted) },
+                        placeholder = { Text("Enter 4-Digit Code", color = MaterialTheme.colorScheme.onSurfaceVariant) },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("manual_code_input"),
@@ -1542,8 +1598,8 @@ fun ReceiverScanningScreen(
                         colors = OutlinedTextFieldDefaults.colors(
                             unfocusedBorderColor = MaterialTheme.colorScheme.outline,
                             focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            focusedTextColor = MinTextPrimary,
-                            unfocusedTextColor = MinTextPrimary
+                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface
                         ),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                     )
@@ -1584,19 +1640,23 @@ fun ReceiverScanningScreen(
 
         Spacer(modifier = Modifier.height(4.dp))
 
-        Button(
+        OutlinedButton(
             onClick = onCancel,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp)
                 .testTag("cancel_scanning_button"),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+            colors = ButtonDefaults.outlinedButtonColors(
+                contentColor = AccentRed
             ),
+            border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
             shape = RoundedCornerShape(16.dp)
         ) {
-            Text("Cancel")
+            Text(
+                "Cancel", 
+                color = AccentRed, 
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+            )
         }
     }
 }
@@ -1627,7 +1687,7 @@ fun CustomFilterChip(
             text = label,
             style = MaterialTheme.typography.bodyMedium.copy(
                 fontWeight = FontWeight.Bold,
-                color = if (selected) MaterialTheme.colorScheme.primary else MinTextMuted
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
             )
         )
     }
@@ -1655,23 +1715,45 @@ fun InAppFilePickerContent(
     var selectedCategory by remember { mutableStateOf("Images") }
     val categories = listOf("Images", "Videos", "Audio", "Documents", "Apps", "Storage")
     
-    // Loaded files state
-    var filesList by remember { mutableStateOf<List<LocalFileItem>>(emptyList()) }
+    // Category files observed from app-scoped FileRepository
+    val currentCategoryFlow = remember(selectedCategory) { FileRepository.getCategoryFlow(selectedCategory) }
+    val filesList by currentCategoryFlow.collectAsState()
+    val isLoadingMap by FileRepository.isLoadingMap.collectAsState()
+    val isLoading = isLoadingMap[selectedCategory] == true
     var searchQuery by remember { mutableStateOf("") }
-    var isLoading by remember { mutableStateOf(false) }
     
     // Directory navigation state
     var currentDirectory by remember { mutableStateOf(android.os.Environment.getExternalStorageDirectory() ?: java.io.File("/sdcard")) }
     
-    // Multi-select state
-    var selectedFiles by remember { mutableStateOf<Set<LocalFileItem>>(emptySet()) }
+    // Multi-select state tracked strictly by canonical key
+    var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isSelectionMode by remember { mutableStateOf(false) }
+
+    // Deletion states and Scoped Storage consent launcher
+    var showDeleteConfirmDialog by remember { mutableStateOf(false) }
+    var entriesToDelete by remember { mutableStateOf<List<com.example.model.FileEntry>>(emptyList()) }
+    var pendingConsentEntries by remember { mutableStateOf<List<com.example.model.FileEntry>?>(null) }
+
+    val consentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            pendingConsentEntries?.let { entries ->
+                val keys = entries.map { it.key }.toSet()
+                com.example.repository.FileRepository.purgeKeys(keys)
+                selectedKeys = selectedKeys - keys
+                if (selectedKeys.isEmpty()) isSelectionMode = false
+                Toast.makeText(context, "Deleted ${entries.size} file(s)", Toast.LENGTH_SHORT).show()
+            }
+        }
+        pendingConsentEntries = null
+    }
 
     // Proper back handler
     BackHandler(enabled = true) {
         if (isSelectionMode) {
             isSelectionMode = false
-            selectedFiles = emptySet()
+            selectedKeys = emptySet()
         } else if (selectedCategory == "Storage" && currentDirectory != android.os.Environment.getExternalStorageDirectory()) {
             val parent = currentDirectory.parentFile
             if (parent != null) {
@@ -1684,9 +1766,7 @@ fun InAppFilePickerContent(
         }
     }
 
-    // SAF Selected/Imported Documents
-    var safDocuments by remember { mutableStateOf<List<LocalFileItem>>(emptyList()) }
-    
+    // SAF Selected/Imported Documents launcher
     val safDocumentsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
@@ -1704,8 +1784,10 @@ fun InAppFilePickerContent(
                     dateAdded = System.currentTimeMillis() / 1000L
                 )
             }
-            safDocuments = (safDocuments + resolved).distinctBy { it.uri.toString() }
-            selectedFiles = (selectedFiles + resolved).toSet()
+            FileRepository.addSafDocuments(context, resolved)
+            val resolvedKeys = resolved.map { FileRepository.toFileEntry(context, it).key }
+            selectedKeys = selectedKeys + resolvedKeys
+            isSelectionMode = true
         }
     }
     
@@ -1834,70 +1916,24 @@ fun InAppFilePickerContent(
     }
 
     var hasAutoScanned by remember { mutableStateOf(false) }
+    // Preload repository when permission is granted
     LaunchedEffect(isPermissionGranted) {
-        if (isPermissionGranted && !hasAutoScanned) {
-            hasAutoScanned = true
-            val db = com.example.database.AppDatabase.getDatabase(context)
-            val count = withContext(Dispatchers.IO) {
-                db.indexedFileDao().getAllFiles().size
-            }
-            if (count == 0) {
-                triggerScan()
-            }
+        if (isPermissionGranted) {
+            FileRepository.preload(context)
         }
     }
     
-    // Load files when category, directory, permission state, safDocuments, showSystemApps, or refresh changes
-    LaunchedEffect(selectedCategory, currentDirectory, isPermissionGranted, safDocuments, refreshTrigger, showSystemApps) {
-        isLoading = true
-        withContext(Dispatchers.IO) {
-            val db = com.example.database.AppDatabase.getDatabase(context)
-            val dao = db.indexedFileDao()
-            val queried = if (isPermissionGranted) {
-                when (selectedCategory) {
-                    "Apps" -> StorageService.queryInstalledApps(context, showSystemApps = showSystemApps)
-                    "Storage" -> StorageService.listDirectoryFiles(currentDirectory)
-                    "Documents" -> {
-                        val dbDocs = dao.getFilesByCategory("Documents").map { indexedFile ->
-                            LocalFileItem(
-                                id = indexedFile.id,
-                                uri = Uri.parse(indexedFile.uriString),
-                                name = indexedFile.name,
-                                size = indexedFile.size,
-                                mimeType = indexedFile.mimeType,
-                                category = "Documents",
-                                dateAdded = indexedFile.dateAdded
-                            )
-                        }
-                        (safDocuments + dbDocs).distinctBy { it.uri.toString() }
-                    }
-                    "Images", "Videos", "Audio" -> {
-                        dao.getFilesByCategory(selectedCategory).map { indexedFile ->
-                            LocalFileItem(
-                                id = indexedFile.id,
-                                uri = Uri.parse(indexedFile.uriString),
-                                name = indexedFile.name,
-                                size = indexedFile.size,
-                                mimeType = indexedFile.mimeType,
-                                category = selectedCategory,
-                                dateAdded = indexedFile.dateAdded
-                            )
-                        }
-                    }
-                    else -> emptyList()
-                }
-            } else {
-                if (selectedCategory == "Documents") {
-                    safDocuments
-                } else {
-                    emptyList()
-                }
-            }
-            
-            withContext(Dispatchers.Main) {
-                filesList = queried
-                isLoading = false
-            }
+    // Load directory files when browsing Storage
+    LaunchedEffect(selectedCategory, currentDirectory, isPermissionGranted) {
+        if (isPermissionGranted && selectedCategory == "Storage") {
+            FileRepository.loadStorageDirectory(context, currentDirectory)
+        }
+    }
+
+    // Load apps with system app preference
+    LaunchedEffect(selectedCategory, showSystemApps, isPermissionGranted) {
+        if (isPermissionGranted && selectedCategory == "Apps") {
+            FileRepository.loadApps(context, showSystemApps = showSystemApps)
         }
     }
     
@@ -1921,31 +1957,53 @@ fun InAppFilePickerContent(
                 ) {
                     IconButton(onClick = {
                         isSelectionMode = false
-                        selectedFiles = emptySet()
+                        selectedKeys = emptySet()
                     }) {
-                        Icon(imageVector = Icons.Default.Close, contentDescription = "Cancel Selection")
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Cancel Selection", tint = AccentRed)
                     }
                     Text(
-                        text = "${selectedFiles.size} selected",
+                        text = "${selectedKeys.size} selected",
                         style = MaterialTheme.typography.titleLarge.copy(
                             fontWeight = FontWeight.Bold,
-                            color = MinTextPrimary
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     )
                 }
                 
-                if (selectedFiles.isNotEmpty()) {
-                    Button(
-                        onClick = {
-                            handleSendAction(selectedFiles.toList())
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                        modifier = Modifier.height(38.dp)
+                if (selectedKeys.isNotEmpty()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Send", style = MaterialTheme.typography.labelMedium)
+                        IconButton(
+                            onClick = {
+                                val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
+                                entriesToDelete = selectedEntries
+                                showDeleteConfirmDialog = true
+                            },
+                            modifier = Modifier.size(38.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = "Delete Selected",
+                                tint = AccentRed,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+
+                        Button(
+                            onClick = {
+                                val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
+                                handleSendAction(selectedEntries.map { it.transferSource })
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                            modifier = Modifier.height(38.dp)
+                        ) {
+                            Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Send", style = MaterialTheme.typography.labelMedium)
+                        }
                     }
                 }
             }
@@ -1966,7 +2024,7 @@ fun InAppFilePickerContent(
                         text = "In-App Explorer",
                         style = MaterialTheme.typography.titleLarge.copy(
                             fontWeight = FontWeight.Bold, 
-                            color = MinTextPrimary
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     )
                     IconButton(
@@ -1982,15 +2040,6 @@ fun InAppFilePickerContent(
                         )
                     }
                 }
-                
-                TextButton(
-                    onClick = onLaunchSystemPicker,
-                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.primary)
-                ) {
-                    Icon(imageVector = Icons.Default.FolderOpen, contentDescription = "System")
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("System Picker")
-                }
             }
         }
         
@@ -2001,7 +2050,7 @@ fun InAppFilePickerContent(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 4.dp),
-            placeholder = { Text("Search files by name...", style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)) },
+            placeholder = { Text("Search files by name...", style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)) },
             leadingIcon = {
                 Icon(
                     imageVector = Icons.Default.Search,
@@ -2016,7 +2065,7 @@ fun InAppFilePickerContent(
                         Icon(
                             imageVector = Icons.Default.Clear,
                             contentDescription = "Clear Search",
-                            tint = MinTextMuted
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -2029,8 +2078,8 @@ fun InAppFilePickerContent(
                 focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
                 unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
                 cursorColor = MaterialTheme.colorScheme.primary,
-                focusedTextColor = MinTextPrimary,
-                unfocusedTextColor = MinTextPrimary
+                focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                unfocusedTextColor = MaterialTheme.colorScheme.onSurface
             )
         )
         
@@ -2079,7 +2128,7 @@ fun InAppFilePickerContent(
                     }
                     Text(
                         text = currentDirectory.name.ifEmpty { "Storage" },
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, color = MinTextPrimary),
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface),
                         modifier = Modifier.weight(1f),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -2240,7 +2289,7 @@ fun InAppFilePickerContent(
                             Icon(
                                 imageVector = Icons.Default.FolderOpen,
                                 contentDescription = "No Files",
-                                tint = MinTextMuted.copy(alpha = 0.4f),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
                                 modifier = Modifier.size(64.dp)
                             )
                             Spacer(modifier = Modifier.height(8.dp))
@@ -2252,7 +2301,7 @@ fun InAppFilePickerContent(
                                 } else {
                                     "No local files found on device"
                                 }, 
-                                style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)
+                                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                             )
                         }
                     } else {
@@ -2279,7 +2328,7 @@ fun InAppFilePickerContent(
                                             text = "App Sharing Preferences",
                                             style = MaterialTheme.typography.bodyMedium.copy(
                                                 fontWeight = FontWeight.Bold,
-                                                color = MinTextPrimary
+                                                color = MaterialTheme.colorScheme.onSurface
                                             )
                                         )
                                         
@@ -2298,12 +2347,12 @@ fun InAppFilePickerContent(
                                                     text = "Show System Apps",
                                                     style = MaterialTheme.typography.bodySmall.copy(
                                                         fontWeight = FontWeight.Bold,
-                                                        color = MinTextPrimary
+                                                        color = MaterialTheme.colorScheme.onSurface
                                                     )
                                                 )
                                                 Text(
                                                     text = "Include system packages in the applications list",
-                                                    style = MaterialTheme.typography.labelSmall.copy(color = MinTextMuted)
+                                                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 )
                                             }
                                             Switch(
@@ -2334,12 +2383,12 @@ fun InAppFilePickerContent(
                                                     text = "Keep Extracted APKs",
                                                     style = MaterialTheme.typography.bodySmall.copy(
                                                         fontWeight = FontWeight.Bold,
-                                                        color = MinTextPrimary
+                                                        color = MaterialTheme.colorScheme.onSurface
                                                     )
                                                 )
                                                 Text(
                                                     text = "Save extracted APKs in internal storage after transfer complete",
-                                                    style = MaterialTheme.typography.labelSmall.copy(color = MinTextMuted)
+                                                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 )
                                             }
                                             Switch(
@@ -2391,12 +2440,12 @@ fun InAppFilePickerContent(
                                                 text = "Storage Space Info",
                                                 style = MaterialTheme.typography.bodyMedium.copy(
                                                     fontWeight = FontWeight.Bold,
-                                                    color = MinTextPrimary
+                                                    color = MaterialTheme.colorScheme.onSurface
                                                 )
                                             )
                                             Text(
                                                 text = "$usedStr / $totalStr used",
-                                                style = MaterialTheme.typography.bodySmall.copy(color = MinTextMuted)
+                                                style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                                             )
                                         }
                                         LinearProgressIndicator(
@@ -2465,15 +2514,15 @@ fun InAppFilePickerContent(
                             }
                         }
  
-                        items(displayFiles, key = { it.id }) { file ->
-                            val isChecked = selectedFiles.contains(file)
-                            val isDirectory = file.category == "Directory"
+                        items(displayFiles, key = { it.key }) { file ->
+                            val isChecked = selectedKeys.contains(file.key)
+                            val isDirectory = file.isDirectory
                             val isApp = file.category == "Apps"
                             
-                            val dateString = remember(file.dateAdded) {
-                                if (file.dateAdded > 0) {
+                            val dateString = remember(file.dateModified) {
+                                if (file.dateModified > 0) {
                                     val sdf = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault())
-                                    sdf.format(Date(file.dateAdded * 1000L))
+                                    sdf.format(Date(file.dateModified * 1000L))
                                 } else {
                                     ""
                                 }
@@ -2486,15 +2535,15 @@ fun InAppFilePickerContent(
                                         onClick = {
                                             if (isSelectionMode) {
                                                 if (!isDirectory) {
-                                                    val newSelected = if (isChecked) selectedFiles - file else selectedFiles + file
-                                                    selectedFiles = newSelected
+                                                    val newSelected = if (isChecked) selectedKeys - file.key else selectedKeys + file.key
+                                                    selectedKeys = newSelected
                                                     if (newSelected.isEmpty()) {
                                                         isSelectionMode = false
                                                     }
                                                 }
                                             } else {
                                                 if (selectedCategory == "Storage" && isDirectory) {
-                                                    currentDirectory = java.io.File(file.uri.path ?: "")
+                                                    currentDirectory = java.io.File(file.displayUri.path ?: "")
                                                 } else {
                                                     openLocalFile(context, file)
                                                 }
@@ -2503,7 +2552,7 @@ fun InAppFilePickerContent(
                                         onLongClick = {
                                             if (!isSelectionMode && !isDirectory) {
                                                 isSelectionMode = true
-                                                selectedFiles = setOf(file)
+                                                selectedKeys = setOf(file.key)
                                             }
                                         }
                                     ),
@@ -2584,7 +2633,7 @@ fun InAppFilePickerContent(
                                                 text = displayName,
                                                 style = MaterialTheme.typography.bodyMedium.copy(
                                                     fontWeight = FontWeight.Bold,
-                                                    color = MinTextPrimary
+                                                    color = MaterialTheme.colorScheme.onSurface
                                                 ),
                                                 maxLines = 1,
                                                 overflow = TextOverflow.Ellipsis
@@ -2597,14 +2646,14 @@ fun InAppFilePickerContent(
                                                     if (pkgStr.isNotEmpty()) {
                                                         Text(
                                                             text = pkgStr,
-                                                            style = MaterialTheme.typography.labelSmall.copy(color = MinTextMuted),
+                                                            style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
                                                             maxLines = 1,
                                                             overflow = TextOverflow.Ellipsis
                                                         )
                                                     }
                                                     Text(
                                                         text = "Version: $versionStr • Size: $sizeStr",
-                                                        style = MaterialTheme.typography.bodySmall.copy(color = MinTextSubtle)
+                                                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                      )
                                                 }
                                             } else if (!isDirectory) {
@@ -2612,12 +2661,12 @@ fun InAppFilePickerContent(
                                                 val subText = if (dateString.isNotEmpty()) "$sizeStr • $dateString" else sizeStr
                                                 Text(
                                                     text = subText,
-                                                    style = MaterialTheme.typography.bodySmall.copy(color = MinTextMuted)
+                                                    style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 )
                                             } else {
                                                 Text(
                                                     text = "Folder",
-                                                    style = MaterialTheme.typography.bodySmall.copy(color = MinTextSubtle)
+                                                    style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 )
                                             }
                                         }
@@ -2629,37 +2678,59 @@ fun InAppFilePickerContent(
                                                 checked = isChecked,
                                                 onCheckedChange = { checked ->
                                                     val newSelected = if (checked == true) {
-                                                        selectedFiles + file
+                                                        selectedKeys + file.key
                                                     } else {
-                                                        selectedFiles - file
+                                                        selectedKeys - file.key
                                                     }
-                                                    selectedFiles = newSelected
+                                                    selectedKeys = newSelected
                                                     if (newSelected.isEmpty()) {
                                                         isSelectionMode = false
                                                     }
                                                 }
                                             )
                                         } else {
-                                            FilledTonalButton(
-                                                onClick = {
-                                                    if (isApp) {
-                                                        handleSendAction(listOf(file))
-                                                    } else {
-                                                        openLocalFile(context, file)
-                                                    }
-                                                },
-                                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                                                modifier = Modifier.height(32.dp),
-                                                colors = ButtonDefaults.filledTonalButtonColors(
-                                                    containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
-                                                    contentColor = MaterialTheme.colorScheme.primary
-                                                )
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                                             ) {
-                                                val btnIcon = if (isApp) Icons.AutoMirrored.Filled.Send else Icons.Default.Launch
-                                                val btnLabel = if (isApp) "Send" else "Open"
-                                                Icon(imageVector = btnIcon, contentDescription = btnLabel, modifier = Modifier.size(12.dp))
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                                Text(btnLabel, style = MaterialTheme.typography.labelMedium)
+                                                if (!isApp && selectedCategory != "Apps") {
+                                                    IconButton(
+                                                        onClick = {
+                                                            entriesToDelete = listOf(file)
+                                                            showDeleteConfirmDialog = true
+                                                        },
+                                                        modifier = Modifier.size(32.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.Default.Delete,
+                                                            contentDescription = "Delete File",
+                                                            tint = AccentRed.copy(alpha = 0.75f),
+                                                            modifier = Modifier.size(18.dp)
+                                                        )
+                                                    }
+                                                }
+
+                                                FilledTonalButton(
+                                                    onClick = {
+                                                        if (isApp) {
+                                                            handleSendAction(listOf(file.transferSource))
+                                                        } else {
+                                                            openLocalFile(context, file)
+                                                        }
+                                                    },
+                                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                                    modifier = Modifier.height(32.dp),
+                                                    colors = ButtonDefaults.filledTonalButtonColors(
+                                                        containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
+                                                        contentColor = MaterialTheme.colorScheme.primary
+                                                    )
+                                                ) {
+                                                    val btnIcon = if (isApp) Icons.AutoMirrored.Filled.Send else Icons.Default.Launch
+                                                    val btnLabel = if (isApp) "Send" else "Open"
+                                                    Icon(imageVector = btnIcon, contentDescription = btnLabel, modifier = Modifier.size(12.dp))
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text(btnLabel, style = MaterialTheme.typography.labelMedium)
+                                                }
                                             }
                                         }
                                     }
@@ -2673,21 +2744,47 @@ fun InAppFilePickerContent(
     }
         
         // Actions Footer
-        if (selectedFiles.isNotEmpty()) {
-            Button(
-                onClick = {
-                    handleSendAction(selectedFiles.toList())
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                shape = RoundedCornerShape(16.dp)
+        if (selectedKeys.isNotEmpty()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    text = "Send ${selectedFiles.size} Selected Files",
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                OutlinedButton(
+                    onClick = {
+                        val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
+                        entriesToDelete = selectedEntries
+                        showDeleteConfirmDialog = true
+                    },
+                    modifier = Modifier
+                        .weight(0.35f)
+                        .height(56.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentRed),
+                    border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = AccentRed, modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Delete", color = AccentRed, style = MaterialTheme.typography.labelLarge)
+                }
+
+                Button(
+                    onClick = {
+                        val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
+                        handleSendAction(selectedEntries.map { it.transferSource })
+                    },
+                    modifier = Modifier
+                        .weight(0.65f)
+                        .height(56.dp),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Send (${selectedKeys.size})",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                }
             }
         }
     }
@@ -2706,7 +2803,7 @@ fun InAppFilePickerContent(
                     text = "Preparing Files",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
-                        color = MinTextPrimary
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                 )
             },
@@ -2717,7 +2814,7 @@ fun InAppFilePickerContent(
                 ) {
                     Text(
                         text = "Preparing \"$currentExtractingAppName\" (${currentExtractingAppIndex}/${totalExtractingAppsCount})",
-                        style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)
+                        style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                     )
                     
                     LinearProgressIndicator(
@@ -2744,6 +2841,92 @@ fun InAppFilePickerContent(
                     }
                 }
             }
+        )
+    }
+
+    if (showDeleteConfirmDialog && entriesToDelete.isNotEmpty()) {
+        val count = entriesToDelete.size
+        val title = if (count == 1) "Delete File?" else "Delete $count Files?"
+        val message = if (count == 1) {
+            "Are you sure you want to permanently delete \"${entriesToDelete.first().name}\"? This action cannot be undone."
+        } else {
+            "Are you sure you want to permanently delete these $count selected files? This action cannot be undone."
+        }
+
+        AlertDialog(
+            onDismissRequest = {
+                showDeleteConfirmDialog = false
+                entriesToDelete = emptyList()
+            },
+            title = {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                )
+            },
+            text = {
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirmDialog = false
+                        val targets = entriesToDelete
+                        entriesToDelete = emptyList()
+                        when (val result = com.example.repository.FileRepository.deleteFilesWithConsent(context, targets)) {
+                            is com.example.repository.FileRepository.DeleteResult.Success -> {
+                                val deleted = result.deletedCount
+                                if (deleted > 0) {
+                                    val deletedKeySet = targets.map { it.key }.toSet()
+                                    selectedKeys = selectedKeys - deletedKeySet
+                                    if (selectedKeys.isEmpty()) isSelectionMode = false
+                                    Toast.makeText(context, "Deleted $deleted file(s)", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Could not delete file(s)", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            is com.example.repository.FileRepository.DeleteResult.RequiresConsent -> {
+                                pendingConsentEntries = result.pendingEntries
+                                try {
+                                    consentLauncher.launch(
+                                        IntentSenderRequest.Builder(result.intentSender).build()
+                                    )
+                                } catch (e: Exception) {
+                                    android.util.Log.e("FilePicker", "Failed to launch delete consent", e)
+                                    Toast.makeText(context, "Permission required to delete", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            is com.example.repository.FileRepository.DeleteResult.Error -> {
+                                Toast.makeText(context, result.message, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = AccentRed)
+                ) {
+                    Text("Delete", color = AccentRed, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirmDialog = false
+                        entriesToDelete = emptyList()
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = AccentRed)
+                ) {
+                    Text("Cancel", color = AccentRed)
+                }
+            },
+            containerColor = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(20.dp)
         )
     }
 }
@@ -2802,18 +2985,30 @@ fun ConnectedScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
-                Text(
-                    text = "Connected Session",
-                    style = MaterialTheme.typography.bodySmall.copy(color = MinTextMuted)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                AnimatedCircularCheckmark(
+                    size = 32.dp,
+                    ringColor = Color(0xFF34C759),
+                    checkColor = Color.White,
+                    ringWidth = 2.dp,
+                    checkWidth = 2.5.dp
                 )
-                Text(
-                    text = remoteDevice?.name ?: "Remote Peer",
-                    style = MaterialTheme.typography.titleLarge.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
+                Column {
+                    Text(
+                        text = "Connected Session",
+                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                     )
-                )
+                    Text(
+                        text = remoteDevice?.name ?: "Remote Peer",
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    )
+                }
             }
 
             Button(
@@ -2864,7 +3059,7 @@ fun ConnectedScreen(
                                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                color = MinTextPrimary
+                                color = MaterialTheme.colorScheme.onSurface
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
@@ -2903,7 +3098,7 @@ fun ConnectedScreen(
             ) {
                 Text(
                     text = "Flipping Payload",
-                    style = MaterialTheme.typography.titleSmall.copy(color = MinTextMuted, fontWeight = FontWeight.Bold)
+                    style = MaterialTheme.typography.titleSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
                 )
 
                 Row(
@@ -2918,17 +3113,17 @@ fun ConnectedScreen(
                             .testTag("send_file_picker_btn"),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = Color.White
+                            contentColor = MaterialTheme.colorScheme.onPrimary
                         ),
                         shape = RoundedCornerShape(14.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.AttachFile, contentDescription = "Pick File", tint = Color.White)
+                        Icon(imageVector = Icons.Default.AttachFile, contentDescription = "Pick File", tint = MaterialTheme.colorScheme.onPrimary)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Send File", fontWeight = FontWeight.Bold)
+                        Text("Send File", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary)
                     }
                 }
 
-                Divider(color = MaterialTheme.colorScheme.outline, thickness = 1.dp)
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline, thickness = 1.dp)
 
                 // Text flip row
                 Row(
@@ -2939,7 +3134,7 @@ fun ConnectedScreen(
                     OutlinedTextField(
                         value = shareText,
                         onValueChange = { shareText = it },
-                        placeholder = { Text("Type text/link to Flip...", color = MinTextMuted) },
+                        placeholder = { Text("Type text/link to Flip...", color = MaterialTheme.colorScheme.onSurfaceVariant) },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("text_input_field"),
@@ -2947,8 +3142,8 @@ fun ConnectedScreen(
                         colors = OutlinedTextFieldDefaults.colors(
                             unfocusedBorderColor = MaterialTheme.colorScheme.outline,
                             focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            focusedTextColor = MinTextPrimary,
-                            unfocusedTextColor = MinTextPrimary
+                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface
                         )
                     )
 
@@ -2964,11 +3159,11 @@ fun ConnectedScreen(
                             .testTag("send_text_submit"),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.secondary,
-                            contentColor = Color.White
+                            contentColor = MaterialTheme.colorScheme.onSecondary
                         ),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send Text", tint = Color.White)
+                        Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send Text", tint = MaterialTheme.colorScheme.onSecondary)
                     }
                 }
             }
@@ -2992,7 +3187,7 @@ fun ConnectedScreen(
                     text = "Transfer Logs & Queues",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
-                        color = MinTextPrimary
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                 )
 
@@ -3009,13 +3204,13 @@ fun ConnectedScreen(
                             Icon(
                                 imageVector = Icons.Default.FolderOpen,
                                 contentDescription = "Empty Queue",
-                                tint = MinTextMuted.copy(alpha = 0.5f),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                 modifier = Modifier.size(48.dp)
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
                                 text = "No active transfers",
-                                style = MaterialTheme.typography.bodyMedium.copy(color = MinTextMuted)
+                                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                             )
                         }
                     }
@@ -3057,7 +3252,7 @@ fun TransferItemRow(
         TransferStatus.COMPLETE -> AccentGreen
         TransferStatus.PAUSED -> AccentOrange
         TransferStatus.FAILED -> AccentRed
-        TransferStatus.CANCELLED -> MinTextMuted
+        TransferStatus.CANCELLED -> MaterialTheme.colorScheme.onSurfaceVariant
         else -> MaterialTheme.colorScheme.primary
     }
 
@@ -3107,7 +3302,7 @@ fun TransferItemRow(
             ) {
                 Text(
                     text = item.fileName,
-                    color = MinTextPrimary,
+                    color = MaterialTheme.colorScheme.onSurface,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -3119,17 +3314,17 @@ fun TransferItemRow(
                 ) {
                     Text(
                         text = if (item.isIncoming) "Incoming" else "Outgoing",
-                        color = MinTextMuted,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
                         text = "•",
-                        color = MinTextMuted,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
                         text = formatSize(item.fileSize),
-                        color = MinTextMuted,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -3204,7 +3399,7 @@ fun TransferItemRow(
                     }
 
                     TransferStatus.CANCELLED -> {
-                        Text("Cancelled", color = MinTextMuted, style = MaterialTheme.typography.bodySmall)
+                        Text("Cancelled", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -3293,7 +3488,52 @@ fun openFile(context: Context, fileName: String) {
     }
 }
 
-// Open local/selected file utility supporting dynamic URI and mime-type resolving
+private val maxMemoryKb = (Runtime.getRuntime().maxMemory() / 1024).toInt()
+private val cacheSizeKb = (maxMemoryKb / 8).coerceAtLeast(1024 * 16)
+
+// In-memory cache for thumbnails (~1/8 of available memory) so scrolling doesn't reload them
+private val thumbnailCache = object : LruCache<String, android.graphics.Bitmap>(cacheSizeKb) {
+    override fun sizeOf(key: String, bitmap: android.graphics.Bitmap): Int {
+        return (bitmap.byteCount / 1024).coerceAtLeast(1)
+    }
+}
+
+// Open local/selected file utility for FileEntry using displayUri
+fun openLocalFile(context: Context, file: FileEntry) {
+    try {
+        var uri = file.displayUri
+        val mimeType = file.mimeType.ifEmpty {
+            context.contentResolver.getType(uri) ?: when (file.name.substringAfterLast('.', "").lowercase()) {
+                "apk" -> "application/vnd.android.package-archive"
+                "pdf" -> "application/pdf"
+                "zip" -> "application/zip"
+                "png", "jpg", "jpeg", "webp", "gif" -> "image/*"
+                "mp4", "mkv", "mov", "avi" -> "video/*"
+                "mp3", "wav", "m4a", "ogg" -> "audio/*"
+                else -> "*/*"
+            }
+        }
+        
+        if (uri.scheme == "file") {
+            val ioFile = java.io.File(uri.path ?: "")
+            if (ioFile.exists()) {
+                val authority = "com.example.fileprovider"
+                uri = androidx.core.content.FileProvider.getUriForFile(context, authority, ioFile)
+            }
+        }
+
+        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType)
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        Toast.makeText(context, "Cannot open file: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
+
+// Overload for LocalFileItem backward compatibility
 fun openLocalFile(context: Context, fileItem: LocalFileItem) {
     try {
         var uri = fileItem.uri
@@ -3329,9 +3569,12 @@ fun openLocalFile(context: Context, fileItem: LocalFileItem) {
 }
 
 @Composable
-fun FileThumbnail(file: LocalFileItem, modifier: Modifier = Modifier) {
+fun FileThumbnail(file: FileEntry, modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    var bitmap by remember(file.uri) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    val isMedia = file.category == "Images" || file.category == "Videos"
+    val cacheKey = file.displayUri.toString()
+    var bitmap by remember(file.displayUri) { mutableStateOf(thumbnailCache.get(cacheKey)) }
+
     val icon = remember(file.category) {
         when (file.category) {
             "Images" -> Icons.Default.Image
@@ -3343,45 +3586,58 @@ fun FileThumbnail(file: LocalFileItem, modifier: Modifier = Modifier) {
         }
     }
 
-    LaunchedEffect(file.uri) {
-        if (file.category == "Images" || file.category == "Videos") {
-            withContext(Dispatchers.IO) {
-                try {
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                        val size = android.util.Size(120, 120)
-                        bitmap = context.contentResolver.loadThumbnail(file.uri, size, null)
-                    } else {
-                        val id = android.content.ContentUris.parseId(file.uri)
-                        if (file.category == "Images") {
-                            bitmap = MediaStore.Images.Thumbnails.getThumbnail(
-                                context.contentResolver, id, MediaStore.Images.Thumbnails.MINI_KIND, null
-                            )
+    if (isMedia) {
+        LaunchedEffect(file.displayUri) {
+            if (bitmap == null) {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val loaded = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                            val size = android.util.Size(120, 120)
+                            context.contentResolver.loadThumbnail(file.displayUri, size, null)
                         } else {
-                            bitmap = MediaStore.Video.Thumbnails.getThumbnail(
-                                context.contentResolver, id, MediaStore.Video.Thumbnails.MINI_KIND, null
-                            )
+                            val id = android.content.ContentUris.parseId(file.displayUri)
+                            if (file.category == "Images") {
+                                MediaStore.Images.Thumbnails.getThumbnail(
+                                    context.contentResolver, id, MediaStore.Images.Thumbnails.MINI_KIND, null
+                                )
+                            } else {
+                                MediaStore.Video.Thumbnails.getThumbnail(
+                                    context.contentResolver, id, MediaStore.Video.Thumbnails.MINI_KIND, null
+                                )
+                            }
                         }
+                        if (loaded != null) {
+                            thumbnailCache.put(cacheKey, loaded)
+                            withContext(Dispatchers.Main) {
+                                bitmap = loaded
+                            }
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.v("FileThumbnail", "Failed to load thumbnail for ${file.displayUri}: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    android.util.Log.e("FileThumbnail", "Failed to load thumbnail for ${file.uri}", e)
                 }
             }
         }
     }
 
-    if (bitmap != null) {
-        Image(
-            bitmap = bitmap!!.asImageBitmap(),
-            contentDescription = file.name,
-            modifier = modifier,
-            contentScale = ContentScale.Crop
-        )
-    } else {
-        Icon(
-            imageVector = icon,
-            contentDescription = file.category,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = modifier.padding(8.dp)
-        )
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = file.name,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = file.category,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(24.dp)
+            )
+        }
     }
 }

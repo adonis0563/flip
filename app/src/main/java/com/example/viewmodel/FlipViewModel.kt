@@ -29,6 +29,19 @@ enum class ConnectionState {
     DISCONNECTED
 }
 
+data class IncomingFileRequest(
+    val transferId: String,
+    val fileName: String,
+    val fileSize: Long,
+    val senderName: String
+)
+
+data class PendingShareRequest(
+    val items: List<LocalFileItem>,
+    val text: String? = null,
+    val targetDevice: Device? = null
+)
+
 class FlipViewModel(application: Application) : AndroidViewModel(application), 
     HttpServerService.ServerListener, BleDiscoveryService.DiscoveryListener {
 
@@ -65,6 +78,36 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val _isServerRunning = MutableStateFlow(false)
     val isServerRunning: StateFlow<Boolean> = _isServerRunning.asStateFlow()
 
+    private val _pendingIncomingRequest = MutableStateFlow<IncomingFileRequest?>(null)
+    val pendingIncomingRequest: StateFlow<IncomingFileRequest?> = _pendingIncomingRequest.asStateFlow()
+
+    private val _pendingShareRequest = MutableStateFlow<PendingShareRequest?>(null)
+    val pendingShareRequest: StateFlow<PendingShareRequest?> = _pendingShareRequest.asStateFlow()
+
+    private val _openExplorerEvent = MutableStateFlow(false)
+    val openExplorerEvent: StateFlow<Boolean> = _openExplorerEvent.asStateFlow()
+
+    val autoJoinManager: AutoJoinManager = ConnectionSessionManager.getAutoJoinManager(context)
+    val autoJoinState: StateFlow<AutoJoinState> = autoJoinManager.state
+
+    fun triggerOpenExplorer() {
+        _openExplorerEvent.value = true
+    }
+
+    fun consumeOpenExplorer() {
+        _openExplorerEvent.value = false
+    }
+
+    fun acceptIncomingRequest(transferId: String) {
+        _pendingIncomingRequest.value = null
+        FlipTransferForegroundService.acceptTransfer(context, transferId)
+    }
+
+    fun declineIncomingRequest(transferId: String) {
+        _pendingIncomingRequest.value = null
+        FlipTransferForegroundService.declineTransfer(context, transferId)
+    }
+
     // State lock for queue running
     private var queueJob: Job? = null
     @Volatile
@@ -74,6 +117,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val cancelledTransferIds = mutableSetOf<String>()
 
     private val preSelectedFiles = java.util.Collections.synchronizedList(mutableListOf<LocalFileItem>())
+    private var pendingSharedText: String? = null
 
     fun preSelectFiles(files: List<LocalFileItem>) {
         preSelectedFiles.clear()
@@ -87,10 +131,16 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             preSelectedFiles.clear()
             list
         }
-        if (filesToQueue.isNotEmpty()) {
+        val textToSend = pendingSharedText
+        pendingSharedText = null
+
+        if (filesToQueue.isNotEmpty() || !textToSend.isNullOrBlank()) {
             viewModelScope.launch(Dispatchers.Main) {
                 filesToQueue.forEach { file ->
                     addFileToTransferQueue(file.uri, file.name, file.size)
+                }
+                if (!textToSend.isNullOrBlank()) {
+                    sendText(textToSend)
                 }
             }
         }
@@ -108,11 +158,66 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             StorageService.cleanupTempTransferFiles(context)
         }
 
-        // Initialize local device profile
-        val devId = UUID.randomUUID().toString().take(8)
-        val devName = Build.MODEL ?: "Android Device"
+        // Initialize local device profile with stable per-install ID and session ID
+        val identity = DeviceIdentity.get(context)
+        val devId = identity.id8
+        val devName = identity.displayName
         val localIp = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
-        _localDevice.value = Device(id = devId, name = devName, ip = localIp, port = 8080)
+        _localDevice.value = Device(
+            id = devId,
+            name = devName,
+            ip = localIp,
+            port = 8080,
+            sid = DeviceIdentity.currentSessionId
+        )
+
+        // Connect Foreground Service bridge
+        FlipTransferForegroundService.bridge = object : FlipTransferForegroundService.ServiceBridge {
+            override fun onCancelTransfer(transferId: String) {
+                cancelTransfer(transferId)
+            }
+
+            override fun onDisconnectSession() {
+                disconnect()
+            }
+        }
+
+        // Restore active session from ConnectionSessionManager (Single source of truth)
+        val initialSession = ConnectionSessionManager.session.value
+        if (initialSession.isConnected && initialSession.remoteDevice != null) {
+            _connectionState.value = ConnectionState.CONNECTED
+            _remoteDevice.value = initialSession.remoteDevice
+            _role.value = initialSession.role
+        }
+
+        viewModelScope.launch {
+            ConnectionSessionManager.session.collect { session ->
+                if (session.isConnected && session.remoteDevice != null) {
+                    if (_connectionState.value != ConnectionState.CONNECTED) {
+                        _connectionState.value = ConnectionState.CONNECTED
+                        _remoteDevice.value = session.remoteDevice
+                        _role.value = session.role
+                    }
+                } else if (!session.isConnected && _connectionState.value == ConnectionState.CONNECTED) {
+                    _connectionState.value = ConnectionState.IDLE
+                    _remoteDevice.value = null
+                    _role.value = null
+                }
+            }
+        }
+    }
+
+    fun updateDeviceName(newName: String) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty()) return
+        val current = _localDevice.value ?: return
+        val updated = current.copy(name = trimmed)
+        _localDevice.value = updated
+        DeviceIdentity.setDisplayName(context, trimmed)
+        context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("device_name", trimmed)
+            .apply()
     }
 
     fun clearToast() {
@@ -186,7 +291,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 val updatedLocal = _localDevice.value?.copy(ip = ip, port = port)
                 _localDevice.value = updatedLocal
 
-                // 2. Scan over BLE
+                // 2. Scan over BLE and notify auto-join manager
+                autoJoinManager.onBleScanStarted()
                 bleService.startScanning()
             } catch (e: Exception) {
                 Log.e("FlipViewModel", "Failed to start receiver server: ${e.message}")
@@ -199,22 +305,47 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     /**
-     * Tapping a discovered sender device to connect
+     * Tapping a discovered sender device to connect (Foreground Tap)
      */
     fun connectToDiscoveredDevice(target: Device) {
         _connectionState.value = ConnectionState.CONNECTING
         val currentLocal = _localDevice.value ?: return
 
+        val pairedPeer = com.example.service.HotspotCredentialStore.getPairedPeer(context, target.id)
+        if (pairedPeer != null) {
+            if (pairedPeer.needsRePair) {
+                _connectionState.value = ConnectionState.SEARCHING
+                showToast("Re-pairing needed for ${pairedPeer.displayName}. Scan their First time QR.")
+                return
+            }
+
+            Log.i("FlipViewModel", "[HOTSPOT] Foreground tap on paired peer: ${pairedPeer.displayName} (${pairedPeer.shortCode})")
+            autoJoinManager.startAutoJoin(
+                pairedPeer = pairedPeer,
+                port = target.port,
+                onSuccess = { remote ->
+                    bleService.stopScanning()
+                    _remoteDevice.value = remote
+                    _connectionState.value = ConnectionState.CONNECTED
+                    FlipTransferForegroundService.start(context, remote)
+                    showToast("Connected to ${remote.name}")
+                    checkAndQueuePreSelected()
+                }
+            )
+            return
+        }
+
+        // Direct connect over local network if already on same Wi-Fi
         viewModelScope.launch(Dispatchers.IO) {
             transferService.connectToDevice(
                 remoteIp = target.ip,
                 remotePort = target.port,
                 localDevice = currentLocal,
                 onSuccess = { remote ->
-                    // Stop BLE scan since we are now connected
                     bleService.stopScanning()
                     _remoteDevice.value = remote
                     _connectionState.value = ConnectionState.CONNECTED
+                    FlipTransferForegroundService.start(context, remote)
                     showToast("Connected to ${remote.name}")
                     checkAndQueuePreSelected()
                 },
@@ -244,6 +375,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     bleService.stopAdvertising()
                     _remoteDevice.value = remote
                     _connectionState.value = ConnectionState.CONNECTED
+                    FlipTransferForegroundService.start(context, remote)
                     showToast("Connected to ${remote.name}")
                     checkAndQueuePreSelected()
                 },
@@ -270,6 +402,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     private fun performDisconnectCleanup() {
+        FlipTransferForegroundService.stop(context)
+        ConnectionSessionManager.updateDisconnected()
+        _pendingIncomingRequest.value = null
+        _pendingShareRequest.value = null
         // Cancel all pending or active transfers
         viewModelScope.launch(Dispatchers.Default) {
             synchronized(cancelledTransferIds) {
@@ -408,9 +544,28 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 }
             },
             onProgress = { bytesTransferred ->
+                if (!AppForegroundTracker.isAppInForeground) {
+                    TransferNotificationManager.showTransferProgressNotification(
+                        context = context,
+                        transferId = item.id,
+                        fileName = item.fileName,
+                        bytesTransferred = bytesTransferred,
+                        totalBytes = item.fileSize,
+                        isIncoming = false
+                    )
+                }
                 updateItemProgress(item.id, bytesTransferred)
             },
             onSuccess = {
+                if (!AppForegroundTracker.isAppInForeground) {
+                    TransferNotificationManager.showTransferCompletedNotification(
+                        context = context,
+                        transferId = item.id,
+                        fileName = item.fileName,
+                        filePath = null,
+                        isIncoming = false
+                    )
+                }
                 updateItemStatus(item.id, TransferStatus.COMPLETE)
                 
                 // Clean up if it is a temporary APK
@@ -453,6 +608,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 if (currentStatus == TransferStatus.PAUSED) {
                     // Let paused state stay
                 } else {
+                    if (!AppForegroundTracker.isAppInForeground) {
+                        TransferNotificationManager.showTransferFailedNotification(
+                            context = context,
+                            transferId = item.id,
+                            fileName = item.fileName,
+                            errorMessage = errMsg
+                        )
+                    }
                     updateItemStatus(item.id, TransferStatus.FAILED, errMsg)
                 }
                 completer.complete(Unit)
@@ -541,6 +704,12 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         if (currentList.none { it.id == device.id }) {
             _discoveredDevices.value = currentList + device
         }
+        autoJoinManager.onBlePeerDiscovered(
+            bleDevice = device,
+            onReadyToConnect = { remoteDevice ->
+                connectToDiscoveredDevice(remoteDevice)
+            }
+        )
     }
 
     override fun onDiscoveryError(message: String) {
@@ -556,6 +725,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             bleService.stopAdvertising()
             _remoteDevice.value = device
             _connectionState.value = ConnectionState.CONNECTED
+            FlipTransferForegroundService.start(context, device)
+            HotspotCredentialStore.saveKnownReceiver(context, device.id, device.name)
             showToast("Connected to ${device.name}")
             checkAndQueuePreSelected()
         }
@@ -581,6 +752,38 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         }
     }
 
+    override fun onIncomingTransferRequest(transferId: String, fileName: String, fileSize: Long): Boolean {
+        val sender = _remoteDevice.value
+        val senderName = sender?.name ?: "Remote Peer"
+
+        if (AppForegroundTracker.isAppInForeground) {
+            _pendingIncomingRequest.value = IncomingFileRequest(
+                transferId = transferId,
+                fileName = fileName,
+                fileSize = fileSize,
+                senderName = senderName
+            )
+        } else {
+            TransferNotificationManager.showIncomingRequestNotification(
+                context = context,
+                transferId = transferId,
+                senderDevice = sender,
+                fileName = fileName,
+                fileSize = fileSize
+            )
+        }
+
+        val approved = runBlocking {
+            FlipTransferForegroundService.awaitTransferApproval(transferId)
+        }
+
+        if (_pendingIncomingRequest.value?.transferId == transferId) {
+            _pendingIncomingRequest.value = null
+        }
+
+        return approved
+    }
+
     override fun onFileTransferStarted(transferId: String, fileName: String, fileSize: Long, isIncoming: Boolean) {
         viewModelScope.launch(Dispatchers.Main) {
             // Check if item already exists
@@ -599,26 +802,53 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onFileTransferProgress(transferId: String, bytesTransferred: Long) {
+        val item = _transferQueue.value.firstOrNull { it.id == transferId }
+        val total = item?.fileSize ?: 0L
+        val name = item?.fileName ?: "File"
+        if (!AppForegroundTracker.isAppInForeground) {
+            TransferNotificationManager.showTransferProgressNotification(
+                context = context,
+                transferId = transferId,
+                fileName = name,
+                bytesTransferred = bytesTransferred,
+                totalBytes = total,
+                isIncoming = true
+            )
+        }
         viewModelScope.launch(Dispatchers.Main) {
             updateItemProgress(transferId, bytesTransferred)
         }
     }
 
     override fun onFileTransferCompleted(transferId: String, filePath: String) {
+        val item = _transferQueue.value.firstOrNull { it.id == transferId }
+        val name = item?.fileName ?: "File"
+
         try {
+            com.example.repository.FileRepository.onFileReceived(context, java.io.File(filePath))
             android.media.MediaScannerConnection.scanFile(
                 context,
                 arrayOf(filePath),
                 null
             ) { path, uri ->
                 Log.d("FlipViewModel", "Successfully scanned and saved file in MediaStore: $path -> $uri")
+                com.example.repository.FileRepository.onFileReceived(context, java.io.File(filePath))
             }
         } catch (e: Exception) {
             Log.e("FlipViewModel", "Failed to scan received file: ${e.message}")
         }
 
+        if (!AppForegroundTracker.isAppInForeground) {
+            TransferNotificationManager.showTransferCompletedNotification(
+                context = context,
+                transferId = transferId,
+                fileName = name,
+                filePath = filePath,
+                isIncoming = true
+            )
+        }
+
         viewModelScope.launch(Dispatchers.Main) {
-            val item = _transferQueue.value.firstOrNull { it.id == transferId }
             updateItemStatus(transferId, TransferStatus.COMPLETE)
             if (item != null) {
                 showToast("Received and saved: ${item.fileName}")
@@ -629,6 +859,17 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onFileTransferFailed(transferId: String, errorMessage: String) {
+        val item = _transferQueue.value.firstOrNull { it.id == transferId }
+        val name = item?.fileName ?: "File"
+        if (!AppForegroundTracker.isAppInForeground) {
+            TransferNotificationManager.showTransferFailedNotification(
+                context = context,
+                transferId = transferId,
+                fileName = name,
+                errorMessage = errorMessage
+            )
+        }
+
         viewModelScope.launch(Dispatchers.Main) {
             updateItemStatus(transferId, TransferStatus.FAILED, errorMessage)
             showToast("File transfer failed: $errorMessage")
@@ -636,6 +877,12 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     }
 
     override fun onRemoteCancelled(transferId: String) {
+        FlipTransferForegroundService.cancelPendingRequest(transferId)
+        TransferNotificationManager.cancelTransferNotification(context, transferId)
+        if (_pendingIncomingRequest.value?.transferId == transferId) {
+            _pendingIncomingRequest.value = null
+        }
+
         viewModelScope.launch(Dispatchers.Main) {
             val item = _transferQueue.value.firstOrNull { it.id == transferId }
             updateItemStatus(transferId, TransferStatus.CANCELLED)
@@ -670,7 +917,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         }
     }
 
-    fun importSharedFiles(uris: List<Uri>) {
+    fun handleIncomingShare(uris: List<Uri>, text: String?) {
         viewModelScope.launch(Dispatchers.Main) {
             val items = withContext(Dispatchers.IO) {
                 uris.mapNotNull { uri ->
@@ -707,17 +954,136 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 }
             }
 
-            if (items.isNotEmpty()) {
-                if (_connectionState.value == ConnectionState.CONNECTED) {
-                    items.forEach { item ->
-                        addFileToTransferQueue(item.uri, item.name, item.size)
-                    }
-                    showToast("Imported ${items.size} shared files to transfer queue")
-                } else {
+            val session = ConnectionSessionManager.session.value
+            val isConnected = session.isConnected || _connectionState.value == ConnectionState.CONNECTED
+            val target = session.remoteDevice ?: _remoteDevice.value
+
+            if (isConnected && target != null) {
+                // Already connected: show lightweight confirmation sheet without restarting pairing
+                _pendingShareRequest.value = PendingShareRequest(
+                    items = items,
+                    text = text,
+                    targetDevice = target
+                )
+            } else {
+                // Not connected: keep items as pending selection and open normal connect flow
+                if (items.isNotEmpty()) {
                     preSelectFiles(items)
-                    startSenderMode()
+                    showToast("${items.size} file(s) selected. Connect to a device to send.")
+                }
+                if (!text.isNullOrBlank()) {
+                    pendingSharedText = text
+                    if (items.isEmpty()) {
+                        showToast("Text prepared to send. Connect to a device to send.")
+                    }
                 }
             }
         }
     }
+
+    fun confirmPendingShare() {
+        val req = _pendingShareRequest.value ?: return
+        _pendingShareRequest.value = null
+        viewModelScope.launch(Dispatchers.Main) {
+            req.items.forEach { file ->
+                addFileToTransferQueue(file.uri, file.name, file.size)
+            }
+            if (!req.text.isNullOrBlank()) {
+                sendText(req.text)
+            }
+        }
+    }
+
+    fun cancelPendingShare() {
+        _pendingShareRequest.value = null
+    }
+
+    fun importSharedFiles(uris: List<Uri>) {
+        handleIncomingShare(uris, null)
+    }
+
+    fun handleScannedQr(
+        qrResult: String,
+        targetBlePeer: Device?,
+        onSuccess: () -> Unit,
+        onRequiresPlainWifiConfirmation: (WifiHotspotDetails, Device) -> Unit
+    ) {
+        if (qrResult.startsWith(HotspotPairingProtocol.SCHEME_FIRST)) {
+            val payload = HotspotPairingProtocol.parseFirstTimeQrPayload(qrResult)
+            if (payload == null) {
+                showToast("Invalid First Time QR code.")
+                return
+            }
+            // Verify embedded ID matches BLE peer being connected to
+            if (targetBlePeer != null && payload.deviceId != targetBlePeer.id && !targetBlePeer.id.contains(payload.shortCode)) {
+                showToast("That QR belongs to a different device")
+                return
+            }
+            // Save to encrypted storage under peer's device ID
+            HotspotCredentialStore.savePairedPeer(
+                context,
+                PairedPeer(
+                    peerDeviceId = payload.deviceId,
+                    displayName = payload.deviceName,
+                    ssid = payload.ssid,
+                    password = payload.password,
+                    security = payload.security,
+                    isHidden = payload.isHidden
+                )
+            )
+            showToast("Paired with ${payload.deviceName} · ${payload.shortCode}")
+            onSuccess()
+            val peer = HotspotCredentialStore.getPairedPeer(context, payload.deviceId)
+            if (peer != null) {
+                autoJoinManager.startAutoJoin(
+                    pairedPeer = peer,
+                    port = targetBlePeer?.port ?: 8080,
+                    onSuccess = { dev -> connectToDiscoveredDevice(dev) }
+                )
+            }
+        } else if (qrResult.startsWith("WIFI:", ignoreCase = true)) {
+            val details = HotspotPairingProtocol.parseWifiQr(qrResult)
+            if (details != null && targetBlePeer != null) {
+                onRequiresPlainWifiConfirmation(details, targetBlePeer)
+            } else {
+                showToast("Invalid Wi-Fi QR code.")
+            }
+        } else if (qrResult.startsWith("flip://")) {
+            // Existing pairing QR behavior unchanged
+            try {
+                val ip = qrResult.substringAfter("ip=").substringBefore("&")
+                val port = qrResult.substringAfter("port=").substringBefore("&").toIntOrNull() ?: 8080
+                connectManually(ip, port)
+                onSuccess()
+            } catch (e: Exception) {
+                showToast("Failed to parse pairing QR: ${e.message}")
+            }
+        } else {
+            showToast("Unrecognized QR code.")
+        }
+    }
+
+    fun savePlainWifiAndAutoJoin(details: WifiHotspotDetails, targetBlePeer: Device) {
+        HotspotCredentialStore.savePairedPeer(
+            context,
+            PairedPeer(
+                peerDeviceId = targetBlePeer.id,
+                displayName = targetBlePeer.name,
+                ssid = details.ssid,
+                password = details.password,
+                security = details.security,
+                isHidden = details.isHidden
+            )
+        )
+        showToast("Paired with ${targetBlePeer.name} · ${targetBlePeer.id.take(4)}")
+        val peer = HotspotCredentialStore.getPairedPeer(context, targetBlePeer.id)
+        if (peer != null) {
+            autoJoinManager.startAutoJoin(
+                pairedPeer = peer,
+                port = targetBlePeer.port,
+                onSuccess = { dev -> connectToDiscoveredDevice(dev) }
+            )
+        }
+    }
 }
+

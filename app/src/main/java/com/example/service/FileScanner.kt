@@ -233,12 +233,16 @@ object FileScanner {
             Environment.DIRECTORY_MUSIC
         )
 
-        val processedPathsOrUris = currentList.map { it.uriString }.toMutableSet()
+        val processed = mutableSetOf<String>()
+        for (item in currentList) {
+            processed.add(item.uriString)
+            processed.add("${item.name.lowercase()}_${item.size}")
+        }
 
         for (folderName in foldersToScan) {
             val folder = Environment.getExternalStoragePublicDirectory(folderName)
             if (folder.exists() && folder.isDirectory) {
-                scanDirRecursively(folder, folderName, processedPathsOrUris, currentList, depth = 0)
+                scanDirRecursively(folder, folderName, processed, currentList, depth = 0)
             }
         }
     }
@@ -253,12 +257,12 @@ object FileScanner {
                 scanDirRecursively(file, defaultCategoryName, processed, outputList, depth + 1)
             } else {
                 val fileUriStr = Uri.fromFile(file).toString()
-                if (processed.contains(fileUriStr)) continue
-                
                 val size = file.length()
                 if (size <= 0) continue
 
                 val name = file.name
+                val signature = "${name.lowercase()}_${size}"
+                if (processed.contains(fileUriStr) || processed.contains(signature)) continue
                 val ext = name.substringAfterLast('.', "").lowercase()
                 
                 // Categorize based on extension
@@ -298,6 +302,7 @@ object FileScanner {
                     )
                 )
                 processed.add(fileUriStr)
+                processed.add(signature)
             }
         }
     }

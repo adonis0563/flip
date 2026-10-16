@@ -31,6 +31,7 @@ class HttpServerService(private val context: android.content.Context, private va
         fun onDeviceConnected(device: Device)
         fun onDeviceDisconnected()
         fun onTextReceived(text: String)
+        fun onIncomingTransferRequest(transferId: String, fileName: String, fileSize: Long): Boolean
         fun onFileTransferStarted(transferId: String, fileName: String, fileSize: Long, isIncoming: Boolean)
         fun onFileTransferProgress(transferId: String, bytesTransferred: Long)
         fun onFileTransferCompleted(transferId: String, filePath: String)
@@ -157,12 +158,16 @@ class HttpServerService(private val context: android.content.Context, private va
                     val device = deviceAdapter.fromJson(body)
                     if (device != null) {
                         listener.onDeviceConnected(device)
+                        val prefs = context.getSharedPreferences("flip_prefs", android.content.Context.MODE_PRIVATE)
+                        val savedName = prefs.getString("device_name", null)
+                        val localName = if (!savedName.isNullOrBlank()) savedName else (android.os.Build.MODEL ?: "Flip Device")
                         val responseJson = deviceAdapter.toJson(
                             Device(
-                                id = "local_device",
-                                name = android.os.Build.MODEL,
+                                id = DeviceIdentity.getStableDeviceId(context),
+                                name = localName,
                                 ip = socket.localAddress.hostAddress ?: "127.0.0.1",
-                                port = boundPort
+                                port = boundPort,
+                                sid = DeviceIdentity.currentSessionId
                             )
                         )
                         sendResponse(output, 200, "OK", "application/json", responseJson.toByteArray())
@@ -258,6 +263,14 @@ class HttpServerService(private val context: android.content.Context, private va
         activeIncomingTransferId = transferId
         isCancelled = false
         Log.d(TAG, "[FILE_TRANSFER_RECEIVER] Metadata received - File Name: $fileName, Size: $fileSize, Offset: $offset, ID: $transferId, Content-Length: $contentLength")
+
+        // Wait for user approval (in-app or notification heads-up) before streaming payload
+        val approved = listener.onIncomingTransferRequest(transferId, fileName, fileSize)
+        if (!approved) {
+            Log.w(TAG, "[FILE_TRANSFER_RECEIVER] Transfer $transferId was declined or timed out.")
+            sendResponse(output, 403, "Forbidden", "text/plain", "Transfer declined".toByteArray())
+            return
+        }
 
         val partialFile = StorageService.getPartialFile(transferId, fileName)
         val offsetFile = StorageService.getOffsetFile(transferId, fileName)

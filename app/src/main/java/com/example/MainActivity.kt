@@ -5,19 +5,26 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.SystemBarStyle
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import android.graphics.Color
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
 import com.example.ui.FlipAppContent
 import com.example.ui.theme.MyApplicationTheme
+import com.example.ui.theme.ThemeManager
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import android.annotation.SuppressLint
 import com.example.viewmodel.FlipViewModel
 
 @SuppressLint("InvalidFragmentVersionForActivityResult")
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
 
     private val viewModel: FlipViewModel by viewModels()
 
@@ -35,6 +42,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        val hasStorage = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions[Manifest.permission.READ_MEDIA_IMAGES] == true ||
+            permissions[Manifest.permission.READ_MEDIA_VIDEO] == true ||
+            permissions[Manifest.permission.READ_MEDIA_AUDIO] == true
+        } else {
+            permissions[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+        }
+        if (hasStorage) {
+            com.example.repository.FileRepository.preload(this)
+        }
         if (!allGranted) {
             Log.w("MainActivity", "Some critical permissions were denied.")
         }
@@ -42,10 +59,28 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        
+        // Ensure status bar is always visible with dark icons against light background
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(
+                Color.TRANSPARENT,
+                Color.TRANSPARENT
+            ),
+            navigationBarStyle = SystemBarStyle.light(
+                Color.TRANSPARENT,
+                Color.TRANSPARENT
+            )
+        )
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            show(WindowInsetsCompat.Type.statusBars())
+        }
         
         // Initialize storage directory safely
         com.example.service.StorageService.appFilesDir = getExternalFilesDir(null)
+
+        // Initialize foreground tracking and notification channels
+        com.example.service.AppForegroundTracker.init(application)
+        com.example.service.TransferNotificationManager.createNotificationChannels(this)
 
         // Gather all required permission parameters based on target Android platform version
         val permissions = mutableListOf(
@@ -80,14 +115,49 @@ class MainActivity : ComponentActivity() {
             requestPermissionLauncher.launch(ungranted.toTypedArray())
         }
 
+        ThemeManager.init(this)
+
+        val hasStoragePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+        if (hasStoragePermission) {
+            com.example.repository.FileRepository.preload(this)
+        }
+
         setContent {
-            MyApplicationTheme {
+            val themeMode by com.example.ui.theme.ThemeManager.themeMode.collectAsState()
+            MyApplicationTheme(themeMode = themeMode) {
                 FlipAppContent(viewModel = viewModel)
             }
         }
 
         // Handle intent if files were shared to the app
         handleIncomingIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val hasStoragePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+        if (hasStoragePermission) {
+            com.example.repository.FileRepository.refreshSilently(this)
+        } else {
+            com.example.repository.FileRepository.onPermissionRevoked()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        com.example.repository.FileRepository.unregisterContentObserver(this)
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -98,28 +168,75 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIncomingIntent(intent: android.content.Intent?) {
         if (intent == null) return
+        if (intent.getBooleanExtra("open_explorer", false)) {
+            viewModel.triggerOpenExplorer()
+        }
         val action = intent.action
         val type = intent.type
 
-        if (android.content.Intent.ACTION_SEND == action && type != null) {
-            val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+        if (android.content.Intent.ACTION_SEND == action || android.content.Intent.ACTION_SEND_MULTIPLE == action) {
+            val uris = LinkedHashSet<android.net.Uri>()
+
+            // 1. Check ClipData first (modern standard used by Photos and file managers)
+            intent.clipData?.let { clipData ->
+                for (i in 0 until clipData.itemCount) {
+                    clipData.getItemAt(i)?.uri?.let { uris.add(it) }
+                }
             }
-            streamUri?.let { uri ->
-                viewModel.importSharedFiles(listOf(uri))
+
+            // 2. Check EXTRA_STREAM for single item share
+            if (android.content.Intent.ACTION_SEND == action) {
+                val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(android.content.Intent.EXTRA_STREAM)
+                }
+                streamUri?.let { uris.add(it) }
             }
-        } else if (android.content.Intent.ACTION_SEND_MULTIPLE == action && type != null) {
-            val streamUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM)
+
+            // 3. Check EXTRA_STREAM for multiple items share
+            if (android.content.Intent.ACTION_SEND_MULTIPLE == action) {
+                val streamUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM)
+                }
+                streamUris?.filterNotNull()?.let { uris.addAll(it) }
             }
-            streamUris?.let { uris ->
-                viewModel.importSharedFiles(uris.filterNotNull())
+
+            // 4. Check EXTRA_TEXT for text shares
+            val sharedText = intent.getStringExtra(android.content.Intent.EXTRA_TEXT)
+                ?: intent.getCharSequenceExtra(android.content.Intent.EXTRA_TEXT)?.toString()
+
+            // 5. Take persistable URI read permission if granted
+            uris.forEach { uri ->
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: SecurityException) {
+                    // Safe to ignore for transient read-permission grants
+                }
+            }
+
+            if (uris.isNotEmpty() || !sharedText.isNullOrBlank()) {
+                viewModel.handleIncomingShare(uris.toList(), sharedText)
+            }
+
+            // 6. Clear intent extras so rotation or returning to the app does not re-trigger
+            try {
+                intent.removeExtra(android.content.Intent.EXTRA_STREAM)
+                intent.removeExtra(android.content.Intent.EXTRA_TEXT)
+                intent.removeExtra("open_explorer")
+                val cleanIntent = android.content.Intent(intent).apply {
+                    this.action = android.content.Intent.ACTION_MAIN
+                }
+                setIntent(cleanIntent)
+            } catch (e: Exception) {
+                Log.w("MainActivity", "Failed to clear share intent extras: ${e.message}")
             }
         }
     }

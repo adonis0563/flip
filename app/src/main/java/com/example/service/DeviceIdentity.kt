@@ -63,6 +63,28 @@ data class DeviceIdentity(
         }
 
         /**
+         * Normalizes any UUID to lowercase canonical format with hyphens.
+         */
+        fun normalizeUuid(raw: String): String {
+            val clean = raw.trim().lowercase().removePrefix("urn:uuid:").removePrefix("flip-")
+            val stripped = clean.replace("-", "")
+            return if (stripped.length == 32 && stripped.all { it in "0123456789abcdef" }) {
+                "${stripped.substring(0, 8)}-${stripped.substring(8, 12)}-${stripped.substring(12, 16)}-${stripped.substring(16, 20)}-${stripped.substring(20, 32)}"
+            } else {
+                clean
+            }
+        }
+
+        /**
+         * Returns deterministic 4-character uppercase short code derived from UUID.
+         */
+        fun getShortCodeFromUuid(uuid: String): String {
+            val normalized = normalizeUuid(uuid)
+            val id8 = deriveHexId(normalized)
+            return id8.take(4).uppercase()
+        }
+
+        /**
          * Gets or generates the installation UUID stored in encrypted preferences.
          * Never uses IMEI, serial, MAC, or ANDROID_ID.
          */
@@ -70,13 +92,13 @@ data class DeviceIdentity(
         fun getInstallUuid(context: Context): String {
             val existing = HotspotCredentialStore.getEncryptedString(context, KEY_INSTALL_UUID)
             if (!existing.isNullOrBlank()) {
-                return existing
+                return normalizeUuid(existing)
             }
 
             // Generate random UUID once on first launch
-            val newUuid = UUID.randomUUID().toString()
+            val newUuid = normalizeUuid(UUID.randomUUID().toString())
             HotspotCredentialStore.saveEncryptedString(context, KEY_INSTALL_UUID, newUuid)
-            Log.i(TAG, "[IDENTITY] New install UUID initialized in encrypted storage")
+            Log.i(TAG, "[IDENTITY] New install UUID initialized: ${getShortCodeFromUuid(newUuid)}")
             return newUuid
         }
 
@@ -112,7 +134,7 @@ data class DeviceIdentity(
         }
 
         /**
-         * Returns the device display name, defaulting to Build.MODEL.
+         * Returns the device display name, defaulting to Build.MODEL · shortCode.
          */
         @Synchronized
         fun getDisplayName(context: Context): String {
@@ -125,7 +147,9 @@ data class DeviceIdentity(
             if (!legacy.isNullOrBlank()) {
                 return legacy
             }
-            return if (!Build.MODEL.isNullOrBlank()) Build.MODEL else "Android Device"
+            val model = if (!Build.MODEL.isNullOrBlank()) Build.MODEL else "Android Device"
+            val shortCode = get(context).shortCode
+            return "$model · $shortCode"
         }
 
         /**

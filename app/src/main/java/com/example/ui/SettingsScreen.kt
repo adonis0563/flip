@@ -228,15 +228,16 @@ fun SettingsScreen(
             // Section: Paired Devices
             item {
                 val context = androidx.compose.ui.platform.LocalContext.current
-                var pairedPeers by remember { mutableStateOf(com.example.service.HotspotCredentialStore.getAllPairedPeers(context)) }
+                val pairedPeers by com.example.service.HotspotCredentialStore.pairedPeersFlow.collectAsState()
+                LaunchedEffect(Unit) {
+                    com.example.service.HotspotCredentialStore.initFlow(context)
+                }
                 var showPairDeviceScanner by remember { mutableStateOf(false) }
 
                 if (showPairDeviceScanner) {
                     PairingScannerDialog(
                         onDismiss = { showPairDeviceScanner = false },
-                        onPairedSuccess = { _, _ ->
-                            pairedPeers = com.example.service.HotspotCredentialStore.getAllPairedPeers(context)
-                        }
+                        onPairedSuccess = { _, _ -> }
                     )
                 }
 
@@ -276,7 +277,6 @@ fun SettingsScreen(
                             TextButton(
                                 onClick = {
                                     com.example.service.HotspotCredentialStore.forgetAllPeers(context)
-                                    pairedPeers = emptyList()
                                 },
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
                             ) {
@@ -379,7 +379,6 @@ fun SettingsScreen(
                                 TextButton(
                                     onClick = {
                                         com.example.service.HotspotCredentialStore.forgetPeer(context, peer.peerDeviceId)
-                                        pairedPeers = com.example.service.HotspotCredentialStore.getAllPairedPeers(context)
                                     },
                                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
                                     modifier = Modifier.height(34.dp)

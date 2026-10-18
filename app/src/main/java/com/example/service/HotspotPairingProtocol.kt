@@ -28,7 +28,7 @@ data class FirstTimePayload(
     val security: String,
     val isHidden: Boolean
 ) {
-    val shortCode: String get() = deviceId.take(4).uppercase()
+    val shortCode: String get() = DeviceIdentity.getShortCodeFromUuid(deviceId)
 }
 
 /**
@@ -84,9 +84,10 @@ object HotspotPairingProtocol {
         isHidden: Boolean
     ): String {
         val enc = { s: String -> URLEncoder.encode(s, "UTF-8") }
+        val cleanId = DeviceIdentity.normalizeUuid(deviceId)
         return StringBuilder(SCHEME_FIRST)
             .append("?v=1")
-            .append("&id=").append(enc(deviceId))
+            .append("&id=").append(enc(cleanId))
             .append("&name=").append(enc(deviceName))
             .append("&ssid=").append(enc(ssid))
             .append("&pw=").append(enc(password))
@@ -112,7 +113,7 @@ object HotspotPairingProtocol {
 
             FirstTimePayload(
                 version = v,
-                deviceId = id,
+                deviceId = DeviceIdentity.normalizeUuid(id),
                 deviceName = name,
                 ssid = ssid,
                 password = pw,

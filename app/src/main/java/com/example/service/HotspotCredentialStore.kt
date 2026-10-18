@@ -31,7 +31,7 @@ data class PairedPeer(
     val lastConnected: Long = System.currentTimeMillis(),
     val needsRePair: Boolean = false
 ) {
-    val shortCode: String get() = peerDeviceId.take(4)
+    val shortCode: String get() = DeviceIdentity.getShortCodeFromUuid(peerDeviceId)
 }
 
 /**
@@ -49,6 +49,19 @@ object HotspotCredentialStore {
     private const val KEY_OWN_HOTSPOT = "enc_own_hotspot"
     private const val KEY_PAIRED_PEERS = "enc_paired_peers"
     private const val KEY_KNOWN_RECEIVERS = "known_receivers"
+
+    private val _pairedPeersFlow = kotlinx.coroutines.flow.MutableStateFlow<List<PairedPeer>>(emptyList())
+    val pairedPeersFlow: kotlinx.coroutines.flow.StateFlow<List<PairedPeer>> = _pairedPeersFlow
+
+    @Synchronized
+    fun initFlow(context: Context) {
+        _pairedPeersFlow.value = getAllPairedPeers(context)
+    }
+
+    @Synchronized
+    fun notifyPeersChanged(context: Context) {
+        _pairedPeersFlow.value = getAllPairedPeers(context)
+    }
 
     @Volatile
     private var fallbackKey: SecretKey? = null
@@ -197,22 +210,20 @@ object HotspotCredentialStore {
 
     @Synchronized
     fun savePairedPeer(context: Context, peer: PairedPeer) {
+        val cleanPeer = peer.copy(peerDeviceId = DeviceIdentity.normalizeUuid(peer.peerDeviceId))
         val peers = getAllPairedPeers(context).toMutableList()
-        peers.removeAll { it.peerDeviceId == peer.peerDeviceId }
-        peers.add(peer)
+        peers.removeAll { DeviceIdentity.normalizeUuid(it.peerDeviceId) == cleanPeer.peerDeviceId }
+        peers.add(cleanPeer)
         saveAllPairedPeers(context, peers)
-        Log.i(TAG, "[PAIRING] Paired peer stored: ${peer.displayName} (${peer.shortCode})")
+        notifyPeersChanged(context)
+        Log.i(TAG, "[PAIRING] Paired peer stored: ${cleanPeer.displayName} (${cleanPeer.shortCode})")
     }
 
     @Synchronized
     fun getPairedPeer(context: Context, peerDeviceId: String): PairedPeer? {
-        val clean = peerDeviceId.removePrefix("flip-")
+        val clean = DeviceIdentity.normalizeUuid(peerDeviceId)
         return getAllPairedPeers(context).firstOrNull { peer ->
-            peer.peerDeviceId.equals(clean, ignoreCase = true) ||
-            peer.peerDeviceId.equals(peerDeviceId, ignoreCase = true) ||
-            peer.shortCode.equals(clean, ignoreCase = true) ||
-            peer.peerDeviceId.startsWith(clean, ignoreCase = true) ||
-            clean.startsWith(peer.shortCode, ignoreCase = true)
+            DeviceIdentity.normalizeUuid(peer.peerDeviceId).equals(clean, ignoreCase = true)
         }
     }
 
@@ -227,7 +238,7 @@ object HotspotCredentialStore {
                 val obj = array.getJSONObject(i)
                 result.add(
                     PairedPeer(
-                        peerDeviceId = obj.getString("id"),
+                        peerDeviceId = DeviceIdentity.normalizeUuid(obj.getString("id")),
                         displayName = obj.getString("name"),
                         ssid = obj.getString("ssid"),
                         password = obj.getString("password"),
@@ -247,39 +258,47 @@ object HotspotCredentialStore {
 
     @Synchronized
     fun markNeedsRePair(context: Context, peerDeviceId: String, needsRePair: Boolean) {
+        val clean = DeviceIdentity.normalizeUuid(peerDeviceId)
         val peers = getAllPairedPeers(context).map {
-            if (it.peerDeviceId == peerDeviceId) it.copy(needsRePair = needsRePair) else it
+            if (DeviceIdentity.normalizeUuid(it.peerDeviceId) == clean) it.copy(needsRePair = needsRePair) else it
         }
         saveAllPairedPeers(context, peers)
-        Log.w(TAG, "[PAIRING] Peer marked needsRePair=$needsRePair: ${peerDeviceId.take(4)}")
+        notifyPeersChanged(context)
+        Log.w(TAG, "[PAIRING] Peer marked needsRePair=$needsRePair: ${DeviceIdentity.getShortCodeFromUuid(clean)}")
     }
 
     @Synchronized
     fun updateLastConnected(context: Context, peerDeviceId: String) {
+        val clean = DeviceIdentity.normalizeUuid(peerDeviceId)
         val peers = getAllPairedPeers(context).map {
-            if (it.peerDeviceId == peerDeviceId) it.copy(lastConnected = System.currentTimeMillis(), needsRePair = false) else it
+            if (DeviceIdentity.normalizeUuid(it.peerDeviceId) == clean) it.copy(lastConnected = System.currentTimeMillis(), needsRePair = false) else it
         }
         saveAllPairedPeers(context, peers)
+        notifyPeersChanged(context)
     }
 
     @Synchronized
     fun forgetPeer(context: Context, peerDeviceId: String) {
-        val peers = getAllPairedPeers(context).filterNot { it.peerDeviceId == peerDeviceId }
+        val clean = DeviceIdentity.normalizeUuid(peerDeviceId)
+        val peers = getAllPairedPeers(context).filterNot { DeviceIdentity.normalizeUuid(it.peerDeviceId) == clean }
         saveAllPairedPeers(context, peers)
-        Log.i(TAG, "[PAIRING] Peer removed: ${peerDeviceId.take(4)}")
+        notifyPeersChanged(context)
+        Log.i(TAG, "[PAIRING] Peer removed: ${DeviceIdentity.getShortCodeFromUuid(clean)}")
     }
 
     @Synchronized
     fun forgetAllPeers(context: Context) {
         getPrefs(context).edit().remove(KEY_PAIRED_PEERS).apply()
+        notifyPeersChanged(context)
         Log.i(TAG, "[PAIRING] All paired peers removed")
     }
 
     private fun saveAllPairedPeers(context: Context, peers: List<PairedPeer>) {
         val array = JSONArray()
         peers.forEach { peer ->
+            val cleanId = DeviceIdentity.normalizeUuid(peer.peerDeviceId)
             val obj = JSONObject().apply {
-                put("id", peer.peerDeviceId)
+                put("id", cleanId)
                 put("name", peer.displayName)
                 put("ssid", peer.ssid)
                 put("password", peer.password)
@@ -298,6 +317,7 @@ object HotspotCredentialStore {
 
     @Synchronized
     fun saveKnownReceiver(context: Context, receiverId: String, displayName: String) {
+        val cleanId = DeviceIdentity.normalizeUuid(receiverId)
         val prefs = getPrefs(context)
         val raw = prefs.getString(KEY_KNOWN_RECEIVERS, "{}") ?: "{}"
         try {
@@ -306,9 +326,10 @@ object HotspotCredentialStore {
                 put("name", displayName)
                 put("lastSeen", System.currentTimeMillis())
             }
-            json.put(receiverId, devObj)
+            json.put(cleanId, devObj)
             prefs.edit().putString(KEY_KNOWN_RECEIVERS, json.toString()).apply()
-            Log.i(TAG, "[SENDER] Known receiver recorded: $displayName (${receiverId.take(4)})")
+            notifyPeersChanged(context)
+            Log.i(TAG, "[SENDER] Known receiver recorded: $displayName (${DeviceIdentity.getShortCodeFromUuid(cleanId)})")
         } catch (e: Exception) {
             Log.w(TAG, "[SENDER] Failed to record known receiver: ${e.message}")
         }

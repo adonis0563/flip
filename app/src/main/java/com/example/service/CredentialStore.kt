@@ -185,10 +185,11 @@ object CredentialStore {
     @Synchronized
     fun savePeer(id: String, creds: WifiCredentials, displayName: String, context: Context? = null) {
         val ctx = resolveContext(context)
+        val cleanId = DeviceIdentity.normalizeUuid(id)
         HotspotCredentialStore.savePairedPeer(
             ctx,
             PairedPeer(
-                peerDeviceId = id,
+                peerDeviceId = cleanId,
                 displayName = displayName,
                 ssid = creds.ssid,
                 password = creds.password,
@@ -197,7 +198,7 @@ object CredentialStore {
                 lastConnected = System.currentTimeMillis()
             )
         )
-        Log.i(TAG, "[HOTSPOT] Peer credentials saved for peer id: ${id.take(4)} (name: $displayName)")
+        Log.i(TAG, "[HOTSPOT] Peer credentials saved for peer id: ${DeviceIdentity.getShortCodeFromUuid(cleanId)} (name: $displayName)")
     }
 
     @Synchronized
@@ -208,7 +209,8 @@ object CredentialStore {
     @Synchronized
     fun getPeer(id: String, context: Context? = null): WifiCredentials? {
         val ctx = resolveContext(context)
-        val peer = HotspotCredentialStore.getPairedPeer(ctx, id) ?: return null
+        val cleanId = DeviceIdentity.normalizeUuid(id)
+        val peer = HotspotCredentialStore.getPairedPeer(ctx, cleanId) ?: return null
         return WifiCredentials(
             ssid = peer.ssid,
             password = peer.password,
@@ -228,7 +230,7 @@ object CredentialStore {
         // Returns names, ids and timestamps only, never passwords
         return HotspotCredentialStore.getAllPairedPeers(ctx).map { peer ->
             PeerSummary(
-                id = peer.peerDeviceId,
+                id = DeviceIdentity.normalizeUuid(peer.peerDeviceId),
                 displayName = peer.displayName,
                 lastConnected = peer.lastConnected
             )
@@ -238,8 +240,9 @@ object CredentialStore {
     @Synchronized
     fun forgetPeer(id: String, context: Context? = null) {
         val ctx = resolveContext(context)
-        HotspotCredentialStore.forgetPeer(ctx, id)
-        Log.i(TAG, "[HOTSPOT] Peer forgotten: ${id.take(4)}")
+        val cleanId = DeviceIdentity.normalizeUuid(id)
+        HotspotCredentialStore.forgetPeer(ctx, cleanId)
+        Log.i(TAG, "[HOTSPOT] Peer forgotten: ${DeviceIdentity.getShortCodeFromUuid(cleanId)}")
     }
 
     @Synchronized

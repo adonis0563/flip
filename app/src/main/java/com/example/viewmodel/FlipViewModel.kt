@@ -89,6 +89,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     val autoJoinManager: AutoJoinManager = ConnectionSessionManager.getAutoJoinManager(context)
     val autoJoinState: StateFlow<AutoJoinState> = autoJoinManager.state
+    val pairedPeers: StateFlow<List<PairedPeer>> = HotspotCredentialStore.pairedPeersFlow
 
     fun triggerOpenExplorer() {
         _openExplorerEvent.value = true
@@ -159,8 +160,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         }
 
         // Initialize local device profile with stable per-install ID and session ID
+        HotspotCredentialStore.initFlow(context)
         val identity = DeviceIdentity.get(context)
-        val devId = identity.id8
+        val devId = DeviceIdentity.normalizeUuid(identity.uuid)
         val devName = identity.displayName
         val localIp = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
         _localDevice.value = Device(
@@ -218,6 +220,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             .edit()
             .putString("device_name", trimmed)
             .apply()
+        HotspotCredentialStore.notifyPeersChanged(context)
     }
 
     fun clearToast() {
@@ -723,10 +726,13 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             // Stop scanning/advertising
             bleService.stopScanning()
             bleService.stopAdvertising()
-            _remoteDevice.value = device
+            val cleanId = DeviceIdentity.normalizeUuid(device.id)
+            val finalDevice = device.copy(id = cleanId)
+            _remoteDevice.value = finalDevice
             _connectionState.value = ConnectionState.CONNECTED
-            FlipTransferForegroundService.start(context, device)
-            HotspotCredentialStore.saveKnownReceiver(context, device.id, device.name)
+            FlipTransferForegroundService.start(context, finalDevice)
+            HotspotCredentialStore.saveKnownReceiver(context, cleanId, device.name)
+            HotspotCredentialStore.notifyPeersChanged(context)
             showToast("Connected to ${device.name}")
             checkAndQueuePreSelected()
         }

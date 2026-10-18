@@ -1233,6 +1233,7 @@ fun ReceiverScanningScreen(
     onCancel: () -> Unit
 ) {
     val context = LocalContext.current
+    val pairedPeers by com.example.service.HotspotCredentialStore.pairedPeersFlow.collectAsState()
     var manualCode by remember { mutableStateOf("") }
     var showScanOverlay by remember { mutableStateOf(false) }
 
@@ -1492,7 +1493,7 @@ fun ReceiverScanningScreen(
                         modifier = Modifier.fillMaxSize()
                     ) {
                         items(discoveredDevices) { device ->
-                            val pairedPeer = remember(device.id) {
+                            val pairedPeer = remember(device.id, pairedPeers) {
                                 com.example.service.HotspotCredentialStore.getPairedPeer(context, device.id)
                             }
 

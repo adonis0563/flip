@@ -157,20 +157,33 @@ class HttpServerService(private val context: android.content.Context, private va
                     val body = readBodyAsString(input, contentLength)
                     val device = deviceAdapter.fromJson(body)
                     if (device != null) {
-                        listener.onDeviceConnected(device)
-                        val prefs = context.getSharedPreferences("flip_prefs", android.content.Context.MODE_PRIVATE)
-                        val savedName = prefs.getString("device_name", null)
-                        val localName = if (!savedName.isNullOrBlank()) savedName else (android.os.Build.MODEL ?: "Flip Device")
-                        val responseJson = deviceAdapter.toJson(
-                            Device(
-                                id = DeviceIdentity.getStableDeviceId(context),
-                                name = localName,
-                                ip = socket.localAddress.hostAddress ?: "127.0.0.1",
-                                port = boundPort,
-                                sid = DeviceIdentity.currentSessionId
+                        val localIdentity = DeviceIdentity.get(context)
+                        val ownUuid = DeviceIdentity.normalizeUuid(localIdentity.uuid)
+                        val receivedUuid = DeviceIdentity.normalizeUuid(device.id)
+
+                        val ownShortCode = DeviceIdentity.getShortCodeFromUuid(ownUuid)
+                        val receivedShortCode = DeviceIdentity.getShortCodeFromUuid(receivedUuid)
+
+                        if (receivedUuid == ownUuid) {
+                            Log.w(TAG, "[SERVER] Rejected handshake: same device ($receivedShortCode)")
+                            sendResponse(output, 400, "Bad Request", "text/plain", "same device".toByteArray())
+                        } else {
+                            HotspotCredentialStore.saveKnownReceiver(context, receivedUuid, device.name)
+                            HotspotCredentialStore.notifyPeersChanged(context)
+                            listener.onDeviceConnected(device.copy(id = receivedUuid))
+
+                            val responseJson = deviceAdapter.toJson(
+                                Device(
+                                    id = ownUuid,
+                                    name = localIdentity.displayName,
+                                    ip = socket.localAddress.hostAddress ?: "127.0.0.1",
+                                    port = boundPort,
+                                    sid = DeviceIdentity.currentSessionId
+                                )
                             )
-                        )
-                        sendResponse(output, 200, "OK", "application/json", responseJson.toByteArray())
+                            Log.i(TAG, "[SERVER] Handshake completed with $receivedShortCode, replying with $ownShortCode")
+                            sendResponse(output, 200, "OK", "application/json", responseJson.toByteArray())
+                        }
                     } else {
                         sendResponse(output, 400, "Bad Request", "text/plain", "Invalid Payload".toByteArray())
                     }

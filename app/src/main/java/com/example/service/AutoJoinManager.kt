@@ -213,17 +213,20 @@ class AutoJoinManager(private val context: Context) {
 
                 val url = "http://$gatewayAddress:$port/connect"
 
-                // Create local Device profile payload
-                val prefs = context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
-                val savedName = prefs.getString("device_name", null)
-                val devName = if (!savedName.isNullOrBlank()) savedName else (Build.MODEL ?: "Android Device")
+                // Create local Device profile payload - receiver sends its OWN DeviceIdentity uuid
+                val localIdentity = DeviceIdentity.get(context)
+                val ownUuid = DeviceIdentity.normalizeUuid(localIdentity.uuid)
+                val ownShortCode = DeviceIdentity.getShortCodeFromUuid(ownUuid)
+
                 val localDev = Device(
-                    id = DeviceIdentity.getStableDeviceId(context),
-                    name = devName,
+                    id = ownUuid,
+                    name = localIdentity.displayName,
                     ip = "0.0.0.0",
                     port = 8080,
                     sid = DeviceIdentity.currentSessionId
                 )
+
+                Log.i(TAG, "[HANDSHAKE] Receiver sending own short code: $ownShortCode")
 
                 val body = deviceAdapter.toJson(localDev).toRequestBody("application/json".toMediaTypeOrNull())
                 val httpRequest = Request.Builder().url(url).post(body).build()
@@ -239,26 +242,28 @@ class AutoJoinManager(private val context: Context) {
                         val responseBody = response.body?.string() ?: ""
                         val remoteDevice = deviceAdapter.fromJson(responseBody)
                         if (remoteDevice != null) {
-                            // Verify peer identity (by device ID / short code only - name stays display-only)
-                            val cleanRemoteId = remoteDevice.id.removePrefix("flip-")
-                            val isIdMatched = remoteDevice.id.equals(pairedPeer.peerDeviceId, ignoreCase = true) ||
-                                cleanRemoteId.equals(pairedPeer.peerDeviceId, ignoreCase = true) ||
-                                pairedPeer.peerDeviceId.startsWith(cleanRemoteId, ignoreCase = true) ||
-                                cleanRemoteId.startsWith(pairedPeer.shortCode, ignoreCase = true)
+                            // Verify peer identity: compare full UUIDs with full UUIDs
+                            val cleanRemoteId = DeviceIdentity.normalizeUuid(remoteDevice.id)
+                            val expectedId = DeviceIdentity.normalizeUuid(pairedPeer.peerDeviceId)
+                            val isIdMatched = cleanRemoteId == expectedId
+
+                            val remoteShortCode = DeviceIdentity.getShortCodeFromUuid(cleanRemoteId)
+                            val expectedShortCode = DeviceIdentity.getShortCodeFromUuid(expectedId)
 
                             if (isIdMatched) {
-                                Log.i(TAG, "[AUTO-JOIN] Handshake successful, peer verified: ${remoteDevice.name} (${remoteDevice.id})")
-                                failureCounts.remove(pairedPeer.peerDeviceId)
-                                HotspotCredentialStore.updateLastConnected(context, pairedPeer.peerDeviceId)
-                                val finalDevice = remoteDevice.copy(ip = gatewayAddress, port = port)
+                                Log.i(TAG, "[HANDSHAKE] Handshake successful, peer verified: $remoteShortCode")
+                                failureCounts.remove(expectedId)
+                                HotspotCredentialStore.updateLastConnected(context, expectedId)
+                                HotspotCredentialStore.notifyPeersChanged(context)
+                                val finalDevice = remoteDevice.copy(id = cleanRemoteId, ip = gatewayAddress, port = port)
                                 _state.value = AutoJoinState.Connected(finalDevice)
                                 mainHandler.post { onSuccess(finalDevice) }
                             } else {
-                                Log.e(TAG, "[AUTO-JOIN] Handshake identity mismatch! Expected ${pairedPeer.peerDeviceId}, got ${remoteDevice.id}")
+                                Log.e(TAG, "[HANDSHAKE] Handshake identity mismatch! Expected $expectedShortCode, got $remoteShortCode")
                                 cleanupNetworkRequest()
                                 _state.value = AutoJoinState.Failed(
-                                    reason = "This isn't the device you paired with.",
-                                    peerId = pairedPeer.peerDeviceId,
+                                    reason = "This isn't the device you saved",
+                                    peerId = expectedId,
                                     peerName = pairedPeer.displayName
                                 )
                             }

@@ -306,29 +306,45 @@ object TransferNotificationManager {
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
 
-        // Add Open action if it is an incoming file and exists on disk
+        // Add Open/Install action if it is an incoming file and exists on disk
         if (isIncoming && filePath != null) {
             val file = File(filePath)
             if (file.exists()) {
-                val uri: Uri? = try {
-                    FileProvider.getUriForFile(context, "com.example.fileprovider", file)
-                } catch (_: Exception) {
-                    null
-                }
-                if (uri != null) {
-                    val mimeType = context.contentResolver.getType(uri) ?: "*/*"
-                    val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, mimeType)
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val isApp = file.name.endsWith(".apk", ignoreCase = true) || file.name.endsWith(".apks", ignoreCase = true)
+                if (isApp) {
+                    val installIntent = Intent(context, MainActivity::class.java).apply {
+                        action = Intent.ACTION_VIEW
+                        putExtra("install_file_path", file.absolutePath)
+                        flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
                     }
-                    val openPendingIntent = PendingIntent.getActivity(
+                    val installPendingIntent = PendingIntent.getActivity(
                         context,
                         completedNotifId + 1,
-                        viewIntent,
+                        installIntent,
                         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                     )
-                    builder.addAction(android.R.drawable.ic_menu_view, "Open", openPendingIntent)
+                    builder.addAction(android.R.drawable.stat_sys_download_done, "Install", installPendingIntent)
+                } else {
+                    val uri: Uri? = try {
+                        FileProvider.getUriForFile(context, "com.example.fileprovider", file)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (uri != null) {
+                        val mimeType = context.contentResolver.getType(uri) ?: "*/*"
+                        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, mimeType)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        val openPendingIntent = PendingIntent.getActivity(
+                            context,
+                            completedNotifId + 1,
+                            viewIntent,
+                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                        )
+                        builder.addAction(android.R.drawable.ic_menu_view, "Open", openPendingIntent)
+                    }
                 }
             }
         }

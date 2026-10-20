@@ -2,31 +2,42 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
-    android:viewportWidth="100"
-    android:viewportHeight="100">
+    android:viewportWidth="108"
+    android:viewportHeight="108">
 
-    <!-- Dark minimalist background circle to hold the design together on launcher -->
+    <!-- Dark circular container -->
     <path
         android:fillColor="#111111"
-        android:pathData="M 50,50 m -45,0 a 45,45 0 1,1 90,0 a 45,45 0 1,1 -90,0" />
+        android:pathData="M 54,54 m -48,0 a 48,48 0 1,1 96,0 a 48,48 0 1,1 -96,0" />
 
-    <!-- Left half of the split-diamond (white/silver) representing send/receive state -->
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M 47,24 L 21,50 L 47,76 Z" />
+    <group
+        android:scaleX="0.75"
+        android:scaleY="0.75"
+        android:pivotX="54"
+        android:pivotY="54">
 
-    <!-- Right half of the split-diamond (muted gray/outline) representing opposing state -->
-    <path
-        android:fillColor="#888888"
-        android:pathData="M 53,24 L 79,50 L 53,76 Z" />
+        <!-- Left arrow (←) -->
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="8.64"
+            android:strokeLineCap="round"
+            android:pathData="M 44.28,54 L 14.04,54" />
 
-    <!-- Inset inverse indicators -->
-    <path
-        android:fillColor="#111111"
-        android:pathData="M 39,50 m -4,0 a 4,4 0 1,1 8,0 a 4,4 0 1,1 -8,0" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M 14.04,54 L 27.0,41.04 L 27.0,66.96 Z" />
 
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M 61,50 m -4,0 a 4,4 0 1,1 8,0 a 4,4 0 1,1 -8,0" />
+        <!-- Right arrow (→) -->
+        <path
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="8.64"
+            android:strokeLineCap="round"
+            android:pathData="M 63.72,54 L 93.96,54" />
+
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M 93.96,54 L 81.0,41.04 L 81.0,66.96 Z" />
+
+    </group>
 
 </vector>

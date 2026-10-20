@@ -75,7 +75,8 @@ import java.net.NetworkInterface
 
 enum class ReadinessMode {
     SEND,
-    RECEIVE
+    RECEIVE,
+    HOTSPOT_PC
 }
 
 enum class ReadinessStatus {
@@ -120,6 +121,17 @@ object ConnectionChecker {
             LocationManagerCompat.isLocationEnabled(lm)
         } catch (_: Exception) {
             false
+        }
+    }
+
+    fun isNearbyOrLocationOn(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.NEARBY_WIFI_DEVICES
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            isLocationOn(context)
         }
     }
 
@@ -177,16 +189,18 @@ object ConnectionChecker {
 
     fun isReadyForMode(context: Context, mode: ReadinessMode): Boolean {
         val bt = isBluetoothOn(context)
-        val loc = isLocationOn(context)
-        if (!bt || !loc) return false
+        if (!bt) return false
 
         return when (mode) {
             ReadinessMode.SEND -> {
-                val hotspot = checkHotspot(context, null)
-                hotspot == ReadinessStatus.ON
+                isWifiOn(context) && isNearbyOrLocationOn(context)
             }
             ReadinessMode.RECEIVE -> {
-                isWifiOn(context)
+                isWifiOn(context) && isLocationOn(context)
+            }
+            ReadinessMode.HOTSPOT_PC -> {
+                val hotspot = checkHotspot(context, null)
+                (hotspot == ReadinessStatus.ON) && isLocationOn(context)
             }
         }
     }
@@ -288,6 +302,7 @@ fun ConnectionReadinessSheet(
     var isBluetoothOn by remember { mutableStateOf(ConnectionChecker.isBluetoothOn(context)) }
     var isWifiOn by remember { mutableStateOf(ConnectionChecker.isWifiOn(context)) }
     var isLocationOn by remember { mutableStateOf(ConnectionChecker.isLocationOn(context)) }
+    var isNearbyDevicesOn by remember { mutableStateOf(ConnectionChecker.isNearbyOrLocationOn(context)) }
     var hotspotBroadcastState by remember { mutableIntStateOf(-1) }
     var hotspotStatus by remember { mutableStateOf(ConnectionChecker.checkHotspot(context, null)) }
     var userAcknowledgedHotspot by remember { mutableStateOf(false) }
@@ -296,6 +311,7 @@ fun ConnectionReadinessSheet(
         isBluetoothOn = ConnectionChecker.isBluetoothOn(context)
         isWifiOn = ConnectionChecker.isWifiOn(context)
         isLocationOn = ConnectionChecker.isLocationOn(context)
+        isNearbyDevicesOn = ConnectionChecker.isNearbyOrLocationOn(context)
         hotspotStatus = ConnectionChecker.checkHotspot(context, if (hotspotBroadcastState != -1) hotspotBroadcastState else null)
     }
 
@@ -401,6 +417,12 @@ fun ConnectionReadinessSheet(
         isLocationOn = ConnectionChecker.isLocationOn(context)
     }
 
+    val nearbyDevicesPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        isNearbyDevicesOn = ConnectionChecker.isNearbyOrLocationOn(context)
+    }
+
     // Readiness calculation
     val effectiveHotspotStatus = when {
         hotspotStatus == ReadinessStatus.ON -> ReadinessStatus.ON
@@ -411,10 +433,13 @@ fun ConnectionReadinessSheet(
 
     val allReady = when (mode) {
         ReadinessMode.SEND -> {
-            (effectiveHotspotStatus == ReadinessStatus.ON) && isBluetoothOn && isLocationOn
+            isWifiOn && isBluetoothOn && isNearbyDevicesOn
         }
         ReadinessMode.RECEIVE -> {
             isWifiOn && isBluetoothOn && isLocationOn
+        }
+        ReadinessMode.HOTSPOT_PC -> {
+            (effectiveHotspotStatus == ReadinessStatus.ON) && isBluetoothOn && isLocationOn
         }
     }
 
@@ -454,18 +479,65 @@ fun ConnectionReadinessSheet(
                 when (mode) {
                     ReadinessMode.SEND -> {
                         ReadinessRow(
-                            icon = Icons.Default.WifiTethering,
-                            label = "Hotspot",
-                            status = effectiveHotspotStatus,
+                            icon = Icons.Default.Wifi,
+                            label = "Wi-Fi",
+                            status = if (isWifiOn) ReadinessStatus.ON else ReadinessStatus.OFF,
                             onRowTap = {
-                                ConnectionChecker.openHotspotSettings(context)
-                            },
-                            onPillTap = {
-                                if (effectiveHotspotStatus == ReadinessStatus.UNKNOWN) {
-                                    userAcknowledgedHotspot = true
-                                } else {
-                                    ConnectionChecker.openHotspotSettings(context)
+                                ConnectionChecker.openWifiSettings(context)
+                            }
+                        )
+
+                        ReadinessRow(
+                            icon = Icons.Default.Bluetooth,
+                            label = "Bluetooth",
+                            status = if (isBluetoothOn) ReadinessStatus.ON else ReadinessStatus.OFF,
+                            onRowTap = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                                        bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                                        return@ReadinessRow
+                                    }
                                 }
+                                try {
+                                    enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                                } catch (_: Exception) {
+                                    ConnectionChecker.openAppSettings(context)
+                                }
+                            }
+                        )
+
+                        val isAndroid13Plus = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                        ReadinessRow(
+                            icon = if (isAndroid13Plus) Icons.Default.Wifi else Icons.Default.LocationOn,
+                            label = if (isAndroid13Plus) "Nearby devices" else "Location",
+                            status = if (isNearbyDevicesOn) ReadinessStatus.ON else ReadinessStatus.OFF,
+                            onRowTap = {
+                                if (isAndroid13Plus) {
+                                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+                                        nearbyDevicesPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+                                    } else {
+                                        ConnectionChecker.openAppSettings(context)
+                                    }
+                                } else {
+                                    val hasFine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                                    val hasCoarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                                    if (!hasFine && !hasCoarse) {
+                                        locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+                                    } else {
+                                        ConnectionChecker.openLocationSettings(context)
+                                    }
+                                }
+                            }
+                        )
+                    }
+
+                    ReadinessMode.RECEIVE -> {
+                        ReadinessRow(
+                            icon = Icons.Default.Wifi,
+                            label = "Wi-Fi",
+                            status = if (isWifiOn) ReadinessStatus.ON else ReadinessStatus.OFF,
+                            onRowTap = {
+                                ConnectionChecker.openWifiSettings(context)
                             }
                         )
 
@@ -504,13 +576,20 @@ fun ConnectionReadinessSheet(
                         )
                     }
 
-                    ReadinessMode.RECEIVE -> {
+                    ReadinessMode.HOTSPOT_PC -> {
                         ReadinessRow(
-                            icon = Icons.Default.Wifi,
-                            label = "Wi-Fi",
-                            status = if (isWifiOn) ReadinessStatus.ON else ReadinessStatus.OFF,
+                            icon = Icons.Default.WifiTethering,
+                            label = "Hotspot",
+                            status = effectiveHotspotStatus,
                             onRowTap = {
-                                ConnectionChecker.openWifiSettings(context)
+                                ConnectionChecker.openHotspotSettings(context)
+                            },
+                            onPillTap = {
+                                if (effectiveHotspotStatus == ReadinessStatus.UNKNOWN) {
+                                    userAcknowledgedHotspot = true
+                                } else {
+                                    ConnectionChecker.openHotspotSettings(context)
+                                }
                             }
                         )
 

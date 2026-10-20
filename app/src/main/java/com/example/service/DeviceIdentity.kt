@@ -148,7 +148,7 @@ data class DeviceIdentity(
                 return legacy
             }
             val model = if (!Build.MODEL.isNullOrBlank()) Build.MODEL else "Android Device"
-            val shortCode = get(context).shortCode
+            val shortCode = getShortCodeFromUuid(getInstallUuid(context))
             return "$model · $shortCode"
         }
 

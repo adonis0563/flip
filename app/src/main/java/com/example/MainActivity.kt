@@ -77,6 +77,7 @@ class MainActivity : FragmentActivity() {
         
         // Initialize storage directory safely
         com.example.service.StorageService.appFilesDir = getExternalFilesDir(null)
+        com.example.service.StorageService.appCacheDir = cacheDir
 
         // Initialize foreground tracking and notification channels
         com.example.service.AppForegroundTracker.init(application)
@@ -94,6 +95,9 @@ class MainActivity : FragmentActivity() {
             permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
             permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+            // Wi-Fi Direct and Notification permissions for Android 13+ (API 33+)
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         } else {
             permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
             permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
@@ -116,6 +120,8 @@ class MainActivity : FragmentActivity() {
         }
 
         ThemeManager.init(this)
+        com.example.service.ConnectedDevicesStore.init(this)
+        com.example.service.PcHotspotReminderPreferences.init(this)
 
         val hasStoragePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
@@ -141,6 +147,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        com.example.service.PackageInstallerHelper.checkPendingInstall(this)
         val hasStoragePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED ||
@@ -170,6 +177,13 @@ class MainActivity : FragmentActivity() {
         if (intent == null) return
         if (intent.getBooleanExtra("open_explorer", false)) {
             viewModel.triggerOpenExplorer()
+        }
+        val installPath = intent.getStringExtra("install_file_path")
+        if (!installPath.isNullOrEmpty()) {
+            val file = java.io.File(installPath)
+            if (file.exists()) {
+                com.example.service.PackageInstallerHelper.install(this, file)
+            }
         }
         val action = intent.action
         val type = intent.type

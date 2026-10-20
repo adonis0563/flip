@@ -285,8 +285,8 @@ class HttpServerService(private val context: android.content.Context, private va
             return
         }
 
-        val partialFile = StorageService.getPartialFile(transferId, fileName)
-        val offsetFile = StorageService.getOffsetFile(transferId, fileName)
+        val partialFile = StorageService.getPartialFile(transferId, fileName, context)
+        val offsetFile = StorageService.getOffsetFile(transferId, fileName, context)
 
         listener.onFileTransferStarted(transferId, fileName, fileSize, isIncoming = true)
 

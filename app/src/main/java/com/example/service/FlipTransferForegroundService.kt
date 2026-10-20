@@ -4,13 +4,55 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.model.Device
+import com.example.service.control.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Unified state machine for First-Time Pairing and Connection.
+ *
+ * Sequence:
+ * Idle → Joining → AwaitingLink → Handshaking → Connected(peerUuid, peerName) | Failed(reason)
+ *
+ * "Connected" is set ONLY here, only after the full 4-way control handshake
+ * (HELLO, HELLO_ACK, READY, READY_ACK) completes on port 8081.
+ */
+sealed class FirstTimeConnectionState {
+    object Idle : FirstTimeConnectionState()
+
+    data class Joining(
+        val peerName: String,
+        val shortCode: String
+    ) : FirstTimeConnectionState()
+
+    data class AwaitingLink(
+        val peerName: String,
+        val shortCode: String
+    ) : FirstTimeConnectionState()
+
+    data class Handshaking(
+        val peerName: String,
+        val shortCode: String
+    ) : FirstTimeConnectionState()
+
+    data class Connected(
+        val peerUuid: String,
+        val peerName: String
+    ) : FirstTimeConnectionState()
+
+    data class Failed(
+        val reason: String
+    ) : FirstTimeConnectionState()
+}
 
 class FlipTransferForegroundService : Service() {
 
@@ -65,9 +107,6 @@ class FlipTransferForegroundService : Service() {
         Log.d(TAG, "[SERVICE] Task removed from recents; service remains active while connected.")
     }
 
-    /**
-     * Android 15 (API 35+) dataSync timeout callback
-     */
     override fun onTimeout(startId: Int, fgsType: Int) {
         super.onTimeout(startId, fgsType)
         Log.w(TAG, "[SERVICE] Foreground service timeout reached for fgsType: $fgsType")
@@ -86,6 +125,7 @@ class FlipTransferForegroundService : Service() {
         serviceScope.cancel()
         pendingGates.values.forEach { it.complete(false) }
         pendingGates.clear()
+        teardownFirstTimeConnection()
         ConnectionSessionManager.updateDisconnected()
         TransferNotificationManager.cancelAllNotifications(this)
         instance = null
@@ -114,10 +154,325 @@ class FlipTransferForegroundService : Service() {
 
         private val pendingGates = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
+        // --- SINGLE CONNECTION STATE MACHINE ---
+        private val _connectionFlowState = MutableStateFlow<FirstTimeConnectionState>(FirstTimeConnectionState.Idle)
+        val connectionFlowState: StateFlow<FirstTimeConnectionState> = _connectionFlowState.asStateFlow()
+
+        private var senderServer: HandshakeServer? = null
+        private var receiverClient: HandshakeClient? = null
+        private var hotspotJoinHelper: HotspotJoinHelper? = null
+        private var receiverFlowJob: Job? = null
+        private var flowScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+        private var connectionStartTime: Long = 0L
+
+        /**
+         * SENDER: Starts HandshakeServer when "Waiting for receiver" screen opens.
+         * Keeps it running for the whole screen and stops it on cancel or screen close.
+         */
+        @Synchronized
+        fun startSenderControl(context: Context) {
+            teardownFirstTimeConnection()
+            connectionStartTime = System.currentTimeMillis()
+            _connectionFlowState.value = FirstTimeConnectionState.Idle
+            ControlChannelConstants.logStep(step = "sender_waiting_start", elapsedMs = 0)
+
+            val ownIdentity = DeviceIdentity.get(context)
+            val server = HandshakeServer()
+            senderServer = server
+
+            server.start(
+                ownIdentity = ownIdentity,
+                port = ControlChannelConstants.PORT,
+                onPeerConnected = { peerUuid, peerName ->
+                    val elapsed = System.currentTimeMillis() - connectionStartTime
+                    ControlChannelConstants.logStep(
+                        step = "connected",
+                        peerId = peerUuid,
+                        elapsedMs = elapsed
+                    )
+                    // Save the peer (uuid and name, no credentials)
+                    HotspotCredentialStore.saveKnownReceiver(context, peerUuid, peerName)
+
+                    // Single source of truth sets Connected state
+                    _connectionFlowState.value = FirstTimeConnectionState.Connected(
+                        peerUuid = peerUuid,
+                        peerName = peerName
+                    )
+
+                    // Continue to the transfer flow
+                    val remoteDev = Device(
+                        id = peerUuid,
+                        name = peerName,
+                        ip = "0.0.0.0",
+                        port = 8080
+                    )
+                    start(context, remoteDev, "SENDER")
+                },
+                onPeerLost = {
+                    val elapsed = System.currentTimeMillis() - connectionStartTime
+                    ControlChannelConstants.logStep(
+                        step = "peer_lost",
+                        elapsedMs = elapsed
+                    )
+                    teardownFirstTimeConnection()
+                    _connectionFlowState.value = FirstTimeConnectionState.Failed("Connection lost.")
+                }
+            )
+        }
+
+        /**
+         * RECEIVER: Initiates first-time connection flow using joinHotspot and HandshakeClient.
+         */
+        @Synchronized
+        fun startReceiverFlow(
+            context: Context,
+            credentials: WifiCredentials,
+            peerUuid: String,
+            peerName: String,
+            onConnected: (gatewayAddress: String) -> Unit
+        ) {
+            teardownFirstTimeConnection()
+            connectionStartTime = System.currentTimeMillis()
+
+            val normPeerUuid = ControlChannelConstants.normalizeUuid(peerUuid)
+            val shortCode = ControlChannelConstants.getShortCode(normPeerUuid)
+            val ownIdentity = DeviceIdentity.get(context)
+
+            val joiner = HotspotJoinHelper(
+                context = context,
+                onNetworkLost = {
+                    val elapsed = System.currentTimeMillis() - connectionStartTime
+                    ControlChannelConstants.logStep(step = "network_lost", peerId = normPeerUuid, elapsedMs = elapsed)
+                    if (_connectionFlowState.value is FirstTimeConnectionState.Connected) {
+                        teardownFirstTimeConnection()
+                        _connectionFlowState.value = FirstTimeConnectionState.Failed("Connection lost. The sender's hotspot may have turned off.")
+                    }
+                }
+            )
+            hotspotJoinHelper = joiner
+
+            val client = HandshakeClient()
+            receiverClient = client
+
+            receiverFlowJob = flowScope.launch {
+                // Step 1: Joining hotspot
+                _connectionFlowState.value = FirstTimeConnectionState.Joining(peerName, shortCode)
+                ControlChannelConstants.logStep(
+                    step = "joining_hotspot",
+                    peerId = normPeerUuid,
+                    elapsedMs = System.currentTimeMillis() - connectionStartTime
+                )
+
+                val joinResult = joiner.joinHotspot(credentials, timeoutMs = 30000)
+
+                if (joinResult !is JoinResult.Joined) {
+                    val elapsed = System.currentTimeMillis() - connectionStartTime
+                    val failReason = (joinResult as? JoinResult.Failed)?.reason ?: JoinResult.FailReason.Unavailable
+                    ControlChannelConstants.logStep(
+                        step = "join_failed",
+                        peerId = normPeerUuid,
+                        detail = failReason.name,
+                        elapsedMs = elapsed
+                    )
+
+                    teardownFirstTimeConnection()
+
+                    val message = when (failReason) {
+                        JoinResult.FailReason.Unavailable, JoinResult.FailReason.Timeout -> {
+                            val isSsidSeen = isSsidVisible(context, credentials.ssid)
+                            if (isSsidSeen) {
+                                "Couldn't connect. The password may be wrong, or the connection wasn't approved."
+                            } else {
+                                "Couldn't find $peerName's hotspot. Make sure it's on and close by."
+                            }
+                        }
+                        JoinResult.FailReason.NoIp -> {
+                            "Connected to the hotspot but got no address. Try again."
+                        }
+                        JoinResult.FailReason.Unsupported -> {
+                            "Auto-connect is not supported on this Android version."
+                        }
+                        JoinResult.FailReason.Cancelled -> {
+                            _connectionFlowState.value = FirstTimeConnectionState.Idle
+                            return@launch
+                        }
+                    }
+
+                    _connectionFlowState.value = FirstTimeConnectionState.Failed(message)
+                    return@launch
+                }
+
+                // Step 2: AwaitingLink
+                _connectionFlowState.value = FirstTimeConnectionState.AwaitingLink(peerName, shortCode)
+                ControlChannelConstants.logStep(
+                    step = "awaiting_link",
+                    peerId = normPeerUuid,
+                    elapsedMs = System.currentTimeMillis() - connectionStartTime
+                )
+
+                delay(1500L) // Small pause as network stack settles right after joining
+
+                // Step 3: Handshaking (run HandshakeClient up to 3 attempts, 1.5s apart)
+                var handshakeSuccess = false
+                var lastFailResult: HandshakeResult? = null
+
+                for (attempt in 1..3) {
+                    if (!isActive) break
+
+                    _connectionFlowState.value = FirstTimeConnectionState.Handshaking(peerName, shortCode)
+                    ControlChannelConstants.logStep(
+                        step = "handshake_attempt_$attempt",
+                        peerId = normPeerUuid,
+                        elapsedMs = System.currentTimeMillis() - connectionStartTime
+                    )
+
+                    val res = client.connect(
+                        host = joinResult.gatewayAddress,
+                        expectedPeerUuid = normPeerUuid,
+                        ownIdentity = ownIdentity,
+                        port = ControlChannelConstants.PORT,
+                        onPeerLost = {
+                            val elapsed = System.currentTimeMillis() - connectionStartTime
+                            ControlChannelConstants.logStep(step = "peer_lost", peerId = normPeerUuid, elapsedMs = elapsed)
+                            if (_connectionFlowState.value is FirstTimeConnectionState.Connected) {
+                                teardownFirstTimeConnection()
+                                _connectionFlowState.value = FirstTimeConnectionState.Failed("Connection lost. The sender's hotspot may have turned off.")
+                            }
+                        }
+                    )
+
+                    if (res is HandshakeResult.Success) {
+                        handshakeSuccess = true
+                        break
+                    } else {
+                        lastFailResult = res
+                        if (attempt < 3 && res !is HandshakeResult.SameDevice && res !is HandshakeResult.IdMismatch) {
+                            delay(1500L)
+                        } else {
+                            break
+                        }
+                    }
+                }
+
+                if (handshakeSuccess) {
+                    val elapsed = System.currentTimeMillis() - connectionStartTime
+                    ControlChannelConstants.logStep(
+                        step = "connected",
+                        peerId = normPeerUuid,
+                        elapsedMs = elapsed
+                    )
+
+                    _connectionFlowState.value = FirstTimeConnectionState.Connected(
+                        peerUuid = normPeerUuid,
+                        peerName = peerName
+                    )
+
+                    // Pass gateway to transfer entry point
+                    onConnected(joinResult.gatewayAddress)
+                } else {
+                    val elapsed = System.currentTimeMillis() - connectionStartTime
+                    ControlChannelConstants.logStep(
+                        step = "handshake_failed",
+                        peerId = normPeerUuid,
+                        detail = lastFailResult?.javaClass?.simpleName ?: "Unknown",
+                        elapsedMs = elapsed
+                    )
+
+                    teardownFirstTimeConnection()
+
+                    val message = when (lastFailResult) {
+                        is HandshakeResult.SameDevice -> {
+                            "That's this phone's own QR code."
+                        }
+                        is HandshakeResult.IdMismatch -> {
+                            // Delete that peer's saved credentials
+                            HotspotCredentialStore.forgetPeer(context, normPeerUuid)
+                            CredentialStore.forgetPeer(context, normPeerUuid)
+                            "This isn't the device you paired with."
+                        }
+                        is HandshakeResult.Timeout, is HandshakeResult.Refused, null -> {
+                            val isSsidSeen = isSsidVisible(context, credentials.ssid)
+                            if (isSsidSeen) {
+                                "Couldn't connect. The password may be wrong, or the connection wasn't approved."
+                            } else {
+                                "Couldn't find $peerName's hotspot. Make sure it's on and close by."
+                            }
+                        }
+                        is HandshakeResult.Malformed -> {
+                            "Couldn't connect to ${peerName}. Try again."
+                        }
+                        else -> {
+                            "Couldn't connect to ${peerName}. Try again."
+                        }
+                    }
+
+                    _connectionFlowState.value = FirstTimeConnectionState.Failed(message)
+                }
+            }
+        }
+
+        private fun isSsidVisible(context: Context, targetSsid: String): Boolean {
+            return try {
+                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                @Suppress("DEPRECATION")
+                wm?.startScan()
+                val results = wm?.scanResults ?: return false
+                val clean = targetSsid.removeSurrounding("\"")
+                results.any {
+                    val s = it.SSID?.removeSurrounding("\"") ?: ""
+                    s.equals(clean, ignoreCase = true)
+                }
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /**
+         * TEARDOWN: Stops heartbeat, closes control sockets, calls leaveHotspot().
+         * Safe to call multiple times.
+         */
+        @Synchronized
+        fun teardownFirstTimeConnection() {
+            receiverFlowJob?.cancel()
+            receiverFlowJob = null
+
+            try {
+                senderServer?.stop()
+            } catch (_: Exception) {}
+            senderServer = null
+
+            try {
+                receiverClient?.close()
+            } catch (_: Exception) {}
+            receiverClient = null
+
+            try {
+                hotspotJoinHelper?.leaveHotspot()
+            } catch (_: Exception) {}
+            hotspotJoinHelper = null
+
+            ControlChannelConstants.logStep(step = "teardown_complete")
+        }
+
+        /**
+         * Returns connection state machine to Idle.
+         */
+        @Synchronized
+        fun resetFirstTimeState() {
+            teardownFirstTimeConnection()
+            _connectionFlowState.value = FirstTimeConnectionState.Idle
+        }
+
         fun start(context: Context, remoteDevice: Device?, role: String? = null) {
             currentRemoteDevice = remoteDevice
             if (remoteDevice != null) {
                 ConnectionSessionManager.updateConnected(remoteDevice, role)
+                ConnectedDevicesStore.recordSession(
+                    context = context,
+                    displayName = remoteDevice.name,
+                    shortCode = DeviceIdentity.getShortCodeFromUuid(remoteDevice.id)
+                )
             }
             val intent = Intent(context, FlipTransferForegroundService::class.java).apply {
                 action = ACTION_START
@@ -130,6 +485,8 @@ class FlipTransferForegroundService : Service() {
         }
 
         fun stop(context: Context) {
+            teardownFirstTimeConnection()
+            _connectionFlowState.value = FirstTimeConnectionState.Idle
             currentRemoteDevice = null
             ConnectionSessionManager.updateDisconnected()
             val intent = Intent(context, FlipTransferForegroundService::class.java).apply {
@@ -141,9 +498,6 @@ class FlipTransferForegroundService : Service() {
             instance?.stopForegroundService()
         }
 
-        /**
-         * Waits up to 60 seconds for user to accept or decline the transfer
-         */
         suspend fun awaitTransferApproval(transferId: String): Boolean {
             val deferred = CompletableDeferred<Boolean>()
             pendingGates[transferId] = deferred

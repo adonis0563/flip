@@ -16,6 +16,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+
 /**
  * Top bar for the Flip home screen.
  * Symmetric layout ensuring the title stays truly centered.
@@ -23,6 +26,7 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun HomeTopBar(
     onOpenSettings: () -> Unit,
+    onOpenDebug: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Box(
@@ -32,14 +36,21 @@ fun HomeTopBar(
             .background(MaterialTheme.colorScheme.background),
         contentAlignment = Alignment.Center
     ) {
-        // Centered Title
+        // Centered Title: long-press opens hidden Wi-Fi Direct debug screen
         Text(
             text = "Flip",
             style = MaterialTheme.typography.titleLarge.copy(
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground
-            )
+            ),
+            modifier = Modifier
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onLongPress = { onOpenDebug() }
+                    )
+                }
+                .testTag("home_title")
         )
 
         // Left Action: Settings button with 48dp minimum touch target

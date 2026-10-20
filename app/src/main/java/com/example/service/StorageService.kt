@@ -9,6 +9,8 @@ import android.provider.MediaStore
 import android.util.Log
 import com.example.model.TransferItem
 import java.io.File
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 data class LocalFileItem(
     val id: Long,
@@ -28,6 +30,24 @@ object StorageService {
     private const val TAG = "StorageService"
     
     var appFilesDir: File? = null
+    var appCacheDir: File? = null
+
+    fun getAppReceivedDirectory(context: Context? = null): File {
+        val cache = context?.cacheDir ?: appCacheDir
+        val receivedDir = if (cache != null) {
+            File(cache, "received")
+        } else {
+            File(getFlipDirectory(), "Received/APKs")
+        }
+        if (!receivedDir.exists()) {
+            receivedDir.mkdirs()
+        }
+        return receivedDir
+    }
+
+    fun isAppFileName(fileName: String): Boolean {
+        return fileName.endsWith(".apk", ignoreCase = true) || fileName.endsWith(".apks", ignoreCase = true)
+    }
     
     // Use Downloads/Flip or appFilesDir as it is easily accessible to users and safe from strict scoped storage restrictions
     fun getFlipDirectory(): File {
@@ -55,30 +75,45 @@ object StorageService {
         return flipDir
     }
 
-    fun getPartialFile(transferId: String, fileName: String): File {
-        return File(getFlipDirectory(), "$fileName.$transferId.partial")
-    }
-
-    fun getOffsetFile(transferId: String, fileName: String): File {
-        return File(getFlipDirectory(), "$fileName.$transferId.offset")
-    }
-
-    fun getUniqueFinalFile(fileName: String): File {
-        val dir = if (fileName.endsWith(".apk", ignoreCase = true)) {
-            val apkDir = File(getFlipDirectory(), "Received/APKs")
-            if (!apkDir.exists()) {
-                apkDir.mkdirs()
-            }
-            apkDir
+    fun getPartialFile(transferId: String, fileName: String, context: Context? = null): File {
+        val dir = if (isAppFileName(fileName)) {
+            getAppReceivedDirectory(context)
         } else {
             getFlipDirectory()
         }
-        var finalFile = File(dir, fileName)
+        return File(dir, "$fileName.$transferId.partial")
+    }
+
+    fun getOffsetFile(transferId: String, fileName: String, context: Context? = null): File {
+        val dir = if (isAppFileName(fileName)) {
+            getAppReceivedDirectory(context)
+        } else {
+            getFlipDirectory()
+        }
+        return File(dir, "$fileName.$transferId.offset")
+    }
+
+    fun getUniqueFinalFile(fileName: String, context: Context? = null): File {
+        val isApp = isAppFileName(fileName)
+        val dir = if (isApp) {
+            getAppReceivedDirectory(context)
+        } else {
+            getFlipDirectory()
+        }
+
+        // Save received app files with the .apk extension (.apks for bundles)
+        val targetName = if (isApp && !fileName.endsWith(".apk", ignoreCase = true) && !fileName.endsWith(".apks", ignoreCase = true)) {
+            "$fileName.apk"
+        } else {
+            fileName
+        }
+
+        var finalFile = File(dir, targetName)
         if (!finalFile.exists()) return finalFile
 
-        val dotIndex = fileName.lastIndexOf('.')
-        val nameWithoutExt = if (dotIndex != -1) fileName.substring(0, dotIndex) else fileName
-        val ext = if (dotIndex != -1) fileName.substring(dotIndex) else ""
+        val dotIndex = targetName.lastIndexOf('.')
+        val nameWithoutExt = if (dotIndex != -1) targetName.substring(0, dotIndex) else targetName
+        val ext = if (dotIndex != -1) targetName.substring(dotIndex) else ""
 
         var counter = 1
         while (finalFile.exists()) {
@@ -91,9 +126,9 @@ object StorageService {
     /**
      * Confirms the exact bytes written to the partial file based on current file length
      */
-    fun getConfirmedOffset(transferId: String, fileName: String): Long {
-        val partialFile = getPartialFile(transferId, fileName)
-        val offsetFile = getOffsetFile(transferId, fileName)
+    fun getConfirmedOffset(transferId: String, fileName: String, context: Context? = null): Long {
+        val partialFile = getPartialFile(transferId, fileName, context)
+        val offsetFile = getOffsetFile(transferId, fileName, context)
         
         if (!partialFile.exists()) {
             offsetFile.delete()
@@ -115,11 +150,11 @@ object StorageService {
      */
     fun finalizeTransfer(context: Context, transferId: String, fileName: String): File? {
         try {
-            val partialFile = getPartialFile(transferId, fileName)
-            val offsetFile = getOffsetFile(transferId, fileName)
+            val partialFile = getPartialFile(transferId, fileName, context)
+            val offsetFile = getOffsetFile(transferId, fileName, context)
             
             if (partialFile.exists()) {
-                val finalFile = getUniqueFinalFile(fileName)
+                val finalFile = getUniqueFinalFile(fileName, context)
                 
                 // Rename partial file to final name first
                 var renamed = partialFile.renameTo(finalFile)
@@ -321,6 +356,7 @@ object StorageService {
                         
                         // Detect split APK
                         val isSplit = !app.splitSourceDirs.isNullOrEmpty()
+                        val fileName = if (isSplit) "$label.apks" else "$label.apk"
                         
                         val appIcon = try {
                             app.loadIcon(pm)
@@ -332,7 +368,7 @@ object StorageService {
                             LocalFileItem(
                                 id = idCounter++,
                                 uri = apkUri,
-                                name = "$label.apk",
+                                name = fileName,
                                 size = size,
                                 mimeType = "application/vnd.android.package-archive",
                                 category = "Apps",
@@ -434,6 +470,41 @@ object StorageService {
             
             val destFile = File(tempDir, item.name)
             onProgress("Extracting ${item.name}...", 0f)
+
+            val splitDirs = appInfo.splitSourceDirs
+            if (!splitDirs.isNullOrEmpty() && (item.isSplitApk || item.name.endsWith(".apks", ignoreCase = true))) {
+                val allApks = mutableListOf(sourceApk)
+                for (splitPath in splitDirs) {
+                    val splitFile = File(splitPath)
+                    if (splitFile.exists()) {
+                        allApks.add(splitFile)
+                    }
+                }
+                val totalSize = allApks.sumOf { it.length() }
+                var bytesCopied = 0L
+
+                ZipOutputStream(destFile.outputStream().buffered()).use { zos ->
+                    for (apk in allApks) {
+                        val entryName = if (apk == sourceApk) "base.apk" else apk.name
+                        zos.putNextEntry(ZipEntry(entryName))
+                        apk.inputStream().buffered().use { input ->
+                            val buffer = ByteArray(1024 * 64)
+                            var bytes = input.read(buffer)
+                            while (bytes >= 0) {
+                                zos.write(buffer, 0, bytes)
+                                bytesCopied += bytes
+                                if (totalSize > 0) {
+                                    onProgress("Extracting ${item.name}...", bytesCopied.toFloat() / totalSize)
+                                }
+                                bytes = input.read(buffer)
+                            }
+                        }
+                        zos.closeEntry()
+                    }
+                }
+                onProgress("Extraction complete", 1f)
+                return destFile
+            }
             
             val totalSize = sourceApk.length()
             var bytesCopied = 0L

@@ -225,20 +225,75 @@ fun SettingsScreen(
                 }
             }
 
-            // Section: Paired Devices
+            // Section: PC Connection
+            item {
+                Text(
+                    text = "PC Connection",
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp
+                    ),
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+                )
+            }
+
+            // Setting row: Hotspot Reminder Toggle
             item {
                 val context = androidx.compose.ui.platform.LocalContext.current
-                val pairedPeers by com.example.service.HotspotCredentialStore.pairedPeersFlow.collectAsState()
-                LaunchedEffect(Unit) {
-                    com.example.service.HotspotCredentialStore.initFlow(context)
-                }
-                var showPairDeviceScanner by remember { mutableStateOf(false) }
+                val showReminder by com.example.service.PcHotspotReminderPreferences.reminderFlow.collectAsState()
 
-                if (showPairDeviceScanner) {
-                    PairingScannerDialog(
-                        onDismiss = { showPairDeviceScanner = false },
-                        onPairedSuccess = { _, _ -> }
-                    )
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 4.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Hotspot Reminder",
+                                style = MaterialTheme.typography.bodyLarge.copy(
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            )
+                            Text(
+                                text = "Show reminder before connecting to PC",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Switch(
+                            checked = showReminder,
+                            onCheckedChange = { isChecked ->
+                                com.example.service.PcHotspotReminderPreferences.setShowReminder(context, isChecked)
+                            },
+                            modifier = Modifier.testTag("hotspot_reminder_switch")
+                        )
+                    }
+                }
+            }
+
+            // Section: Connected Devices
+            item {
+                val context = androidx.compose.ui.platform.LocalContext.current
+                val activeSession by com.example.service.ConnectionSessionManager.session.collectAsState()
+                val pastDevices by com.example.service.ConnectedDevicesStore.pastDevicesFlow.collectAsState()
+
+                LaunchedEffect(Unit) {
+                    com.example.service.ConnectedDevicesStore.init(context)
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
@@ -250,47 +305,33 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Paired Devices",
+                        text = "Connected Devices",
                         style = MaterialTheme.typography.labelMedium.copy(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 12.sp
                         )
                     )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        FilledTonalButton(
-                            onClick = { showPairDeviceScanner = true },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                            modifier = Modifier
-                                .height(32.dp)
-                                .testTag("pair_device_button")
-                        ) {
-                            Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(14.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Pair device", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
-                        }
 
-                        if (pairedPeers.isNotEmpty()) {
-                            TextButton(
-                                onClick = {
-                                    com.example.service.HotspotCredentialStore.forgetAllPeers(context)
-                                },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    "Forget all",
-                                    color = AccentRed,
-                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
-                                )
-                            }
+                    if (pastDevices.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                com.example.service.ConnectedDevicesStore.clearList(context)
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                "Clear list",
+                                color = AccentRed,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                            )
                         }
                     }
                 }
 
-                if (pairedPeers.isEmpty()) {
+                val hasActiveSession = activeSession.isConnected && activeSession.remoteDevice != null
+
+                if (!hasActiveSession && pastDevices.isEmpty()) {
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -300,7 +341,7 @@ fun SettingsScreen(
                         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
                     ) {
                         Text(
-                            text = "No paired devices yet. Devices you pair with for auto-connect will appear here.",
+                            text = "No connected devices yet. Devices you connect with will appear here.",
                             style = MaterialTheme.typography.bodySmall.copy(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             ),
@@ -308,14 +349,15 @@ fun SettingsScreen(
                         )
                     }
                 } else {
-                    pairedPeers.forEach { peer ->
+                    // 1. Current session's device first
+                    if (hasActiveSession) {
                         Card(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 20.dp, vertical = 4.dp),
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                             shape = RoundedCornerShape(16.dp),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
                         ) {
                             Row(
                                 modifier = Modifier
@@ -329,61 +371,79 @@ fun SettingsScreen(
                                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
                                         Text(
-                                            text = "${peer.displayName} · ${peer.shortCode}",
+                                            text = "${activeSession.peerName} · ${activeSession.shortCode}",
                                             style = MaterialTheme.typography.bodyLarge.copy(
-                                                fontWeight = FontWeight.SemiBold,
+                                                fontWeight = FontWeight.Bold,
                                                 color = MaterialTheme.colorScheme.onSurface
                                             )
                                         )
-                                        if (peer.needsRePair) {
-                                            Surface(
-                                                shape = RoundedCornerShape(6.dp),
-                                                color = MaterialTheme.colorScheme.errorContainer
-                                            ) {
-                                                Text(
-                                                    text = "Needs re-pair",
-                                                    style = MaterialTheme.typography.labelSmall.copy(
-                                                        color = MaterialTheme.colorScheme.onErrorContainer,
-                                                        fontWeight = FontWeight.Bold
-                                                    ),
-                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                                )
-                                            }
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+                                        ) {
+                                            Text(
+                                                text = "Current session",
+                                                style = MaterialTheme.typography.labelSmall.copy(
+                                                    color = MaterialTheme.colorScheme.primary,
+                                                    fontWeight = FontWeight.Bold
+                                                ),
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
                                         }
                                     }
-                                    val formattedTime = remember(peer.lastConnected) {
-                                        java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
-                                            .format(java.util.Date(peer.lastConnected))
-                                    }
                                     Text(
-                                        text = "Last connected: $formattedTime",
+                                        text = "Active connection",
                                         style = MaterialTheme.typography.bodySmall.copy(
                                             color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     )
                                 }
+                            }
+                        }
+                    }
 
-                                if (peer.needsRePair) {
-                                    FilledTonalButton(
-                                        onClick = {
-                                            showPairDeviceScanner = true
-                                        },
-                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                        modifier = Modifier.height(34.dp)
-                                    ) {
-                                        Text("Re-pair", style = MaterialTheme.typography.labelMedium)
-                                    }
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                }
-
-                                TextButton(
-                                    onClick = {
-                                        com.example.service.HotspotCredentialStore.forgetPeer(context, peer.peerDeviceId)
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                    modifier = Modifier.height(34.dp)
+                    // 2. Last 10 devices from past sessions
+                    pastDevices.forEach { dev ->
+                        // Don't show duplicate if currently active
+                        val isActive = hasActiveSession && activeSession.shortCode.equals(dev.shortCode, ignoreCase = true)
+                        if (!isActive) {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 20.dp, vertical = 4.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text("Forget", color = AccentRed, style = MaterialTheme.typography.labelMedium)
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "${dev.displayName} · ${dev.shortCode}",
+                                            style = MaterialTheme.typography.bodyLarge.copy(
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                        )
+                                        val formattedTime = remember(dev.lastConnected) {
+                                            if (dev.lastConnected > 0) {
+                                                java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
+                                                    .format(java.util.Date(dev.lastConnected))
+                                            } else {
+                                                "Recent"
+                                            }
+                                        }
+                                        Text(
+                                            text = "Last connected: $formattedTime",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        )
+                                    }
                                 }
                             }
                         }

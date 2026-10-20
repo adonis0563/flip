@@ -118,8 +118,14 @@ class BleDiscoveryService(
     // -------------------------------------------------------------
 
     @Synchronized
-    fun startAdvertising(localIp: String, port: Int, deviceId: String, deviceName: String) {
-        Log.d(TAG, "[BLE] start advertising requested: IP=$localIp, Port=$port, Device=$deviceName")
+    fun startAdvertising(
+        localIp: String,
+        port: Int,
+        deviceId: String,
+        deviceName: String,
+        flags: Byte = 0x01
+    ) {
+        Log.d(TAG, "[BLE] start advertising requested: IP=$localIp, Port=$port, Device=$deviceName, Flags=$flags")
 
         val adapter = bluetoothAdapter
         if (adapter == null) {
@@ -170,8 +176,9 @@ class BleDiscoveryService(
             // [0..3]: IPv4 (4 bytes)
             // [4..5]: Port (2 bytes, big endian)
             // [6..9]: DeviceId truncated/hash (4 bytes)
-            // [10..]: Truncated device name (up to 10 bytes to stay under 31-byte advertising packet limit)
-            val serviceDataBytes = encodeServiceData(localIp, port, deviceId, deviceName)
+            // [10]: Flags byte (bit 0 = ready, bit 1 = transport: 0=hotspot, 1=wfd)
+            // [11..]: Truncated device name (up to 10 bytes)
+            val serviceDataBytes = encodeServiceData(localIp, port, deviceId, deviceName, flags)
 
             // 2. Start GATT Server to respond to read requests with full metadata
             startGattServer(localIp, port, deviceId, deviceName)
@@ -427,6 +434,7 @@ class BleDiscoveryService(
         } catch (e: Exception) {
             Log.w(TAG, "[BLE] Exception stopping scan: ${e.message}")
         } finally {
+            discoveredDeviceKeys.clear()
             scanCallback = null
             scanner = null
             isScanning = false
@@ -445,11 +453,11 @@ class BleDiscoveryService(
         try {
             val decodedDevice = decodeServiceData(serviceData, result.device)
             if (decodedDevice != null) {
-                val dedupeKey = "${decodedDevice.ip}:${decodedDevice.port}"
+                val dedupeKey = "${decodedDevice.id}:${decodedDevice.ip}:${decodedDevice.port}"
                 if (discoveredDeviceKeys.add(dedupeKey)) {
-                    Log.i(TAG, "[BLE] Device found: ${decodedDevice.name} at ${decodedDevice.ip}:${decodedDevice.port} (id: ${decodedDevice.id})")
-                    listener?.onDeviceDiscovered(decodedDevice)
+                    Log.i(TAG, "[BLE] Device found: ${decodedDevice.name} at ${decodedDevice.ip}:${decodedDevice.port} (id: ${decodedDevice.id}, flags: ${decodedDevice.flags})")
                 }
+                listener?.onDeviceDiscovered(decodedDevice)
             }
         } catch (e: Exception) {
             Log.e(TAG, "[BLE] Error decoding scan result: ${e.message}")
@@ -458,16 +466,23 @@ class BleDiscoveryService(
 
     /**
      * Compact binary encoding for service data:
-     * - 4 bytes: IPv4
+     * - 4 bytes: IPv4 (zeros for Wi-Fi Direct senders)
      * - 2 bytes: Port (Big Endian)
      * - 4 bytes: Device ID prefix / hash
+     * - 1 byte: Flags (bit 0 = ready, bit 1 = transport: 0=hotspot, 1=wfd)
      * - Remaining: Device name in UTF-8
      */
-    private fun encodeServiceData(ip: String, port: Int, deviceId: String, deviceName: String): ByteArray {
+    private fun encodeServiceData(
+        ip: String,
+        port: Int,
+        deviceId: String,
+        deviceName: String,
+        flags: Byte = 0x01
+    ): ByteArray {
         val ipBytes = try {
             InetAddress.getByName(ip).address
         } catch (e: Exception) {
-            byteArrayOf(127, 0, 0, 1)
+            byteArrayOf(0, 0, 0, 0)
         }
 
         val idBytes = deviceId.take(4).toByteArray(Charsets.UTF_8).let {
@@ -479,10 +494,11 @@ class BleDiscoveryService(
             if (it.size > 10) it.copyOf(10) else it
         }
 
-        val buffer = ByteBuffer.allocate(4 + 2 + 4 + nameBytes.size)
+        val buffer = ByteBuffer.allocate(4 + 2 + 4 + 1 + nameBytes.size)
         buffer.put(ipBytes)
         buffer.putShort(port.toShort())
         buffer.put(idBytes)
+        buffer.put(flags)
         buffer.put(nameBytes)
         return buffer.array()
     }
@@ -502,6 +518,9 @@ class BleDiscoveryService(
         buffer.get(idBytes)
         val idPrefix = String(idBytes, Charsets.UTF_8).trim('\u0000')
 
+        // Read flags if present (spare byte at offset 10)
+        val flags = if (buffer.remaining() > 0 && bytes.size > 10) buffer.get() else 0x01.toByte()
+
         val remaining = buffer.remaining()
         val name = if (remaining > 0) {
             val nameBytes = ByteArray(remaining)
@@ -519,7 +538,8 @@ class BleDiscoveryService(
             ip = ip,
             port = port,
             deviceType = "Android BLE",
-            lastSeen = System.currentTimeMillis()
+            lastSeen = System.currentTimeMillis(),
+            flags = flags
         )
     }
 }

@@ -14,6 +14,7 @@ import com.example.model.Device
 import com.example.model.TransferItem
 import com.example.model.TransferStatus
 import com.example.service.*
+import com.example.service.control.HandshakeClient
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -48,7 +49,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val context = getApplication<Application>().applicationContext
     private val transferService = TransferService(context)
     private val bleService = BleDiscoveryService(context, this)
+    val wifiDirectClient = WifiDirectClient(context)
+    val wifiDirectHost = WifiDirectHost(context)
+    private var handshakeClient: HandshakeClient? = null
     private var httpServerService: HttpServerService? = null
+    private var directSenderTimeoutJob: Job? = null
 
     // UI state flows
     private val _connectionState = MutableStateFlow(ConnectionState.IDLE)
@@ -56,6 +61,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     private val _role = MutableStateFlow<String?>(null) // "SENDER" or "RECEIVER"
     val role: StateFlow<String?> = _role.asStateFlow()
+
+    private val _directSenderPayloadUri = MutableStateFlow<String?>(null)
+    val directSenderPayloadUri: StateFlow<String?> = _directSenderPayloadUri.asStateFlow()
 
     private val _localDevice = MutableStateFlow<Device?>(null)
     val localDevice: StateFlow<Device?> = _localDevice.asStateFlow()
@@ -89,7 +97,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     val autoJoinManager: AutoJoinManager = ConnectionSessionManager.getAutoJoinManager(context)
     val autoJoinState: StateFlow<AutoJoinState> = autoJoinManager.state
-    val pairedPeers: StateFlow<List<PairedPeer>> = HotspotCredentialStore.pairedPeersFlow
+
+
+    val connectionFlowState: StateFlow<com.example.service.FirstTimeConnectionState> =
+        com.example.service.FlipTransferForegroundService.connectionFlowState
 
     fun triggerOpenExplorer() {
         _openExplorerEvent.value = true
@@ -97,6 +108,12 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     fun consumeOpenExplorer() {
         _openExplorerEvent.value = false
+    }
+
+    fun setHandshakeClient(client: HandshakeClient?) {
+        synchronized(this) {
+            this.handshakeClient = client
+        }
     }
 
     fun acceptIncomingRequest(transferId: String) {
@@ -159,10 +176,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             StorageService.cleanupTempTransferFiles(context)
         }
 
-        // Initialize local device profile with stable per-install ID and session ID
-        HotspotCredentialStore.initFlow(context)
+        // Initialize local device profile with stable per-install UUID and session ID
         val identity = DeviceIdentity.get(context)
-        val devId = DeviceIdentity.normalizeUuid(identity.uuid)
+        val devId = identity.uuid
         val devName = identity.displayName
         val localIp = NetworkUtils.getLocalIpAddress() ?: "127.0.0.1"
         _localDevice.value = Device(
@@ -201,9 +217,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                         _role.value = session.role
                     }
                 } else if (!session.isConnected && _connectionState.value == ConnectionState.CONNECTED) {
-                    _connectionState.value = ConnectionState.IDLE
-                    _remoteDevice.value = null
-                    _role.value = null
+                    performDisconnectCleanup()
                 }
             }
         }
@@ -220,7 +234,6 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             .edit()
             .putString("device_name", trimmed)
             .apply()
-        HotspotCredentialStore.notifyPeersChanged(context)
     }
 
     fun clearToast() {
@@ -258,7 +271,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     bleService.startAdvertising(
                         localIp = updatedLocal.ip,
                         port = updatedLocal.port,
-                        deviceId = updatedLocal.id,
+                        deviceId = DeviceIdentity.getStableDeviceId(context),
                         deviceName = updatedLocal.name
                     )
                 }
@@ -270,6 +283,175 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 }
             }
         }
+    }
+
+    /**
+     * Prepares local HTTP transfer server for Wi-Fi Direct sender mode.
+     */
+    fun startDirectSenderMode() {
+        _role.value = "SENDER"
+        _directSenderPayloadUri.value = null
+        directSenderTimeoutJob?.cancel()
+        directSenderTimeoutJob = viewModelScope.launch {
+            delay(120_000L)
+            if (_connectionState.value != ConnectionState.CONNECTED) {
+                Log.w("FlipViewModel", "[WFD_SENDER] 2-minute timeout reached with no receiver connection; resetting to home")
+                withContext(Dispatchers.Main) {
+                    showToast("Connection timed out after 2 minutes")
+                }
+                resetToHome()
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 1. Start local HTTP transfer server
+                if (httpServerService == null) {
+                    val server = HttpServerService(context, this@FlipViewModel)
+                    val port = server.startServer()
+                    httpServerService = server
+                    _isServerRunning.value = true
+                    val updatedLocal = _localDevice.value?.copy(port = port)
+                    _localDevice.value = updatedLocal
+                    Log.i("FlipViewModel", "[TRANSFER] Direct sender HTTP server started on port $port")
+                }
+
+                // 2. Start sender control channel
+                try {
+                    FlipTransferForegroundService.startSenderControl(context)
+                } catch (e: Exception) {
+                    Log.w("FlipViewModel", "[WFD_SENDER] Handshake server initialization: ${e.message}")
+                }
+
+                // 3. Start Wi-Fi Direct host
+                val clientJoinedCb: (String) -> Unit = { ownerIp ->
+                    Log.i("FlipViewModel", "[WFD_SENDER] Receiver joined Wi-Fi Direct group at radio level (owner IP: $ownerIp)")
+                }
+
+                val result = wifiDirectHost.start(clientJoinedCallback = clientJoinedCb)
+
+                when (result) {
+                    is HostResult.GroupReady -> {
+                        Log.i("FlipViewModel", "[WFD_SENDER] Group ready: ${result.networkName}")
+                        val currentLocal = _localDevice.value
+                        val devId = currentLocal?.id ?: DeviceIdentity.get(context).uuid
+                        val devName = currentLocal?.name ?: DeviceIdentity.get(context).displayName
+
+                        val payloadUri = WifiDirectPayloadParser.build(
+                            deviceId = devId,
+                            deviceName = devName,
+                            groupName = result.networkName,
+                            passphrase = result.passphrase,
+                            ownerAddress = result.ownerDeviceAddress
+                        )
+                        _directSenderPayloadUri.value = payloadUri
+
+                        // Start BLE Advertising
+                        val port = currentLocal?.port ?: 8080
+                        bleService.startAdvertising(
+                            localIp = "0.0.0.0",
+                            port = port,
+                            deviceId = DeviceIdentity.getStableDeviceId(context),
+                            deviceName = devName,
+                            flags = 0x03.toByte()
+                        )
+                    }
+                    is HostResult.Unsupported -> {
+                        Log.e("FlipViewModel", "[WFD_SENDER] Unsupported OS version")
+                        withContext(Dispatchers.Main) { showToast("Wi-Fi Direct hosting requires Android 10 or newer.") }
+                    }
+                    is HostResult.PermissionMissing -> {
+                        Log.e("FlipViewModel", "[WFD_SENDER] Permissions missing")
+                        withContext(Dispatchers.Main) { showToast("Required Wi-Fi or Nearby Devices permissions are missing.") }
+                    }
+                    is HostResult.Busy -> {
+                        Log.e("FlipViewModel", "[WFD_SENDER] Wi-Fi Direct is busy")
+                        withContext(Dispatchers.Main) { showToast("Wi-Fi Direct is currently busy. Please try again.") }
+                    }
+                    is HostResult.Error -> {
+                        Log.e("FlipViewModel", "[WFD_SENDER] Wi-Fi Direct error: ${result.code}")
+                        withContext(Dispatchers.Main) { showToast("Failed to start Wi-Fi Direct (Error ${result.code}).") }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("FlipViewModel", "[TRANSFER] Error starting direct sender mode: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Connects to the joined client and enters the transfer flow.
+     */
+    fun onDirectClientConnected(ownerIp: String, port: Int = 8080, peerId: String = "", peerName: String = "") {
+        directSenderTimeoutJob?.cancel()
+        directSenderTimeoutJob = null
+        viewModelScope.launch(Dispatchers.Main) {
+            bleService.stopScanning()
+            bleService.stopAdvertising()
+            val remote = Device(
+                id = if (peerId.isNotBlank()) peerId else java.util.UUID.randomUUID().toString(),
+                name = if (peerName.isNotBlank()) peerName else "Receiver",
+                ip = ownerIp,
+                port = port
+            )
+            _remoteDevice.value = remote
+            _role.value = "SENDER"
+            _connectionState.value = ConnectionState.CONNECTED
+            FlipTransferForegroundService.start(context, remote, "SENDER")
+            showToast("Connected to ${remote.name}")
+            checkAndQueuePreSelected()
+        }
+    }
+
+    fun onDirectReceiverConnected(
+        ownerIp: String,
+        port: Int = 8080,
+        peerId: String = "",
+        peerName: String = "",
+        handshakeClient: HandshakeClient? = null,
+        onDone: (Boolean, String?) -> Unit
+    ) {
+        if (handshakeClient != null) {
+            setHandshakeClient(handshakeClient)
+        }
+        val currentLocal = _localDevice.value
+        if (currentLocal == null) {
+            onDone(false, "Local device not ready")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            transferService.connectToDevice(
+                remoteIp = ownerIp,
+                remotePort = port,
+                localDevice = currentLocal,
+                onSuccess = { remote ->
+                    viewModelScope.launch(Dispatchers.Main) {
+                        bleService.stopScanning()
+                        bleService.stopAdvertising()
+                        _remoteDevice.value = remote
+                        _role.value = "RECEIVER"
+                        _connectionState.value = ConnectionState.CONNECTED
+                        FlipTransferForegroundService.start(context, remote, "RECEIVER")
+                        showToast("Connected to ${remote.name}")
+                        checkAndQueuePreSelected()
+                        onDone(true, null)
+                    }
+                },
+                onError = { err ->
+                    Log.e("FlipViewModel", "Failed to connect to direct sender: $err")
+                    onDone(false, err)
+                }
+            )
+        }
+    }
+
+    fun onDirectReceiverConnected(
+        ownerIp: String,
+        port: Int = 8080,
+        peerId: String = "",
+        peerName: String = "",
+        onDone: (Boolean, String?) -> Unit
+    ) {
+        onDirectReceiverConnected(ownerIp, port, peerId, peerName, null, onDone)
     }
 
     /**
@@ -329,8 +511,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 onSuccess = { remote ->
                     bleService.stopScanning()
                     _remoteDevice.value = remote
+                    _role.value = "RECEIVER"
                     _connectionState.value = ConnectionState.CONNECTED
-                    FlipTransferForegroundService.start(context, remote)
+                    FlipTransferForegroundService.start(context, remote, "RECEIVER")
                     showToast("Connected to ${remote.name}")
                     checkAndQueuePreSelected()
                 }
@@ -347,8 +530,9 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 onSuccess = { remote ->
                     bleService.stopScanning()
                     _remoteDevice.value = remote
+                    _role.value = "RECEIVER"
                     _connectionState.value = ConnectionState.CONNECTED
-                    FlipTransferForegroundService.start(context, remote)
+                    FlipTransferForegroundService.start(context, remote, "RECEIVER")
                     showToast("Connected to ${remote.name}")
                     checkAndQueuePreSelected()
                 },
@@ -377,13 +561,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     bleService.stopScanning()
                     bleService.stopAdvertising()
                     _remoteDevice.value = remote
+                    _role.value = "RECEIVER"
                     _connectionState.value = ConnectionState.CONNECTED
-                    FlipTransferForegroundService.start(context, remote)
+                    FlipTransferForegroundService.start(context, remote, "RECEIVER")
                     showToast("Connected to ${remote.name}")
                     checkAndQueuePreSelected()
                 },
                 onError = { err ->
-                    _connectionState.value = ConnectionState.IDLE
+                    performDisconnectCleanup()
                     showToast("Failed to connect: $err")
                 }
             )
@@ -404,11 +589,83 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         showToast("Disconnected")
     }
 
-    private fun performDisconnectCleanup() {
-        FlipTransferForegroundService.stop(context)
+    fun performDisconnectCleanup() {
+        Log.i("FlipViewModel", "[CLEANUP] Starting performDisconnectCleanup()")
+        directSenderTimeoutJob?.cancel()
+        directSenderTimeoutJob = null
+
+        // 1. Wi-Fi Direct Host stop (safe to repeat)
+        try {
+            wifiDirectHost.stop()
+            Log.d("FlipViewModel", "[CLEANUP] wifiDirectHost stopped")
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error stopping wifiDirectHost: ${e.message}")
+        }
+
+        // 2. Wi-Fi Direct Client leave (safe to repeat)
+        try {
+            wifiDirectClient.leave()
+            Log.d("FlipViewModel", "[CLEANUP] wifiDirectClient left group")
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error leaving wifiDirectClient: ${e.message}")
+        }
+
+        // 3. Receiver HandshakeClient close (safe to repeat)
+        synchronized(this) {
+            try {
+                handshakeClient?.close()
+                Log.d("FlipViewModel", "[CLEANUP] handshakeClient closed")
+            } catch (e: Exception) {
+                Log.w("FlipViewModel", "[CLEANUP] Error closing handshakeClient: ${e.message}")
+            } finally {
+                handshakeClient = null
+            }
+        }
+
+        // 4. BLE stop scanning and advertising (safe to repeat)
+        try {
+            bleService.stopScanning()
+            Log.d("FlipViewModel", "[CLEANUP] bleService stopped scanning")
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error stopping BLE scanning: ${e.message}")
+        }
+        try {
+            bleService.stopAdvertising()
+            Log.d("FlipViewModel", "[CLEANUP] bleService stopped advertising")
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error stopping BLE advertising: ${e.message}")
+        }
+
+        // 5. Control-channel server teardown (safe to repeat)
+        try {
+            FlipTransferForegroundService.teardownFirstTimeConnection()
+            Log.d("FlipViewModel", "[CLEANUP] Control channel torn down")
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error tearing down control channel: ${e.message}")
+        }
+
+        // 6. HTTP server stop (safe to repeat)
+        try {
+            httpServerService?.stopServer()
+            Log.d("FlipViewModel", "[CLEANUP] httpServerService stopped")
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error stopping HTTP server: ${e.message}")
+        } finally {
+            httpServerService = null
+            _isServerRunning.value = false
+        }
+
+        // 7. Foreground transfer service stop (safe to repeat)
+        try {
+            FlipTransferForegroundService.stop(context)
+        } catch (e: Exception) {
+            Log.w("FlipViewModel", "[CLEANUP] Error stopping FlipTransferForegroundService: ${e.message}")
+        }
+
         ConnectionSessionManager.updateDisconnected()
         _pendingIncomingRequest.value = null
         _pendingShareRequest.value = null
+
         // Cancel all pending or active transfers
         viewModelScope.launch(Dispatchers.Default) {
             synchronized(cancelledTransferIds) {
@@ -427,15 +684,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             }
         }
 
-        bleService.stopScanning()
-        bleService.stopAdvertising()
-        httpServerService?.stopServer()
-        httpServerService = null
-        _isServerRunning.value = false
-
         _remoteDevice.value = null
         _connectionState.value = ConnectionState.IDLE
         _role.value = null
+        _directSenderPayloadUri.value = null
+        Log.i("FlipViewModel", "[CLEANUP] performDisconnectCleanup() completed successfully")
     }
 
     fun resetToHome() {
@@ -704,8 +957,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     // --- BLE DISCOVERY LISTENER ---
     override fun onDeviceDiscovered(device: Device) {
         val currentList = _discoveredDevices.value
-        if (currentList.none { it.id == device.id }) {
-            _discoveredDevices.value = currentList + device
+        val now = System.currentTimeMillis()
+        val index = currentList.indexOfFirst { it.id == device.id }
+        if (index >= 0) {
+            val updated = currentList.toMutableList()
+            updated[index] = device.copy(lastSeen = now)
+            _discoveredDevices.value = updated
+        } else {
+            _discoveredDevices.value = currentList + device.copy(lastSeen = now)
         }
         autoJoinManager.onBlePeerDiscovered(
             bleDevice = device,
@@ -726,13 +985,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             // Stop scanning/advertising
             bleService.stopScanning()
             bleService.stopAdvertising()
-            val cleanId = DeviceIdentity.normalizeUuid(device.id)
-            val finalDevice = device.copy(id = cleanId)
-            _remoteDevice.value = finalDevice
+            _remoteDevice.value = device
+            if (_role.value == null) _role.value = "SENDER"
             _connectionState.value = ConnectionState.CONNECTED
-            FlipTransferForegroundService.start(context, finalDevice)
-            HotspotCredentialStore.saveKnownReceiver(context, cleanId, device.name)
-            HotspotCredentialStore.notifyPeersChanged(context)
+            FlipTransferForegroundService.start(context, device, _role.value ?: "SENDER")
+            HotspotCredentialStore.saveKnownReceiver(context, device.id, device.name)
             showToast("Connected to ${device.name}")
             checkAndQueuePreSelected()
         }

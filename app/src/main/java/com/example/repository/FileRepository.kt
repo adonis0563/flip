@@ -6,6 +6,7 @@ import android.content.Context
 import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
@@ -188,6 +189,16 @@ object FileRepository {
         val newEntries = docs.map { toFileEntry(context, it) }
         val current = _documents.value
         _documents.value = deduplicateEntries(newEntries + current)
+    }
+
+    /**
+     * Explicitly reloads the Documents category (e.g. after storage permission is granted).
+     */
+    fun reloadDocuments(context: Context) {
+        val appContext = context.applicationContext
+        repositoryScope.launch {
+            loadCategoryInternal(appContext, "Documents")
+        }
     }
 
     /**
@@ -432,19 +443,13 @@ object FileRepository {
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.MIME_TYPE,
-            MediaStore.MediaColumns.DATE_MODIFIED
+            MediaStore.MediaColumns.DATE_MODIFIED,
+            MediaStore.MediaColumns.DATA
         )
 
         val selection = when (category) {
             "Images", "Videos", "Audio" -> null
-            else -> {
-                // Documents selection
-                "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/pdf' OR " +
-                "${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%' OR " +
-                "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/msword' OR " +
-                "${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/vnd.openxmlformats-officedocument.%' OR " +
-                "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/zip'"
-            }
+            else -> buildDocumentsSelection()
         }
 
         val sortOrder = "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
@@ -464,6 +469,7 @@ object FileRepository {
                 val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
                 val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
                 val dateCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
+                val dataCol = try { cursor.getColumnIndex(MediaStore.MediaColumns.DATA) } catch (_: Exception) { -1 }
 
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idCol)
@@ -471,12 +477,26 @@ object FileRepository {
                     val size = cursor.getLong(sizeCol)
                     if (size <= 0) continue
 
-                    val mimeType = cursor.getString(mimeCol) ?: "application/octet-stream"
+                    val rawMime = cursor.getString(mimeCol)
+                    val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                    val mimeType = if (!rawMime.isNullOrBlank() && rawMime != "application/octet-stream") {
+                        rawMime
+                    } else {
+                        getMimeTypeForExtension(ext) ?: (rawMime ?: "application/octet-stream")
+                    }
+
                     val dateModified = cursor.getLong(dateCol)
                     val itemUri = ContentUris.withAppendedId(contentUri, id)
+                    val filePath = if (dataCol >= 0 && !cursor.isNull(dataCol)) {
+                        try { cursor.getString(dataCol) } catch (_: Exception) { null }
+                    } else null
 
-                    // Fast canonical key directly from collection & ID: zero IPC overhead
-                    val key = "ms:${category.lowercase(Locale.ROOT)}:$id"
+                    // Canonical key: prefer disk path when available so it seamlessly deduplicates with direct scan
+                    val key = if (!filePath.isNullOrBlank()) {
+                        "file:${filePath.trimEnd('/').lowercase(Locale.ROOT)}"
+                    } else {
+                        "ms:${category.lowercase(Locale.ROOT)}:$id"
+                    }
 
                     val entry = FileEntry(
                         key = key,
@@ -501,17 +521,141 @@ object FileRepository {
             Log.e(TAG, "Error querying MediaStore for $category: ${e.message}")
         }
 
-        // Include any user-imported SAF documents if loading Documents
+        // Include direct scans and user-imported SAF documents if loading Documents
         if (category == "Documents") {
+            scanDirectDocumentFolders(accumulated)
+
             val safList = synchronized(importedSafDocuments) { importedSafDocuments.toList() }
             val safEntries = safList.map { toFileEntry(context, it) }
             accumulated.addAll(safEntries)
         }
 
-        // Deduplicate and emit complete final list
-        val finalDeduplicated = deduplicateEntries(accumulated)
+        // Deduplicate and emit complete final list sorted by dateModified DESC
+        val finalDeduplicated = deduplicateEntries(accumulated).sortedByDescending { it.dateModified }
         targetFlow.value = finalDeduplicated
         setCategoryLoading(category, false)
+    }
+
+    val DOCUMENT_EXTENSIONS = setOf(
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "rtf",
+        "odt", "ods", "odp", "epub", "zip", "rar", "7z", "json", "xml", "html"
+    )
+
+    private fun buildDocumentsSelection(): String {
+        val mimeConditions = listOf(
+            "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/pdf'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/msword'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/vnd.openxmlformats-officedocument.%'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/vnd.ms-excel'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/vnd.ms-powerpoint'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'application/vnd.oasis.opendocument.%'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} LIKE 'text/%'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/zip'",
+            "${MediaStore.Files.FileColumns.MIME_TYPE} = 'application/epub+zip'"
+        )
+
+        val extConditions = DOCUMENT_EXTENSIONS.map { ext ->
+            "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.$ext'"
+        }
+
+        return "(${MediaStore.Files.FileColumns.MEDIA_TYPE} = ${MediaStore.Files.FileColumns.MEDIA_TYPE_NONE} OR ${MediaStore.Files.FileColumns.MEDIA_TYPE} IS NULL) AND (" +
+            (mimeConditions + extConditions).joinToString(" OR ") + ")"
+    }
+
+    private fun scanDirectDocumentFolders(targetList: MutableList<FileEntry>) {
+        try {
+            val candidateDirs = listOfNotNull(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                File(Environment.getExternalStorageDirectory(), "Download"),
+                File(Environment.getExternalStorageDirectory(), "Documents")
+            ).distinctBy { it.canonicalPath }
+
+            for (dir in candidateDirs) {
+                if (!dir.exists() || !dir.isDirectory) continue
+                scanDirectoryRecursive(dir, currentDepth = 1, maxDepth = 2, targetList)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Direct document folder scan error: ${e.message}")
+        }
+    }
+
+    private fun scanDirectoryRecursive(
+        dir: File,
+        currentDepth: Int,
+        maxDepth: Int,
+        targetList: MutableList<FileEntry>
+    ) {
+        if (!dir.exists() || !dir.isDirectory || dir.name.startsWith(".")) return
+        val files = dir.listFiles() ?: return
+
+        for (file in files) {
+            val name = file.name
+            if (name.startsWith(".")) continue
+
+            if (file.isDirectory) {
+                if (currentDepth < maxDepth) {
+                    scanDirectoryRecursive(file, currentDepth + 1, maxDepth, targetList)
+                }
+            } else if (file.isFile && file.length() > 0) {
+                val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                val mime = getMimeTypeForExtension(ext) ?: "application/octet-stream"
+                if (isDocumentFile(name, ext, mime)) {
+                    val path = file.canonicalPath
+                    val key = "file:${path.trimEnd('/').lowercase(Locale.ROOT)}"
+                    val entry = FileEntry(
+                        key = key,
+                        displayUri = Uri.fromFile(file),
+                        name = name,
+                        size = file.length(),
+                        mimeType = mime,
+                        dateModified = file.lastModified() / 1000L,
+                        category = "Documents"
+                    )
+                    targetList.add(entry)
+                }
+            }
+        }
+    }
+
+    private fun isDocumentFile(name: String, ext: String, mime: String): Boolean {
+        if (ext in DOCUMENT_EXTENSIONS) return true
+        val lowerMime = mime.lowercase(Locale.ROOT)
+        return lowerMime == "application/pdf" ||
+                lowerMime == "application/msword" ||
+                lowerMime.startsWith("application/vnd.openxmlformats-officedocument.") ||
+                lowerMime == "application/vnd.ms-excel" ||
+                lowerMime == "application/vnd.ms-powerpoint" ||
+                lowerMime.startsWith("application/vnd.oasis.opendocument.") ||
+                lowerMime.startsWith("text/") ||
+                lowerMime == "application/zip" ||
+                lowerMime == "application/epub+zip"
+    }
+
+    fun getMimeTypeForExtension(ext: String): String? {
+        return when (ext) {
+            "pdf" -> "application/pdf"
+            "doc" -> "application/msword"
+            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            "xls" -> "application/vnd.ms-excel"
+            "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "ppt" -> "application/vnd.ms-powerpoint"
+            "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            "txt" -> "text/plain"
+            "csv" -> "text/csv"
+            "rtf" -> "application/rtf"
+            "odt" -> "application/vnd.oasis.opendocument.text"
+            "ods" -> "application/vnd.oasis.opendocument.spreadsheet"
+            "odp" -> "application/vnd.oasis.opendocument.presentation"
+            "epub" -> "application/epub+zip"
+            "zip" -> "application/zip"
+            "rar" -> "application/x-rar-compressed"
+            "7z" -> "application/x-7z-compressed"
+            "json" -> "application/json"
+            "xml" -> "text/xml"
+            "html" -> "text/html"
+            else -> null
+        }
     }
 
     private fun setCategoryLoading(category: String, loading: Boolean) {

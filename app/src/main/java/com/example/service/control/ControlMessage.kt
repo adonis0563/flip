@@ -15,12 +15,17 @@ sealed class ControlMessage {
         val app: String = "flip",
         val v: Int = 1,
         val uuid: String,
-        val name: String
+        val name: String,
+        val port: Int = 0,
+        val httpPort: Int = port,
+        val ip: String? = null
     ) : ControlMessage()
 
     data class HelloAck(
         val uuid: String,
-        val name: String
+        val name: String,
+        val port: Int = 0,
+        val httpPort: Int = port
     ) : ControlMessage()
 
     object Ready : ControlMessage()
@@ -30,6 +35,10 @@ sealed class ControlMessage {
     object Ping : ControlMessage()
 
     object Pong : ControlMessage()
+
+    data class Bye(
+        val name: String = ""
+    ) : ControlMessage()
 
     data class Error(
         val error: String
@@ -43,11 +52,20 @@ sealed class ControlMessage {
                 json.put("v", v)
                 json.put("uuid", ControlChannelConstants.normalizeUuid(uuid))
                 json.put("name", name)
+                val effectivePort = if (httpPort > 0) httpPort else port
+                json.put("port", effectivePort)
+                json.put("httpPort", effectivePort)
+                if (!ip.isNullOrBlank()) {
+                    json.put("ip", ip)
+                }
                 json.put("type", "HELLO")
             }
             is HelloAck -> {
                 json.put("uuid", ControlChannelConstants.normalizeUuid(uuid))
                 json.put("name", name)
+                val effectivePort = if (httpPort > 0) httpPort else port
+                json.put("port", effectivePort)
+                json.put("httpPort", effectivePort)
                 json.put("type", "HELLO_ACK")
             }
             is Ready -> {
@@ -61,6 +79,12 @@ sealed class ControlMessage {
             }
             is Pong -> {
                 json.put("type", "PONG")
+            }
+            is Bye -> {
+                json.put("type", "BYE")
+                if (name.isNotBlank()) {
+                    json.put("name", name)
+                }
             }
             is Error -> {
                 json.put("error", error)
@@ -89,25 +113,39 @@ sealed class ControlMessage {
                     type.equals("HELLO", ignoreCase = true) || (json.optString("app") == "flip" && json.has("uuid")) -> {
                         val uuid = json.optString("uuid")
                         val name = json.optString("name", "Unknown")
+                        val httpPort = json.optInt("httpPort", json.optInt("port", 0))
+                        val port = if (httpPort > 0) httpPort else json.optInt("port", 0)
+                        val reportedIp = json.optString("ip", "").takeIf { it.isNotBlank() }
                         if (uuid.isNullOrBlank()) null else Hello(
                             app = json.optString("app", "flip"),
                             v = json.optInt("v", 1),
                             uuid = ControlChannelConstants.normalizeUuid(uuid),
-                            name = name
+                            name = name,
+                            port = port,
+                            httpPort = port,
+                            ip = reportedIp
                         )
                     }
                     type.equals("HELLO_ACK", ignoreCase = true) || (json.has("uuid") && !json.has("app")) -> {
                         val uuid = json.optString("uuid")
                         val name = json.optString("name", "Unknown")
+                        val httpPort = json.optInt("httpPort", json.optInt("port", 0))
+                        val port = if (httpPort > 0) httpPort else json.optInt("port", 0)
                         if (uuid.isNullOrBlank()) null else HelloAck(
                             uuid = ControlChannelConstants.normalizeUuid(uuid),
-                            name = name
+                            name = name,
+                            port = port,
+                            httpPort = port
                         )
                     }
                     type.equals("READY", ignoreCase = true) -> Ready
                     type.equals("READY_ACK", ignoreCase = true) -> ReadyAck
                     type.equals("PING", ignoreCase = true) -> Ping
                     type.equals("PONG", ignoreCase = true) -> Pong
+                    type.equals("BYE", ignoreCase = true) -> {
+                        val name = json.optString("name", "")
+                        Bye(name = name)
+                    }
                     else -> null
                 }
             } catch (_: Exception) {

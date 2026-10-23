@@ -15,14 +15,18 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.tooling.preview.Preview
+import com.example.ui.theme.MyApplicationTheme
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -203,7 +207,9 @@ fun ReceiverScanningScreen(
                                     host = ownerAddress,
                                     expectedPeerUuid = payload.deviceId,
                                     ownIdentity = ownIdentity,
-                                    port = ControlChannelConstants.PORT
+                                    port = ControlChannelConstants.PORT,
+                                    localTransferPort = localDevice?.port ?: 0,
+                                    localIp = localDevice?.ip
                                 )
                             } catch (e: Exception) {
                                 Log.w(TAG, "[WFD_CLIENT] Control channel handshake exception (attempt $attempt/$maxAttempts): ${e.message}")
@@ -299,7 +305,7 @@ fun ReceiverScanningScreen(
                     if (onDirectReceiverConnected != null) {
                         onDirectReceiverConnected(
                             ownerAddress,
-                            selectedSender?.port ?: 8080,
+                            selectedSender?.port?.takeIf { it > 0 } ?: verifiedClient.peerTransferPort,
                             payload.deviceId,
                             payload.deviceName,
                             verifiedClient
@@ -310,7 +316,7 @@ fun ReceiverScanningScreen(
                                 onHandshakeSuccess?.invoke(null)
                                 wifiDirectClient.leave()
                                 if (isActive) {
-                                    errorMessage = "Failed to connect to sender: ${err ?: "Unknown error"}"
+                                    errorMessage = "Failed to connect to sender. Check that both phones are on the same network."
                                     screenMode = ReceiverScreenMode.ERROR
                                 }
                             }
@@ -321,7 +327,7 @@ fun ReceiverScanningScreen(
                             id = payload.deviceId,
                             name = payload.deviceName,
                             ip = ownerAddress,
-                            port = selectedSender?.port ?: 8080
+                            port = selectedSender?.port?.takeIf { it > 0 } ?: verifiedClient.peerTransferPort
                         )
                         onSelectDevice(remoteDev)
                     }
@@ -638,113 +644,131 @@ private fun ReceiverErrorView(
     onUseCodeOrIp: () -> Unit,
     onBack: () -> Unit
 ) {
-    Column(
+    val cleanError = remember(errorMessage) {
+        val withoutIp = errorMessage.replace(Regex("""\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"""), "").trim()
+        if (withoutIp.isBlank() || withoutIp.contains("failed", ignoreCase = true) || withoutIp.contains("error", ignoreCase = true)) {
+            "Connection failed. Check that both phones are on the same network."
+        } else {
+            withoutIp
+        }
+    }
+
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+            .imePadding(),
+        contentAlignment = Alignment.Center
     ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-            shape = RoundedCornerShape(24.dp)
+        Column(
+            modifier = Modifier
+                .widthIn(max = 480.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                shape = RoundedCornerShape(24.dp)
             ) {
-                Box(
+                Column(
                     modifier = Modifier
-                        .size(56.dp)
-                        .background(MaterialTheme.colorScheme.error.copy(alpha = 0.12f), CircleShape),
-                    contentAlignment = Alignment.Center
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Warning,
-                        contentDescription = "Connection Error",
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(32.dp)
-                    )
-                }
-
-                Text(
-                    text = "Connection Failed",
-                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.testTag("error_title")
-                )
-
-                Surface(
-                    color = MaterialTheme.colorScheme.errorContainer,
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = errorMessage.ifBlank { "Unknown connection failure." },
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
+                    Box(
                         modifier = Modifier
-                            .padding(14.dp)
-                            .testTag("error_reason_text")
+                            .size(56.dp)
+                            .background(MaterialTheme.colorScheme.error.copy(alpha = 0.12f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Connection Error",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(32.dp)
+                        )
+                    }
+
+                    Text(
+                        text = "Connection Failed",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.testTag("error_title")
                     )
-                }
 
-                Spacer(modifier = Modifier.height(4.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = cleanError,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .padding(14.dp)
+                                .testTag("error_reason_text")
+                        )
+                    }
 
-                // 1. Try again
-                Button(
-                    onClick = onTryAgain,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .testTag("try_again_button"),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                ) {
-                    Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Try again", fontWeight = FontWeight.SemiBold)
-                }
+                    Spacer(modifier = Modifier.height(4.dp))
 
-                // 2. Scan again
-                OutlinedButton(
-                    onClick = onScanAgain,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .testTag("scan_again_button"),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Icon(imageVector = Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Scan again", fontWeight = FontWeight.SemiBold)
-                }
+                    // 1. Try again
+                    Button(
+                        onClick = onTryAgain,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("try_again_button"),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Try again", fontWeight = FontWeight.SemiBold)
+                    }
 
-                // 3. Use code/IP instead
-                OutlinedButton(
-                    onClick = onUseCodeOrIp,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp)
-                        .testTag("use_code_ip_button"),
-                    shape = RoundedCornerShape(14.dp)
-                ) {
-                    Icon(imageVector = Icons.Default.Dialpad, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Use code/IP instead", fontWeight = FontWeight.SemiBold)
-                }
+                    // 2. Scan again
+                    OutlinedButton(
+                        onClick = onScanAgain,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("scan_again_button"),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Scan again", fontWeight = FontWeight.SemiBold)
+                    }
 
-                TextButton(
-                    onClick = onBack,
-                    modifier = Modifier.testTag("back_to_list_button")
-                ) {
-                    Text("Back to Available Devices", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // 3. Enter code instead
+                    OutlinedButton(
+                        onClick = onUseCodeOrIp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("use_code_ip_button"),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Dialpad, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Enter code instead", fontWeight = FontWeight.SemiBold)
+                    }
+
+                    TextButton(
+                        onClick = onBack,
+                        modifier = Modifier.testTag("back_to_list_button")
+                    ) {
+                        Text("Back to Available Devices", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
         }
@@ -769,375 +793,433 @@ private fun DeviceListView(
     onCancel: () -> Unit,
     formatSenderTitle: (Device) -> String
 ) {
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .imePadding(),
+        contentAlignment = Alignment.TopCenter
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
+        Column(
+            modifier = Modifier
+                .widthIn(max = 480.dp)
+                .fillMaxWidth()
+                .heightIn(min = maxHeight)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
-            IconButton(onClick = onCancel) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Go Back",
-                    tint = MaterialTheme.colorScheme.onBackground
-                )
-            }
-            Text(
-                text = "Scanning for Flips",
-                style = MaterialTheme.typography.titleLarge.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
-            )
-        }
-
-        if (bleError != null) {
-            Card(
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                shape = RoundedCornerShape(12.dp)
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Warning,
-                        contentDescription = "Bluetooth Error",
-                        tint = MaterialTheme.colorScheme.error
-                    )
+                    IconButton(onClick = onCancel) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Go Back",
+                            tint = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
                     Text(
-                        text = "Bluetooth issue: $bleError. Please make sure Bluetooth and Location are enabled on your device.",
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                        style = MaterialTheme.typography.bodySmall
+                        text = "Scanning for Flips",
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
                     )
                 }
-            }
-        }
 
-        // Auto-join status banners for hotspot transport
-        when (autoJoinState) {
-            is AutoJoinState.Joining -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                if (bleError != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                        shape = RoundedCornerShape(12.dp)
                     ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = MaterialTheme.colorScheme.primary,
-                            strokeWidth = 2.dp
-                        )
-                        Column {
-                            Text(
-                                text = "Joining ${autoJoinState.peerName}'s hotspot...",
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                style = MaterialTheme.typography.bodyMedium
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Bluetooth Error",
+                                tint = MaterialTheme.colorScheme.error
                             )
                             Text(
-                                text = autoJoinState.message,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
+                                text = "Bluetooth issue: $bleError. Please make sure Bluetooth and Location are enabled on your device.",
+                                color = MaterialTheme.colorScheme.onErrorContainer,
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                     }
                 }
-            }
-            is AutoJoinState.Handshake -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = MaterialTheme.colorScheme.primary,
-                            strokeWidth = 2.dp
-                        )
-                        Text(
-                            text = "Connecting to ${autoJoinState.peerName}...",
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
-            }
-            is AutoJoinState.Disconnected -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = "Disconnected",
-                            tint = MaterialTheme.colorScheme.error
-                        )
-                        Text(
-                            text = autoJoinState.reason ?: "Connection lost, hotspot may have turned off",
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                }
-            }
-            is AutoJoinState.Failed -> {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = "Connection Failed",
-                            tint = MaterialTheme.colorScheme.error
-                        )
-                        Text(
-                            text = autoJoinState.reason,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.Medium,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                }
-            }
-            else -> {}
-        }
 
-        // Available Senders Card
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1.2f),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-            shape = RoundedCornerShape(24.dp)
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(16.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = "Available Senders",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    )
-                    IconButton(onClick = onOpenGeneralScanner) {
-                        Icon(
-                            imageVector = Icons.Default.QrCodeScanner,
-                            contentDescription = "Open Scanner",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                if (activeSenders.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(
-                                color = MaterialTheme.colorScheme.primary,
-                                strokeWidth = 2.dp,
-                                modifier = Modifier.size(24.dp)
-                            )
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Text(
-                                text = "Searching for nearby senders...",
-                                style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            )
-                        }
-                    }
-                } else {
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        modifier = Modifier.fillMaxSize()
-                    ) {
-                        items(activeSenders, key = { it.id }) { sender ->
-                            val isWfd = (sender.flags.toInt() and 0x02) != 0
-                            val title = formatSenderTitle(sender)
-                            Card(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onSenderTapped(sender) }
-                                    .testTag("device_list_item"),
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                                shape = RoundedCornerShape(14.dp)
+                // Auto-join status banners for hotspot transport
+                when (autoJoinState) {
+                    is AutoJoinState.Joining -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(14.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(40.dp)
-                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), CircleShape),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = if (isWfd) Icons.Default.Wifi else Icons.Default.WifiTethering,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(22.dp)
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = title,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            fontWeight = FontWeight.Bold,
-                                            style = MaterialTheme.typography.bodyLarge
-                                        )
-                                        Text(
-                                            text = if (isWfd) "Wi-Fi Direct · Tap to scan QR" else "Hotspot · Tap to connect",
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-                                    }
-                                    Icon(
-                                        imageVector = if (isWfd) Icons.Default.QrCodeScanner else Icons.Default.ChevronRight,
-                                        contentDescription = "Connect",
-                                        tint = MaterialTheme.colorScheme.primary
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    color = MaterialTheme.colorScheme.primary,
+                                    strokeWidth = 2.dp
+                                )
+                                Column {
+                                    Text(
+                                        text = "Joining ${autoJoinState.peerName}'s hotspot...",
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    Text(
+                                        text = autoJoinState.message,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
+                                        style = MaterialTheme.typography.bodySmall
                                     )
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
-
-        // Connect via code helper block
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-            shape = RoundedCornerShape(20.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Text(
-                    text = "Or enter Connect Code",
-                    style = MaterialTheme.typography.titleSmall.copy(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    OutlinedTextField(
-                        value = manualCode,
-                        onValueChange = onManualCodeChange,
-                        placeholder = { Text("Enter 4-Digit Code", color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("manual_code_input"),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface
-                        ),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                    )
-
-                    Button(
-                        onClick = {
-                            val code = manualCode.trim()
-                            if (code.length >= 4) {
-                                val localIpStr = localDevice?.ip ?: ""
-                                val basePrefix = if (localIpStr.contains(".") && localIpStr.split(".").size == 4) {
-                                    val parts = localIpStr.split(".")
-                                    "${parts[0]}.${parts[1]}.${parts[2]}."
-                                } else {
-                                    "192.168.43."
-                                }
-                                val portPart = code.takeLast(4).toIntOrNull() ?: 8080
-                                val ipOctet = code.dropLast(4)
-                                onManualConnect("$basePrefix$ipOctet", portPart)
+                    is AutoJoinState.Handshake -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    color = MaterialTheme.colorScheme.primary,
+                                    strokeWidth = 2.dp
+                                )
+                                Text(
+                                    text = "Connecting to ${autoJoinState.peerName}...",
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
                             }
-                        },
+                        }
+                    }
+                    is AutoJoinState.Disconnected -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = "Disconnected",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                                Text(
+                                    text = autoJoinState.reason ?: "Connection lost, hotspot may have turned off",
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+                    is AutoJoinState.Failed -> {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = "Connection Failed",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                                Text(
+                                    text = autoJoinState.reason,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                    else -> {}
+                }
+
+                // Available Senders Card
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp, max = 340.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Column(
                         modifier = Modifier
-                            .height(56.dp)
-                            .testTag("code_connect_submit"),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                            contentColor = MaterialTheme.colorScheme.primary
-                        ),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                        shape = RoundedCornerShape(12.dp)
+                            .fillMaxSize()
+                            .padding(16.dp)
                     ) {
-                        Text("Connect")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Available Senders",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            )
+                            IconButton(onClick = onOpenGeneralScanner) {
+                                Icon(
+                                    imageVector = Icons.Default.QrCodeScanner,
+                                    contentDescription = "Open Scanner",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        if (activeSenders.isEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    CircularProgressIndicator(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        strokeWidth = 2.dp,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text(
+                                        text = "Searching for nearby senders...",
+                                        style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    )
+                                }
+                            }
+                        } else {
+                            LazyColumn(
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                items(activeSenders, key = { it.id }) { sender ->
+                                    val isWfd = (sender.flags.toInt() and 0x02) != 0
+                                    val title = formatSenderTitle(sender)
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { onSenderTapped(sender) }
+                                            .testTag("device_list_item"),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                                        shape = RoundedCornerShape(14.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(40.dp)
+                                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), CircleShape),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(
+                                                    imageVector = if (isWfd) Icons.Default.Wifi else Icons.Default.WifiTethering,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(22.dp)
+                                                )
+                                            }
+                                            Spacer(modifier = Modifier.width(12.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = title,
+                                                    color = MaterialTheme.colorScheme.onSurface,
+                                                    fontWeight = FontWeight.Bold,
+                                                    style = MaterialTheme.typography.bodyLarge
+                                                )
+                                                Text(
+                                                    text = if (isWfd) "Wi-Fi Direct · Tap to scan QR" else "Hotspot · Tap to connect",
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    style = MaterialTheme.typography.bodySmall
+                                                )
+                                            }
+                                            Icon(
+                                                imageVector = if (isWfd) Icons.Default.QrCodeScanner else Icons.Default.ChevronRight,
+                                                contentDescription = "Connect",
+                                                tint = MaterialTheme.colorScheme.primary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
+
+            // Bottom section anchored with spacing and keyboard resilience
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Connect with code helper block
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    shape = RoundedCornerShape(20.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "Connect with code",
+                            style = MaterialTheme.typography.titleSmall.copy(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = manualCode,
+                                onValueChange = { newValue ->
+                                    val digitsOnly = newValue.filter { it.isDigit() }
+                                    onManualCodeChange(digitsOnly)
+                                },
+                                placeholder = { Text("Enter code", color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("manual_code_input"),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface
+                                ),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
+
+                            Button(
+                                onClick = {
+                                    val code = manualCode.trim().filter { it.isDigit() }
+                                    if (code.length >= 4) {
+                                        val localIpStr = localDevice?.ip ?: ""
+                                        val basePrefix = if (localIpStr.contains(".") && localIpStr.split(".").size == 4) {
+                                            val parts = localIpStr.split(".")
+                                            "${parts[0]}.${parts[1]}.${parts[2]}."
+                                        } else {
+                                            "192.168.49."
+                                        }
+                                        val portPart = code.takeLast(4).toIntOrNull() ?: 8080
+                                        val ipOctet = code.dropLast(4)
+                                        val targetIp = if (ipOctet.isNotEmpty()) "$basePrefix$ipOctet" else "${basePrefix}1"
+                                        onManualConnect(targetIp, portPart)
+                                    }
+                                },
+                                modifier = Modifier
+                                    .height(56.dp)
+                                    .testTag("code_connect_submit"),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                    contentColor = MaterialTheme.colorScheme.primary
+                                ),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("Connect")
+                            }
+                        }
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .testTag("cancel_scanning_button"),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    ),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Text(
+                        "Cancel",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                }
+            }
         }
+    }
+}
 
-        Spacer(modifier = Modifier.height(4.dp))
-
-        OutlinedButton(
-            onClick = onCancel,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp)
-                .testTag("cancel_scanning_button"),
-            colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = MaterialTheme.colorScheme.error
-            ),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.5f)),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Text(
-                "Cancel",
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+// -------------------------------------------------------------
+// Previews for Device List View across 5 screen configurations
+// -------------------------------------------------------------
+@Preview(name = "Small Phone", widthDp = 320, heightDp = 640)
+@Preview(name = "Tall 20:9 Phone", widthDp = 360, heightDp = 800)
+@Preview(name = "21:9 Phone", widthDp = 360, heightDp = 860)
+@Preview(name = "Tablet", widthDp = 800, heightDp = 1280)
+@Preview(name = "Font Scale 1.3", widthDp = 360, heightDp = 800, fontScale = 1.3f)
+@Composable
+private fun ReceiverListPreview() {
+    MyApplicationTheme {
+        Surface {
+            DeviceListView(
+                activeSenders = listOf(
+                    Device(id = "1", name = "Pixel 8 · 4A", ip = "192.168.49.1", port = 8080, flags = 0x01.toByte())
+                ),
+                bleError = null,
+                autoJoinState = AutoJoinState.Idle,
+                localDevice = Device(id = "2", name = "Galaxy S24 · 9B", ip = "192.168.49.2", port = 8080, flags = 0x01.toByte()),
+                manualCode = "",
+                onManualCodeChange = {},
+                onSenderTapped = {},
+                onOpenGeneralScanner = {},
+                onManualConnect = { _, _ -> },
+                onCancel = {},
+                formatSenderTitle = { it.name }
             )
         }
     }

@@ -54,6 +54,8 @@ class WifiDirectHost(
     private val context: Context,
     private val onClientJoined: ((ownerIpAddress: String) -> Unit)? = null
 ) {
+    var onGroupStateChanged: ((isConnected: Boolean) -> Unit)? = null
+
     companion object {
         private const val TAG = "FlipDirect"
         private const val ALPHANUMERIC = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -341,9 +343,20 @@ class WifiDirectHost(
                                         }
                                     }
                                 }
+                                onGroupStateChanged?.invoke(true)
                             } else if (count < previousClientCount) {
                                 previousClientCount = count
+                                if (count == 0) {
+                                    onGroupStateChanged?.invoke(false)
+                                }
+                            } else if (count > 0) {
+                                onGroupStateChanged?.invoke(true)
+                            } else {
+                                onGroupStateChanged?.invoke(false)
                             }
+                        } else {
+                            previousClientCount = 0
+                            onGroupStateChanged?.invoke(false)
                         }
                     }
                 } catch (e: SecurityException) {

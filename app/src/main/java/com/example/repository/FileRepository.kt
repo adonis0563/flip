@@ -15,6 +15,9 @@ import com.example.model.FileEntry
 import com.example.service.LocalFileItem
 import com.example.service.StorageService
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
@@ -31,7 +34,7 @@ import kotlinx.coroutines.withContext
 
 /**
  * App-scoped singleton repository for file loading, preloading, live updates,
- * and canonical deduplication in Flip In-App File Explorer.
+ * and canonical deduplication in Flip Files.
  */
 object FileRepository {
     private const val TAG = "FileRepository"
@@ -58,6 +61,19 @@ object FileRepository {
     private val _storage = MutableStateFlow<List<FileEntry>>(emptyList())
     val storage: StateFlow<List<FileEntry>> = _storage.asStateFlow()
 
+    // Day-grouped category StateFlows (grouped once in repository, updated on changes)
+    private val _groupedImages = MutableStateFlow<List<DayGroupedFiles>>(emptyList())
+    val groupedImages: StateFlow<List<DayGroupedFiles>> = _groupedImages.asStateFlow()
+
+    private val _groupedVideos = MutableStateFlow<List<DayGroupedFiles>>(emptyList())
+    val groupedVideos: StateFlow<List<DayGroupedFiles>> = _groupedVideos.asStateFlow()
+
+    private val _groupedAudio = MutableStateFlow<List<DayGroupedFiles>>(emptyList())
+    val groupedAudio: StateFlow<List<DayGroupedFiles>> = _groupedAudio.asStateFlow()
+
+    private val _groupedDocuments = MutableStateFlow<List<DayGroupedFiles>>(emptyList())
+    val groupedDocuments: StateFlow<List<DayGroupedFiles>> = _groupedDocuments.asStateFlow()
+
     // Loading indicators per category (true only when cache is empty and actively loading)
     private val _isLoadingMap = MutableStateFlow<Map<String, Boolean>>(emptyMap())
     val isLoadingMap: StateFlow<Map<String, Boolean>> = _isLoadingMap.asStateFlow()
@@ -70,6 +86,125 @@ object FileRepository {
     // Cache of SAF documents imported by user
     private val importedSafDocuments = mutableListOf<LocalFileItem>()
 
+    data class DayGroupedFiles(
+        val dayKey: String,
+        val headerTitle: String,
+        val files: List<FileEntry>
+    )
+
+    fun getDayKey(timestampMillis: Long): String {
+        if (timestampMillis <= 0L) return "day_unknown"
+        val cal = Calendar.getInstance().apply {
+            timeInMillis = timestampMillis
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        return "day_${sdf.format(Date(cal.timeInMillis))}"
+    }
+
+    /**
+     * Formats full-width section headers:
+     * - "Today"
+     * - "Yesterday"
+     * - The weekday and date for the last 7 days (e.g. "Mon, Oct 12")
+     * - "MMM d, yyyy" for older dates
+     */
+    fun formatDayHeader(timestampMillis: Long, nowMillis: Long = System.currentTimeMillis()): String {
+        if (timestampMillis <= 0L) return "Older"
+
+        val todayCal = Calendar.getInstance().apply {
+            timeInMillis = nowMillis
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+
+        val itemCal = Calendar.getInstance().apply {
+            timeInMillis = timestampMillis
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+
+        val diffMillis = todayCal.timeInMillis - itemCal.timeInMillis
+        val diffDays = ((diffMillis + 3600000L) / 86400000L).toInt()
+
+        return when {
+            diffDays <= 0 -> "Today"
+            diffDays == 1 -> "Yesterday"
+            diffDays in 2..7 -> {
+                SimpleDateFormat("EEE, MMM d", Locale.getDefault()).format(Date(timestampMillis))
+            }
+            else -> {
+                SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(Date(timestampMillis))
+            }
+        }
+    }
+
+    /**
+     * Groups files by day using DATE_TAKEN if present, otherwise DATE_ADDED.
+     * Preserves newest first sort order.
+     */
+    fun groupFilesByDay(files: List<FileEntry>): List<DayGroupedFiles> {
+        if (files.isEmpty()) return emptyList()
+
+        val sorted = files.sortedByDescending { it.sortTimeMillis }
+        val now = System.currentTimeMillis()
+
+        val groupsMap = LinkedHashMap<String, MutableList<FileEntry>>()
+        val titleMap = HashMap<String, String>()
+
+        for (file in sorted) {
+            val time = file.sortTimeMillis
+            val key = getDayKey(time)
+            val list = groupsMap.getOrPut(key) {
+                titleMap[key] = formatDayHeader(time, now)
+                mutableListOf()
+            }
+            list.add(file)
+        }
+
+        return groupsMap.map { (key, groupFiles) ->
+            DayGroupedFiles(
+                dayKey = key,
+                headerTitle = titleMap[key] ?: key,
+                files = groupFiles
+            )
+        }
+    }
+
+    /**
+     * Atomically updates raw and grouped StateFlows for a given category.
+     */
+    fun updateCategoryEntries(category: String, entries: List<FileEntry>) {
+        val sorted = entries.sortedByDescending { it.sortTimeMillis }
+        when (category) {
+            "Images" -> {
+                _images.value = sorted
+                _groupedImages.value = groupFilesByDay(sorted)
+            }
+            "Videos" -> {
+                _videos.value = sorted
+                _groupedVideos.value = groupFilesByDay(sorted)
+            }
+            "Audio" -> {
+                _audio.value = sorted
+                _groupedAudio.value = groupFilesByDay(sorted)
+            }
+            "Documents" -> {
+                _documents.value = sorted
+                _groupedDocuments.value = groupFilesByDay(sorted)
+            }
+            "Apps" -> _apps.value = sorted
+            "Storage" -> _storage.value = sorted
+        }
+    }
+
     fun getCategoryFlow(category: String): StateFlow<List<FileEntry>> {
         return when (category) {
             "Images" -> images
@@ -79,6 +214,16 @@ object FileRepository {
             "Apps" -> apps
             "Storage" -> storage
             else -> images
+        }
+    }
+
+    fun getGroupedCategoryFlow(category: String): StateFlow<List<DayGroupedFiles>>? {
+        return when (category) {
+            "Images" -> groupedImages
+            "Videos" -> groupedVideos
+            "Audio" -> groupedAudio
+            "Documents" -> groupedDocuments
+            else -> null
         }
     }
 
@@ -158,9 +303,13 @@ object FileRepository {
      */
     fun onPermissionRevoked() {
         _images.value = emptyList()
+        _groupedImages.value = emptyList()
         _videos.value = emptyList()
+        _groupedVideos.value = emptyList()
         _audio.value = emptyList()
+        _groupedAudio.value = emptyList()
         _documents.value = emptyList()
+        _groupedDocuments.value = emptyList()
         _apps.value = emptyList()
         _storage.value = emptyList()
         _isLoadingMap.value = emptyMap()
@@ -188,7 +337,8 @@ object FileRepository {
         }
         val newEntries = docs.map { toFileEntry(context, it) }
         val current = _documents.value
-        _documents.value = deduplicateEntries(newEntries + current)
+        val merged = deduplicateEntries(newEntries + current)
+        updateCategoryEntries("Documents", merged)
     }
 
     /**
@@ -212,6 +362,7 @@ object FileRepository {
         val size = file.length()
         val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
         val dateModified = file.lastModified() / 1000L
+        val nowSec = System.currentTimeMillis() / 1000L
         val fileUri = Uri.fromFile(file)
 
         val category = when (ext) {
@@ -246,15 +397,17 @@ object FileRepository {
             size = size,
             mimeType = mimeType,
             dateModified = dateModified,
+            dateAdded = nowSec,
+            dateTaken = System.currentTimeMillis(),
             category = category
         )
 
         // Prepend directly to affected category StateFlow
         when (category) {
-            "Images" -> _images.value = deduplicateEntries(listOf(entry) + _images.value)
-            "Videos" -> _videos.value = deduplicateEntries(listOf(entry) + _videos.value)
-            "Audio" -> _audio.value = deduplicateEntries(listOf(entry) + _audio.value)
-            "Documents" -> _documents.value = deduplicateEntries(listOf(entry) + _documents.value)
+            "Images" -> updateCategoryEntries("Images", deduplicateEntries(listOf(entry) + _images.value))
+            "Videos" -> updateCategoryEntries("Videos", deduplicateEntries(listOf(entry) + _videos.value))
+            "Audio" -> updateCategoryEntries("Audio", deduplicateEntries(listOf(entry) + _audio.value))
+            "Documents" -> updateCategoryEntries("Documents", deduplicateEntries(listOf(entry) + _documents.value))
             "Apps" -> _apps.value = deduplicateEntries(listOf(entry) + _apps.value)
         }
         
@@ -275,10 +428,10 @@ object FileRepository {
      */
     fun purgeKeys(keys: Set<String>) {
         if (keys.isEmpty()) return
-        _images.value = _images.value.filterNot { it.key in keys }
-        _videos.value = _videos.value.filterNot { it.key in keys }
-        _audio.value = _audio.value.filterNot { it.key in keys }
-        _documents.value = _documents.value.filterNot { it.key in keys }
+        updateCategoryEntries("Images", _images.value.filterNot { it.key in keys })
+        updateCategoryEntries("Videos", _videos.value.filterNot { it.key in keys })
+        updateCategoryEntries("Audio", _audio.value.filterNot { it.key in keys })
+        updateCategoryEntries("Documents", _documents.value.filterNot { it.key in keys })
         _storage.value = _storage.value.filterNot { it.key in keys }
         Log.i(TAG, "[DELETE] Purged ${keys.size} key(s) from memory cache")
     }
@@ -295,43 +448,60 @@ object FileRepository {
         val deletedKeys = mutableSetOf<String>()
         val consentRequiredUris = mutableListOf<Uri>()
         val consentRequiredEntries = mutableListOf<FileEntry>()
+        val hasDirectAccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            true
+        }
 
         for (entry in filesToDelete) {
             var success = false
-            try {
-                // 1. If it's a MediaStore content URI, delete via ContentResolver
-                if (isMediaStoreUri(entry.displayUri)) {
+
+            // 1. Direct file deletion for direct access (All Files Access or filesystem files)
+            val directFile = when {
+                entry.displayUri.scheme == "file" -> entry.displayUri.path?.let { File(it) }
+                entry.key.startsWith("file:") -> File(entry.key.removePrefix("file:"))
+                else -> null
+            }
+
+            if (hasDirectAccess && directFile != null && directFile.exists()) {
+                try {
+                    success = if (directFile.isDirectory) directFile.deleteRecursively() else directFile.delete()
+                    if (success && isMediaStoreUri(entry.displayUri)) {
+                        try { resolver.delete(entry.displayUri, null, null) } catch (_: Exception) {}
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Direct file delete error for ${entry.name}: ${e.message}")
+                }
+            }
+
+            // 2. MediaStore deletion
+            if (!success && isMediaStoreUri(entry.displayUri)) {
+                try {
                     val rows = resolver.delete(entry.displayUri, null, null)
                     if (rows > 0) {
                         success = true
                     }
-                }
-            } catch (e: SecurityException) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    consentRequiredUris.add(entry.displayUri)
-                    consentRequiredEntries.add(entry)
-                } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && e is android.app.RecoverableSecurityException) {
-                    return DeleteResult.RequiresConsent(e.userAction.actionIntent.intentSender, listOf(entry))
-                } else {
-                    Log.w(TAG, "SecurityException deleting ${entry.displayUri}: ${e.message}")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "ContentResolver delete failed for ${entry.displayUri}: ${e.message}")
-            }
-
-            // 2. If not deleted via MediaStore and not queued for consent, attempt direct file deletion
-            if (!success && !consentRequiredEntries.contains(entry)) {
-                try {
-                    val file = when {
-                        entry.displayUri.scheme == "file" -> entry.displayUri.path?.let { File(it) }
-                        entry.key.startsWith("file:") -> File(entry.key.removePrefix("file:"))
-                        else -> null
-                    }
-                    if (file != null && file.exists()) {
-                        success = if (file.isDirectory) file.deleteRecursively() else file.delete()
+                } catch (e: SecurityException) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        consentRequiredUris.add(entry.displayUri)
+                        consentRequiredEntries.add(entry)
+                    } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q && e is android.app.RecoverableSecurityException) {
+                        return DeleteResult.RequiresConsent(e.userAction.actionIntent.intentSender, listOf(entry))
+                    } else {
+                        Log.w(TAG, "SecurityException deleting ${entry.displayUri}: ${e.message}")
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Direct file delete failed for ${entry.name}: ${e.message}")
+                    Log.w(TAG, "ContentResolver delete failed for ${entry.displayUri}: ${e.message}")
+                }
+            }
+
+            // 3. Fallback direct file deletion if not queued for consent
+            if (!success && !consentRequiredEntries.contains(entry) && directFile != null && directFile.exists()) {
+                try {
+                    success = if (directFile.isDirectory) directFile.deleteRecursively() else directFile.delete()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Fallback file delete error for ${entry.name}: ${e.message}")
                 }
             }
 
@@ -353,6 +523,7 @@ object FileRepository {
                 return DeleteResult.RequiresConsent(pendingIntent.intentSender, consentRequiredEntries)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to create MediaStore delete request: ${e.message}", e)
+                return DeleteResult.Error("Could not request delete permission: ${e.message}")
             }
         }
 
@@ -437,22 +608,35 @@ object FileRepository {
             else -> MediaStore.Files.getContentUri("external")
         }
 
-        // Minimal fast projection
-        val projection = arrayOf(
-            MediaStore.MediaColumns._ID,
-            MediaStore.MediaColumns.DISPLAY_NAME,
-            MediaStore.MediaColumns.SIZE,
-            MediaStore.MediaColumns.MIME_TYPE,
-            MediaStore.MediaColumns.DATE_MODIFIED,
-            MediaStore.MediaColumns.DATA
-        )
+        // Minimal fast projection with DATE_ADDED and datetaken for day grouping
+        val projection = when (category) {
+            "Images", "Videos" -> arrayOf(
+                MediaStore.MediaColumns._ID,
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.MIME_TYPE,
+                MediaStore.MediaColumns.DATE_MODIFIED,
+                MediaStore.MediaColumns.DATE_ADDED,
+                "datetaken",
+                MediaStore.MediaColumns.DATA
+            )
+            else -> arrayOf(
+                MediaStore.MediaColumns._ID,
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.MIME_TYPE,
+                MediaStore.MediaColumns.DATE_MODIFIED,
+                MediaStore.MediaColumns.DATE_ADDED,
+                MediaStore.MediaColumns.DATA
+            )
+        }
 
         val selection = when (category) {
             "Images", "Videos", "Audio" -> null
             else -> buildDocumentsSelection()
         }
 
-        val sortOrder = "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+        val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
         val accumulated = mutableListOf<FileEntry>()
         var chunkEmitted = false
 
@@ -469,6 +653,8 @@ object FileRepository {
                 val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
                 val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
                 val dateCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
+                val addedCol = try { cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED) } catch (_: Exception) { -1 }
+                val takenCol = try { cursor.getColumnIndex("datetaken") } catch (_: Exception) { -1 }
                 val dataCol = try { cursor.getColumnIndex(MediaStore.MediaColumns.DATA) } catch (_: Exception) { -1 }
 
                 while (cursor.moveToNext()) {
@@ -486,6 +672,9 @@ object FileRepository {
                     }
 
                     val dateModified = cursor.getLong(dateCol)
+                    val dateAdded = if (addedCol >= 0 && !cursor.isNull(addedCol)) cursor.getLong(addedCol) else 0L
+                    val dateTaken = if (takenCol >= 0 && !cursor.isNull(takenCol)) cursor.getLong(takenCol) else null
+
                     val itemUri = ContentUris.withAppendedId(contentUri, id)
                     val filePath = if (dataCol >= 0 && !cursor.isNull(dataCol)) {
                         try { cursor.getString(dataCol) } catch (_: Exception) { null }
@@ -505,13 +694,16 @@ object FileRepository {
                         size = size,
                         mimeType = mimeType,
                         dateModified = dateModified,
+                        dateAdded = dateAdded,
+                        dateTaken = dateTaken,
                         category = category
                     )
                     accumulated.add(entry)
 
                     // Chunking: emit the first chunk (~100 items) immediately for instant rendering
                     if (accumulated.size == CHUNK_SIZE && !chunkEmitted && isCacheEmpty) {
-                        targetFlow.value = accumulated.toList()
+                        val chunkSorted = deduplicateEntries(accumulated).sortedByDescending { it.sortTimeMillis }
+                        updateCategoryEntries(category, chunkSorted)
                         setCategoryLoading(category, false)
                         chunkEmitted = true
                     }
@@ -530,9 +722,9 @@ object FileRepository {
             accumulated.addAll(safEntries)
         }
 
-        // Deduplicate and emit complete final list sorted by dateModified DESC
-        val finalDeduplicated = deduplicateEntries(accumulated).sortedByDescending { it.dateModified }
-        targetFlow.value = finalDeduplicated
+        // Deduplicate and emit complete final list sorted by sortTimeMillis DESC (newest first)
+        val finalDeduplicated = deduplicateEntries(accumulated).sortedByDescending { it.sortTimeMillis }
+        updateCategoryEntries(category, finalDeduplicated)
         setCategoryLoading(category, false)
     }
 
@@ -610,6 +802,7 @@ object FileRepository {
                         size = file.length(),
                         mimeType = mime,
                         dateModified = file.lastModified() / 1000L,
+                        dateAdded = file.lastModified() / 1000L,
                         category = "Documents"
                     )
                     targetList.add(entry)
@@ -688,6 +881,7 @@ object FileRepository {
             versionName = item.versionName,
             isSplitApk = item.isSplitApk,
             appIcon = item.appIcon,
+            dateAdded = item.dateAdded,
             explicitTransferSource = item
         )
     }
@@ -715,12 +909,16 @@ object FileRepository {
                 val preferredIcon = existing.appIcon ?: entry.appIcon
                 val preferredPackage = existing.packageName ?: entry.packageName
                 val preferredVersion = existing.versionName ?: entry.versionName
+                val preferredDateTaken = existing.dateTaken ?: entry.dateTaken
+                val preferredDateAdded = if (existing.dateAdded > 0) existing.dateAdded else entry.dateAdded
 
                 mergedMap[key] = existing.copy(
                     displayUri = preferredDisplayUri,
                     appIcon = preferredIcon,
                     packageName = preferredPackage,
-                    versionName = preferredVersion
+                    versionName = preferredVersion,
+                    dateTaken = preferredDateTaken,
+                    dateAdded = preferredDateAdded
                 )
             }
         }

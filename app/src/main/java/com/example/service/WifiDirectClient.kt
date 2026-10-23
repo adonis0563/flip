@@ -77,6 +77,8 @@ sealed interface ClientResult {
 class WifiDirectClient(
     private val context: Context
 ) {
+    var onGroupStateChanged: ((isConnected: Boolean) -> Unit)? = null
+
     companion object {
         private const val TAG = "FlipDirect"
         private const val P2P_CONNECT_TIMEOUT_MS = 20_000L
@@ -295,6 +297,9 @@ class WifiDirectClient(
                         if (info != null && info.groupFormed && info.groupOwnerAddress != null) {
                             Log.d(TAG, "P2P connection established: groupOwnerAddress=${info.groupOwnerAddress.hostAddress}")
                             connectionSignal.trySend(info)
+                            onGroupStateChanged?.invoke(true)
+                        } else {
+                            onGroupStateChanged?.invoke(false)
                         }
                     }
                 } catch (e: Exception) {
@@ -524,7 +529,16 @@ class WifiDirectClient(
         val linkProps = connectivityManager.getLinkProperties(network)
         val gatewayAddress = linkProps?.routes?.firstOrNull { it.isDefaultRoute }?.gateway?.hostAddress
             ?: linkProps?.routes?.firstOrNull { it.gateway != null }?.gateway?.hostAddress
-            ?: "192.168.49.1"
+
+        if (gatewayAddress.isNullOrBlank()) {
+            Log.w(TAG, "WifiNetworkSpecifier: unable to determine group owner gateway address")
+            cleanupSpecifier()
+            return ClientResult.Failed(
+                reason = ClientFailureReason.SpecifierFailed("Unable to determine group owner gateway address"),
+                p2pReason = p2pFailureReason,
+                specifierReason = ClientFailureReason.SpecifierFailed("Gateway IP is null")
+            )
+        }
 
         Log.d(TAG, "WifiNetworkSpecifier connected successfully. Gateway owner IP: $gatewayAddress")
 

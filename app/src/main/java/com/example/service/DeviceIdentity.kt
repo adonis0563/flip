@@ -17,7 +17,7 @@ import java.util.UUID
  * - DeviceIdentity { uuid, id8, shortCode, displayName }:
  *     - id8 = first 8 hex characters of SHA-256(uuid)
  *     - shortCode = first 4 characters of id8 uppercased
- *     - displayName defaults to the phone model and can be renamed
+ *     - displayName is always the phone model plus the short code
  * - Provides a per-session `sid` (random 8 hex characters, refreshed on process restart)
  *   for session-level uniqueness.
  */
@@ -30,7 +30,6 @@ data class DeviceIdentity(
     companion object {
         private const val TAG = "DeviceIdentity"
         private const val KEY_INSTALL_UUID = "device_install_uuid_v1"
-        private const val KEY_DISPLAY_NAME = "device_display_name_v1"
 
         // Volatile session ID generated once per application process launch
         val currentSessionId: String by lazy {
@@ -134,38 +133,13 @@ data class DeviceIdentity(
         }
 
         /**
-         * Returns the device display name, defaulting to Build.MODEL · shortCode.
+         * Returns the device display name. Always the phone model plus the short code.
          */
         @Synchronized
         fun getDisplayName(context: Context): String {
-            val custom = HotspotCredentialStore.getEncryptedString(context, KEY_DISPLAY_NAME)
-            if (!custom.isNullOrBlank()) {
-                return custom
-            }
-            val legacy = context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
-                .getString("device_name", null)
-            if (!legacy.isNullOrBlank()) {
-                return legacy
-            }
             val model = if (!Build.MODEL.isNullOrBlank()) Build.MODEL else "Android Device"
             val shortCode = getShortCodeFromUuid(getInstallUuid(context))
             return "$model · $shortCode"
-        }
-
-        /**
-         * Renames the device display name and persists in encrypted storage.
-         */
-        @Synchronized
-        fun setDisplayName(context: Context, newName: String) {
-            val trimmed = newName.trim()
-            if (trimmed.isEmpty()) return
-            HotspotCredentialStore.saveEncryptedString(context, KEY_DISPLAY_NAME, trimmed)
-            context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
-                .edit()
-                .putString("device_name", trimmed)
-                .apply()
-            cachedIdentity = null
-            Log.i(TAG, "[IDENTITY] Device display name updated")
         }
 
         /**

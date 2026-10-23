@@ -35,14 +35,20 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -50,6 +56,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -91,9 +100,17 @@ import com.example.viewmodel.ConnectionState
 import com.example.viewmodel.FlipViewModel
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.foundation.border
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+
+enum class SessionSheetStep {
+    FULL_SCREEN,
+    SEVENTY_PERCENT,
+    MINIMISED
+}
 
 // Helper to extract file details (name and size) from a URI
 fun getFileDetails(context: Context, uri: Uri): Pair<String, Long> {
@@ -114,6 +131,7 @@ fun getFileDetails(context: Context, uri: Uri): Pair<String, Long> {
     return Pair(name, size)
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FlipAppContent(viewModel: FlipViewModel) {
     val connectionState by viewModel.connectionState.collectAsState()
@@ -195,8 +213,16 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                     category = "Documents"
                 )
             }
-            viewModel.preSelectFiles(items)
-            viewModel.startSenderMode()
+            if (connectionState == ConnectionState.CONNECTED) {
+                items.forEach { file ->
+                    viewModel.addFileToTransferQueue(file.uri, file.name, file.size)
+                }
+            } else {
+                viewModel.preSelectFiles(items)
+                if (connectionState == ConnectionState.IDLE) {
+                    viewModel.startSenderMode()
+                }
+            }
             showStandaloneFilePicker = false
         }
     }
@@ -209,34 +235,44 @@ fun FlipAppContent(viewModel: FlipViewModel) {
         }
     }
 
-    // Reset showDirectSender when connectionState becomes CONNECTED and when returning home or disconnecting
+    var sessionSheetStep by rememberSaveable { mutableStateOf(SessionSheetStep.FULL_SCREEN) }
+
+    // Reset showDirectSender and session minimization on state changes
     LaunchedEffect(connectionState) {
         if (connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.DISCONNECTED || connectionState == ConnectionState.IDLE) {
             showDirectSender = false
         }
+        if (connectionState == ConnectionState.DISCONNECTED || connectionState == ConnectionState.IDLE) {
+            sessionSheetStep = SessionSheetStep.FULL_SCREEN
+        }
     }
 
-    // App state machine navigation using custom clean state routing
-    val prefs = remember(context) { context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE) }
-    var showSplash by remember { mutableStateOf(!prefs.getBoolean("onboarding_complete", false)) }
+    val onboardingState by viewModel.onboardingState.collectAsState()
+    val pendingPostOnboardingShare by viewModel.pendingPostOnboardingShare.collectAsState()
+    val appSharePromptState by viewModel.appSharePromptState.collectAsState()
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         contentWindowInsets = WindowInsets.safeDrawing,
         containerColor = MaterialTheme.colorScheme.background
     ) { innerPadding ->
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background)
         ) {
-            if (showSplash) {
-                SplashScreen(
-                    onGetStarted = { showSplash = false }
-                )
-            } else {
-                when (connectionState) {
+            when (onboardingState) {
+                is com.example.viewmodel.OnboardingState.Loading -> {
+                    // System splash screen covers the window until loading completes
+                }
+                is com.example.viewmodel.OnboardingState.NotDone -> {
+                    SplashScreen(
+                        onGetStarted = { viewModel.setOnboardingDone() }
+                    )
+                }
+                is com.example.viewmodel.OnboardingState.Done -> {
+                    when (connectionState) {
                     ConnectionState.IDLE -> {
                         if (showSettings) {
                             SettingsScreen(
@@ -254,8 +290,8 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                                 payloadUri = directSenderPayloadUri,
                                 connectionState = connectionState,
                                 remoteDevice = remoteDevice,
-                                onClientConnected = { ownerIp, peerId, peerName ->
-                                    viewModel.onDirectClientConnected(ownerIp, peerId = peerId, peerName = peerName)
+                                onClientConnected = { peerIp, peerId, peerName, port ->
+                                    viewModel.onDirectClientConnected(peerIp, port = port, peerId = peerId, peerName = peerName)
                                     showDirectSender = false
                                 },
                                 onCancel = {
@@ -263,9 +299,28 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                                     viewModel.resetToHome()
                                 }
                             )
+                        } else if (showStandaloneFilePicker) {
+                            InAppFilePickerContent(
+                                onDismiss = { showStandaloneFilePicker = false },
+                                onSendFiles = { selectedFiles ->
+                                    viewModel.preSelectFiles(selectedFiles)
+                                    viewModel.startSenderMode()
+                                    showStandaloneFilePicker = false
+                                },
+                                onLaunchSystemPicker = {
+                                    standaloneFilePickerLauncher.launch(arrayOf("*/*"))
+                                }
+                            )
                         } else {
                             HomeScreen(
                                 localDevice = localDevice,
+                                pendingShareData = pendingPostOnboardingShare,
+                                onSendPendingShare = {
+                                    viewModel.sendPendingPostOnboardingShare()
+                                },
+                                onDismissPendingShare = {
+                                    viewModel.dismissPendingPostOnboardingShare()
+                                },
                                 onDirectSendMode = {
                                     viewModel.startDirectSenderMode()
                                     showDirectSender = true
@@ -274,96 +329,222 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                                 onReceiveMode = { viewModel.startReceiverMode() },
                                 onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
                                 onExploreFiles = { showStandaloneFilePicker = true },
-                                onRenameDevice = { viewModel.updateDeviceName(it) },
                                 onOpenSettings = { showSettings = true },
                                 onOpenDebug = { showDebugScreen = true }
                             )
                         }
                     }
 
-                    ConnectionState.SEARCHING, ConnectionState.CONNECTING -> {
-                        BackHandler {
-                            viewModel.resetToHome()
+                    ConnectionState.SEARCHING, ConnectionState.CONNECTING, ConnectionState.CONNECTED -> {
+                        LaunchedEffect(connectionState) {
+                            if (connectionState == ConnectionState.CONNECTED) {
+                                showDirectSender = false
+                            }
                         }
-                        if (role == "SENDER") {
-                            SenderWaitingScreen(
-                                localDevice = localDevice,
-                                onUpdateIp = { viewModel.updateLocalIpAddress(it) },
-                                onCancel = { viewModel.resetToHome() }
+
+                        // Base content beneath the session sheet
+                        if (showStandaloneFilePicker) {
+                            InAppFilePickerContent(
+                                onDismiss = { showStandaloneFilePicker = false },
+                                onSendFiles = { selectedFiles ->
+                                    if (connectionState == ConnectionState.CONNECTED) {
+                                        selectedFiles.forEach { file ->
+                                            viewModel.addFileToTransferQueue(file.uri, file.name, file.size)
+                                        }
+                                    } else {
+                                        viewModel.preSelectFiles(selectedFiles)
+                                    }
+                                    showStandaloneFilePicker = false
+                                },
+                                onLaunchSystemPicker = {
+                                    standaloneFilePickerLauncher.launch(arrayOf("*/*"))
+                                }
+                            )
+                        } else if (showSettings) {
+                            SettingsScreen(
+                                onBack = { showSettings = false }
                             )
                         } else {
-                            ReceiverScanningScreen(
-                                discoveredDevices = discoveredDevices,
-                                bleError = bleError,
+                            HomeScreen(
                                 localDevice = localDevice,
-                                connectionState = connectionState,
-                                wifiDirectClient = viewModel.wifiDirectClient,
-                                autoJoinState = autoJoinState,
-                                onSelectDevice = { viewModel.connectToDiscoveredDevice(it) },
-                                onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
-                                onDirectReceiverConnected = { ownerIp, port, peerId, peerName, hsClient, onDone ->
-                                    viewModel.onDirectReceiverConnected(ownerIp, port, peerId, peerName, hsClient, onDone)
+                                onDirectSendMode = {
+                                    showDirectSender = true
                                 },
-                                onHandshakeSuccess = { viewModel.setHandshakeClient(it) },
-                                onCancel = { viewModel.resetToHome() }
+                                onSendMode = { sessionSheetStep = SessionSheetStep.FULL_SCREEN },
+                                onReceiveMode = { sessionSheetStep = SessionSheetStep.FULL_SCREEN },
+                                onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
+                                onExploreFiles = { showStandaloneFilePicker = true },
+                                onOpenSettings = { showSettings = true },
+                                onOpenDebug = { showDebugScreen = true }
                             )
                         }
-                    }
 
-                    ConnectionState.CONNECTED -> {
-                        LaunchedEffect(Unit) {
-                            showDirectSender = false
-                        }
-                        BackHandler {
-                            showDirectSender = false
-                            viewModel.disconnect()
-                        }
-                        ConnectedScreen(
-                            remoteDevice = remoteDevice,
-                            transferQueue = transferQueue,
-                            onSendFile = { uri, name, size ->
-                                viewModel.addFileToTransferQueue(uri, name, size)
-                            },
-                            onSendText = { text ->
-                                viewModel.sendText(text)
-                            },
-                            onPauseItem = { id -> viewModel.pauseTransfer(id) },
-                            onResumeItem = { id -> viewModel.resumeTransfer(id) },
-                            onCancelItem = { id -> viewModel.cancelTransfer(id) },
-                            onDisconnect = { viewModel.disconnect() }
-                        )
-
-                        AnimatedVisibility(
-                            visible = showConnectedSuccess,
-                            enter = fadeIn(tween(180)),
-                            exit = fadeOut(tween(300)) + scaleOut(targetScale = 0.96f)
-                        ) {
-                            ConnectedSuccessOverlay(
-                                remoteDevice = remoteDevice,
-                                onFinished = { showConnectedSuccess = false }
+                        // Dimmed scrim behind sheet when at 70%
+                        if (sessionSheetStep == SessionSheetStep.SEVENTY_PERCENT) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.36f))
+                                    .clickable { sessionSheetStep = SessionSheetStep.MINIMISED }
                             )
+                        }
+
+                        // 3-step Session Sheet (Full screen, 70%, or minimised - no additional buttons)
+                        if (sessionSheetStep != SessionSheetStep.MINIMISED) {
+                            val targetHeight = if (sessionSheetStep == SessionSheetStep.FULL_SCREEN) maxHeight else maxHeight * 0.70f
+                            val animatedHeight by animateDpAsState(
+                                targetValue = targetHeight,
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                    stiffness = Spring.StiffnessMediumLow
+                                ),
+                                label = "SessionSheetHeight"
+                            )
+
+                            BackHandler(enabled = !showStandaloneFilePicker) {
+                                if (sessionSheetStep == SessionSheetStep.FULL_SCREEN) {
+                                    sessionSheetStep = SessionSheetStep.SEVENTY_PERCENT
+                                } else if (sessionSheetStep == SessionSheetStep.SEVENTY_PERCENT) {
+                                    sessionSheetStep = SessionSheetStep.MINIMISED
+                                }
+                            }
+
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(animatedHeight)
+                                    .align(Alignment.BottomCenter),
+                                shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
+                                color = MaterialTheme.colorScheme.surface,
+                                tonalElevation = 6.dp,
+                                shadowElevation = 16.dp
+                            ) {
+                                Column(modifier = Modifier.fillMaxSize()) {
+                                    // Drag handle at top (drags between Full Screen, 70%, and Minimised)
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .pointerInput(sessionSheetStep) {
+                                                detectVerticalDragGestures { change, dragAmount ->
+                                                    change.consume()
+                                                    if (dragAmount > 20f) {
+                                                        when (sessionSheetStep) {
+                                                            SessionSheetStep.FULL_SCREEN -> sessionSheetStep = SessionSheetStep.SEVENTY_PERCENT
+                                                            SessionSheetStep.SEVENTY_PERCENT -> sessionSheetStep = SessionSheetStep.MINIMISED
+                                                            SessionSheetStep.MINIMISED -> {}
+                                                        }
+                                                    } else if (dragAmount < -20f) {
+                                                        when (sessionSheetStep) {
+                                                            SessionSheetStep.SEVENTY_PERCENT -> sessionSheetStep = SessionSheetStep.FULL_SCREEN
+                                                            SessionSheetStep.MINIMISED -> sessionSheetStep = SessionSheetStep.SEVENTY_PERCENT
+                                                            SessionSheetStep.FULL_SCREEN -> {}
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        BottomSheetDefaults.DragHandle()
+                                    }
+
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxWidth()
+                                    ) {
+                                        if (connectionState == ConnectionState.CONNECTED) {
+                                            ConnectedScreen(
+                                                remoteDevice = remoteDevice,
+                                                transferQueue = transferQueue,
+                                                onSendFile = { uri, name, size ->
+                                                    viewModel.addFileToTransferQueue(uri, name, size)
+                                                },
+                                                onSendText = { text ->
+                                                    viewModel.sendText(text)
+                                                },
+                                                onPauseItem = { id -> viewModel.pauseTransfer(id) },
+                                                onResumeItem = { id -> viewModel.resumeTransfer(id) },
+                                                onCancelItem = { id -> viewModel.cancelTransfer(id) },
+                                                onDisconnect = {
+                                                    viewModel.disconnect()
+                                                },
+                                                onMinimize = {
+                                                    sessionSheetStep = SessionSheetStep.MINIMISED
+                                                }
+                                            )
+
+                                            androidx.compose.animation.AnimatedVisibility(
+                                                visible = showConnectedSuccess,
+                                                enter = fadeIn(tween(180)),
+                                                exit = fadeOut(tween(300)) + scaleOut(targetScale = 0.96f)
+                                            ) {
+                                                ConnectedSuccessOverlay(
+                                                    remoteDevice = remoteDevice,
+                                                    onFinished = { showConnectedSuccess = false }
+                                                )
+                                            }
+                                        } else if (role == "SENDER") {
+                                            SenderWaitingScreen(
+                                                localDevice = localDevice,
+                                                onUpdateIp = { viewModel.updateLocalIpAddress(it) },
+                                                onCancel = {
+                                                    viewModel.resetToHome()
+                                                }
+                                            )
+                                        } else {
+                                            ReceiverScanningScreen(
+                                                discoveredDevices = discoveredDevices,
+                                                bleError = bleError,
+                                                localDevice = localDevice,
+                                                connectionState = connectionState,
+                                                wifiDirectClient = viewModel.wifiDirectClient,
+                                                autoJoinState = autoJoinState,
+                                                onSelectDevice = { viewModel.connectToDiscoveredDevice(it) },
+                                                onManualConnect = { ip, port -> viewModel.connectManually(ip, port) },
+                                                onDirectReceiverConnected = { ownerIp, port, peerId, peerName, hsClient, onDone ->
+                                                    viewModel.onDirectReceiverConnected(ownerIp, port, peerId, peerName, hsClient, onDone)
+                                                },
+                                                onHandshakeSuccess = { viewModel.setHandshakeClient(it) },
+                                                onCancel = {
+                                                    viewModel.resetToHome()
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
                     ConnectionState.DISCONNECTED -> {
                         // Automatically clean up and return to Home
                         LaunchedEffect(Unit) {
+                            sessionSheetStep = SessionSheetStep.FULL_SCREEN
                             showDirectSender = false
                             viewModel.resetToHome()
                         }
                     }
                 }
 
-                if (showStandaloneFilePicker) {
-                    InAppFilePickerContent(
-                        onDismiss = { showStandaloneFilePicker = false },
-                        onSendFiles = { selectedFiles ->
-                            viewModel.preSelectFiles(selectedFiles)
-                            viewModel.startSenderMode()
+                // Docked Session Mini Bar when minimized (tapping expands, close button disconnects directly without morphing)
+                if (sessionSheetStep == SessionSheetStep.MINIMISED && (connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.SEARCHING || connectionState == ConnectionState.CONNECTING)) {
+                    val queueStatus = TransferMetricsHelper.computeQueueStatus(remoteDevice, transferQueue, connectionState, role)
+                    SessionMiniBar(
+                        line1Text = queueStatus.line1,
+                        line2Text = queueStatus.line2,
+                        activeProgress = queueStatus.progress,
+                        isIncoming = queueStatus.isIncoming,
+                        onExpand = { sessionSheetStep = SessionSheetStep.SEVENTY_PERCENT },
+                        onDisconnect = {
+                            if (connectionState == ConnectionState.CONNECTED) {
+                                viewModel.disconnect()
+                            } else {
+                                viewModel.resetToHome()
+                            }
                         },
-                        onLaunchSystemPicker = {
-                            standaloneFilePickerLauncher.launch(arrayOf("*/*"))
-                        }
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .navigationBarsPadding()
                     )
                 }
 
@@ -488,9 +669,20 @@ fun FlipAppContent(viewModel: FlipViewModel) {
                         onCancel = { viewModel.cancelPendingShare() }
                     )
                 }
+
+                // App Share Option Sheet (Play Store link / bare package ID)
+                appSharePromptState?.let { option ->
+                    SharedAppOptionSheet(
+                        option = option,
+                        onSendApp = { viewModel.chooseSendSharedApp(option.appItem) },
+                        onSendText = { viewModel.chooseSendSharedText(option.originalText) },
+                        onDismiss = { viewModel.clearAppSharePrompt() }
+                    )
+                }
             }
         }
     }
+}
 }
 
 // -------------------------------------------------------------
@@ -567,12 +759,10 @@ fun SplashScreen(onGetStarted: () -> Unit) {
 
         Button(
             onClick = {
-                if (dontShowAgain) {
-                    context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean("onboarding_complete", true)
-                        .apply()
-                }
+                context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean("onboarding_complete", true)
+                    .commit()
                 onGetStarted()
             },
             modifier = Modifier
@@ -645,10 +835,12 @@ fun HomeScreen(
     onReceiveMode: () -> Unit,
     onManualConnect: (String, Int) -> Unit,
     onExploreFiles: () -> Unit,
-    onRenameDevice: (String) -> Unit = {},
     onOpenSettings: () -> Unit = {},
     onOpenDebug: () -> Unit = {},
-    onDirectSendMode: () -> Unit = {}
+    onDirectSendMode: () -> Unit = {},
+    pendingShareData: com.example.viewmodel.PendingShareBannerData? = null,
+    onSendPendingShare: () -> Unit = {},
+    onDismissPendingShare: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var isOnWifi by remember {
@@ -690,68 +882,6 @@ fun HomeScreen(
         }
     }
 
-    var showRenameDialog by remember { mutableStateOf(false) }
-    var renameInput by remember(localDevice?.name) { mutableStateOf(localDevice?.name ?: "") }
-
-    if (showRenameDialog) {
-        AlertDialog(
-            onDismissRequest = { showRenameDialog = false },
-            title = {
-                Text(
-                    text = "Rename Device",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-            },
-            text = {
-                OutlinedTextField(
-                    value = renameInput,
-                    onValueChange = { renameInput = it },
-                    label = { Text("Device Name") },
-                    singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                        focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                        unfocusedTextColor = MaterialTheme.colorScheme.onSurface
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("device_rename_input")
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val trimmed = renameInput.trim()
-                        if (trimmed.isNotEmpty()) {
-                            onRenameDevice(trimmed)
-                        }
-                        showRenameDialog = false
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary
-                    ),
-                    modifier = Modifier.testTag("device_rename_save_button")
-                ) {
-                    Text("Save")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { showRenameDialog = false },
-                    colors = ButtonDefaults.textButtonColors(
-                        contentColor = AccentRed
-                    )
-                ) {
-                    Text("Cancel", color = AccentRed)
-                }
-            }
-        )
-    }
-
     var activeConnectionSheet by remember { mutableStateOf<ReadinessMode?>(null) }
     var showPcHotspotPrompt by remember { mutableStateOf(false) }
     var dontShowAgainChecked by remember { mutableStateOf(false) }
@@ -777,260 +907,276 @@ fun HomeScreen(
         }
     }
 
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .imePadding(),
+        contentAlignment = Alignment.TopCenter
     ) {
-        // Top bar: 56dp height, centered Flip title, settings button on left
-        HomeTopBar(
-            onOpenSettings = onOpenSettings,
-            onOpenDebug = onOpenDebug
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Single-line device card: device name, small status dot (green when on wifi), tap to rename
-        Card(
+        Column(
             modifier = Modifier
+                .widthIn(max = 480.dp)
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .clickable {
-                    renameInput = localDevice?.name ?: ""
-                    showRenameDialog = true
-                }
-                .testTag("device_card"),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            shape = RoundedCornerShape(16.dp)
+                .heightIn(min = maxHeight)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(
+            // Top section: TopBar, Device Card, Storage Card, Connect to PC
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                // Top bar: 56dp height, centered Flip title, settings button on left
+                HomeTopBar(
+                    onOpenSettings = onOpenSettings,
+                    onOpenDebug = onOpenDebug
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Single-line device card: device name, small status dot (green when on wifi)
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .testTag("device_card"),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = localDevice?.name ?: "Android Device",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .background(
+                                    color = if (isOnWifi) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline,
+                                    shape = CircleShape
+                                )
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Device Storage card
+                StorageCard(
+                    onViewDetails = onExploreFiles
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Row with two buttons under StorageCard: "Connect to PC" (primary) and "Share Flip" (disabled look; tapping shows "Coming soon")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = triggerConnectToPc,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("connect_to_pc_sub_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
+                        ),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Laptop,
+                            contentDescription = "Connect to PC",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Connect to PC",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            Toast.makeText(context, "Coming soon", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("share_flip_button"),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                            contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                        ),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.38f)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Share Flip",
+                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Share Flip",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            // Bottom CTA section
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(top = 24.dp, bottom = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text(
-                    text = localDevice?.name ?: "Android Device",
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    ),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false)
-                )
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .background(
-                            color = if (isOnWifi) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline,
-                            shape = CircleShape
-                        )
-                )
-
-                Spacer(modifier = Modifier.weight(1f, fill = true))
-
-                Icon(
-                    imageVector = Icons.Default.Edit,
-                    contentDescription = "Rename device",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp)
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Device Storage card
-        StorageCard(
-            onViewDetails = onExploreFiles
-        )
-
-        Spacer(modifier = Modifier.height(14.dp))
-
-        // Row with two buttons under StorageCard: "Connect to PC" (primary) and "Share Flip" (disabled look; tapping shows "Coming soon")
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Button(
-                onClick = triggerConnectToPc,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(48.dp)
-                    .testTag("connect_to_pc_sub_button"),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                ),
-                shape = RoundedCornerShape(14.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Laptop,
-                    contentDescription = "Connect to PC",
-                    tint = MaterialTheme.colorScheme.onPrimary,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "Connect to PC",
-                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            OutlinedButton(
-                onClick = {
-                    Toast.makeText(context, "Coming soon", Toast.LENGTH_SHORT).show()
-                },
-                modifier = Modifier
-                    .weight(1f)
-                    .height(48.dp)
-                    .testTag("share_flip_button"),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                    contentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                ),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.38f)),
-                shape = RoundedCornerShape(14.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Share,
-                    contentDescription = "Share Flip",
-                    tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "Share Flip",
-                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.weight(0.8f))
-
-        Text(
-            text = "Ready to flip?",
-            style = MaterialTheme.typography.headlineMedium.copy(
-                fontWeight = FontWeight.ExtraBold,
-                color = MaterialTheme.colorScheme.onBackground
-            )
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Big CTA buttons: "Send" & "Receive"
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            Button(
-                onClick = triggerDirectSend,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(96.dp)
-                    .testTag("send_button"),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                ),
-                shape = RoundedCornerShape(24.dp)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send Icon",
-                        tint = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Send",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onPrimary
+                // Big CTA buttons: "Send" & "Receive"
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Button(
+                        onClick = triggerDirectSend,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(96.dp)
+                            .testTag("send_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary
                         ),
-                        textAlign = TextAlign.Center
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send Icon",
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Send",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimary
+                                ),
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            if (ConnectionChecker.isReadyForMode(context, ReadinessMode.RECEIVE)) {
+                                onReceiveMode()
+                            } else {
+                                activeConnectionSheet = ReadinessMode.RECEIVE
+                            }
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(96.dp)
+                            .testTag("receive_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurface
+                        ),
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.ArrowDownward,
+                                contentDescription = "Receive Icon",
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Receive",
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                OutlinedButton(
+                    onClick = onExploreFiles,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .testTag("explore_files_button"),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.onBackground
+                    ),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Folder,
+                        contentDescription = "Explore Files",
+                        tint = MaterialTheme.colorScheme.onBackground
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Files",
+                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onBackground
                     )
                 }
             }
+        }
 
-            Button(
-                onClick = {
-                    if (ConnectionChecker.isReadyForMode(context, ReadinessMode.RECEIVE)) {
-                        onReceiveMode()
+        pendingShareData?.let { data ->
+            PostOnboardingShareBanner(
+                data = data,
+                onSend = {
+                    onSendPendingShare()
+                    if (ConnectionChecker.isReadyForMode(context, ReadinessMode.SEND)) {
+                        onSendMode()
                     } else {
-                        activeConnectionSheet = ReadinessMode.RECEIVE
+                        activeConnectionSheet = ReadinessMode.SEND
                     }
                 },
+                onDismiss = onDismissPendingShare,
                 modifier = Modifier
-                    .weight(1f)
-                    .height(96.dp)
-                    .testTag("receive_button"),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                    contentColor = MaterialTheme.colorScheme.onSurface
-                ),
-                shape = RoundedCornerShape(24.dp)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        imageVector = Icons.Default.ArrowDownward,
-                        contentDescription = "Receive Icon",
-                        tint = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Receive",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        OutlinedButton(
-            onClick = onExploreFiles,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp)
-                .testTag("explore_files_button"),
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = MaterialTheme.colorScheme.onBackground
-            ),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-        ) {
-            Icon(
-                imageVector = Icons.Default.Folder,
-                contentDescription = "Explore Files",
-                tint = MaterialTheme.colorScheme.onBackground
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "In-App File Explorer",
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.onBackground
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
             )
         }
-
-        Spacer(modifier = Modifier.weight(1f))
     }
 
     // Modal bottom sheet prompting to connect PC and phone hotspots
@@ -1039,7 +1185,7 @@ fun HomeScreen(
             onDismissRequest = { showPcHotspotPrompt = false },
             containerColor = MaterialTheme.colorScheme.surface,
             dragHandle = { BottomSheetDefaults.DragHandle() },
-            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
+            shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp)
         ) {
             Column(
                 modifier = Modifier
@@ -1193,312 +1339,247 @@ fun SenderWaitingScreen(
     }
 
     var showQrFallback by remember { mutableStateOf(false) }
-    var showIpEditDialog by remember { mutableStateOf(false) }
-    var editingIp by remember { mutableStateOf(localDevice?.ip ?: "") }
 
-    if (showIpEditDialog) {
-        AlertDialog(
-            onDismissRequest = { showIpEditDialog = false },
-            title = { Text("Correct Server IP", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        text = "If your detected IP is wrong, correct it here so receivers can connect over Wi-Fi and BLE.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    OutlinedTextField(
-                        value = editingIp,
-                        onValueChange = { editingIp = it },
-                        label = { Text("Local IP Address") },
-                        placeholder = { Text("e.g. 192.168.43.1") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline
-                        )
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (editingIp.isNotBlank()) {
-                            onUpdateIp(editingIp.trim())
-                        }
-                        showIpEditDialog = false
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary
-                    )
-                ) {
-                    Text("Update & Restart BLE", color = MaterialTheme.colorScheme.onPrimary)
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { showIpEditDialog = false },
-                    colors = ButtonDefaults.textButtonColors(contentColor = AccentRed)
-                ) {
-                    Text("Cancel", color = AccentRed)
-                }
-            },
-            containerColor = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(20.dp)
-        )
-    }
-
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .imePadding(),
+        contentAlignment = Alignment.TopCenter
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onCancel) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Go Back",
-                    tint = MaterialTheme.colorScheme.onBackground
-                )
-            }
-            Text(
-                text = "Flipping Out...",
-                style = MaterialTheme.typography.titleLarge.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
-            )
-        }
-
-    val connectionFlowState by com.example.service.FlipTransferForegroundService.connectionFlowState.collectAsState()
-
-    DisposableEffect(Unit) {
-        com.example.service.FlipTransferForegroundService.startSenderControl(context)
-        onDispose {
-            com.example.service.FlipTransferForegroundService.teardownFirstTimeConnection()
-        }
-    }
-
-    val statusText = when (val s = connectionFlowState) {
-        is com.example.service.FirstTimeConnectionState.Idle -> "Waiting for receiver..."
-        is com.example.service.FirstTimeConnectionState.Joining -> "Receiver connecting..."
-        is com.example.service.FirstTimeConnectionState.AwaitingLink -> "Awaiting link..."
-        is com.example.service.FirstTimeConnectionState.Handshaking -> "Verifying receiver..."
-        is com.example.service.FirstTimeConnectionState.Connected -> "Connected!"
-        is com.example.service.FirstTimeConnectionState.Failed -> s.reason
-    }
-    val isFailed = connectionFlowState is com.example.service.FirstTimeConnectionState.Failed
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        if (isFailed) {
-            Icon(
-                imageVector = Icons.Default.Warning,
-                contentDescription = "Failed",
-                tint = AccentRed,
-                modifier = Modifier.size(24.dp)
-            )
-        } else {
-            CircularProgressIndicator(
-                color = MaterialTheme.colorScheme.primary,
-                strokeWidth = 3.dp,
-                modifier = Modifier.size(24.dp)
-            )
-        }
-        Text(
-            text = statusText,
-            style = MaterialTheme.typography.bodyMedium.copy(
-                color = if (isFailed) AccentRed else MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.Bold
-            )
-        )
-        if (isFailed) {
-            TextButton(
-                onClick = { com.example.service.FlipTransferForegroundService.startSenderControl(context) },
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-            ) {
-                Text("Retry", style = MaterialTheme.typography.labelSmall)
-            }
-        }
-    }
-
-        // Beautiful Card presenting Animation or QR Code fallback and Details
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            shape = RoundedCornerShape(24.dp)
+        Column(
+            modifier = Modifier
+                .widthIn(max = 480.dp)
+                .fillMaxWidth()
+                .heightIn(min = maxHeight)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(20.dp),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                if (showQrFallback) {
-                    // QR Code Fallback
-                    if (qrBitmap != null) {
-                        Surface(
-                            color = Color.White,
-                            shape = RoundedCornerShape(16.dp),
-                            modifier = Modifier
-                                .size(190.dp)
-                                .padding(4.dp)
-                        ) {
-                            Image(
-                                bitmap = qrBitmap.asImageBitmap(),
-                                contentDescription = "Pairing QR Code",
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .size(190.dp)
-                                .background(MaterialTheme.colorScheme.background, RoundedCornerShape(16.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text("QR Error", color = AccentRed)
-                        }
-                    }
-
-                    // Text link to switch back to animation
-                    TextButton(
-                        onClick = { showQrFallback = false },
-                        modifier = Modifier.testTag("hide_qr_fallback_link")
-                    ) {
-                        Text(
-                            text = "Hide QR",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        )
-                    }
-                } else {
-                    // Pulsing Hotspot / Radio animation
-                    PulsingRadioAnimation(
-                        modifier = Modifier.padding(vertical = 4.dp),
-                        size = 190.dp,
-                        waveColor = MaterialTheme.colorScheme.primary
-                    )
-
-                    // Small "Show QR instead" text link
-                    TextButton(
-                        onClick = { showQrFallback = true },
-                        modifier = Modifier.testTag("show_qr_fallback_link")
-                    ) {
-                        Text(
-                            text = "Show QR instead",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                        )
-                    }
-                }
-
-                Text(
-                    text = if (showQrFallback) {
-                        "Receiver can scan this QR code within the Flip app, or connect using the info below:"
-                    } else {
-                        "Broadcasting via BLE. Nearby receivers will detect this device automatically."
-                    },
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
-                    )
-                )
-
-                // 4-Digit Connection code
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(12.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = "CONNECT CODE",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                letterSpacing = 2.sp
-                            )
-                        )
-                        Text(
-                            text = connectCode,
-                            style = MaterialTheme.typography.titleLarge.copy(
-                                fontWeight = FontWeight.Black,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                fontFamily = FontFamily.Monospace
-                            )
+                    IconButton(onClick = onCancel) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Go Back",
+                            tint = MaterialTheme.colorScheme.onBackground
                         )
                     }
+                    Text(
+                        text = "Flipping Out...",
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                    )
                 }
+
+                val connectionFlowState by com.example.service.FlipTransferForegroundService.connectionFlowState.collectAsState()
+
+                DisposableEffect(Unit) {
+                    com.example.service.FlipTransferForegroundService.startSenderControl(context)
+                    onDispose {
+                        com.example.service.FlipTransferForegroundService.teardownFirstTimeConnection()
+                    }
+                }
+
+                val statusText = when (val s = connectionFlowState) {
+                    is com.example.service.FirstTimeConnectionState.Idle -> "Waiting for receiver..."
+                    is com.example.service.FirstTimeConnectionState.Joining -> "Receiver connecting..."
+                    is com.example.service.FirstTimeConnectionState.AwaitingLink -> "Awaiting link..."
+                    is com.example.service.FirstTimeConnectionState.Handshaking -> "Verifying receiver..."
+                    is com.example.service.FirstTimeConnectionState.Connected -> "Connected!"
+                    is com.example.service.FirstTimeConnectionState.Failed -> s.reason
+                }
+                val isFailed = connectionFlowState is com.example.service.FirstTimeConnectionState.Failed
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.fillMaxWidth()
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    if (isFailed) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Failed",
+                            tint = AccentRed,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    } else {
+                        CircularProgressIndicator(
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 3.dp,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
                     Text(
-                        text = "Server IP: ${localDevice?.ip}:${localDevice?.port}",
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontFamily = FontFamily.Monospace
+                        text = statusText,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = if (isFailed) AccentRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontWeight = FontWeight.Bold
                         )
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    IconButton(
-                        onClick = { 
-                            editingIp = localDevice?.ip ?: ""
-                            showIpEditDialog = true 
-                        },
-                        modifier = Modifier.size(24.dp)
+                    if (isFailed) {
+                        TextButton(
+                            onClick = { com.example.service.FlipTransferForegroundService.startSenderControl(context) },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text("Retry", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+
+                // Beautiful Card presenting Animation or QR Code fallback and Details
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Edit,
-                            contentDescription = "Edit Server IP",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(14.dp)
+                        if (showQrFallback) {
+                            // QR Code Fallback
+                            if (qrBitmap != null) {
+                                Surface(
+                                    color = Color.White,
+                                    shape = RoundedCornerShape(16.dp),
+                                    modifier = Modifier
+                                        .size(170.dp)
+                                        .padding(4.dp)
+                                ) {
+                                    Image(
+                                        bitmap = qrBitmap.asImageBitmap(),
+                                        contentDescription = "Pairing QR Code",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(170.dp)
+                                        .background(MaterialTheme.colorScheme.background, RoundedCornerShape(16.dp)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("QR Error", color = AccentRed)
+                                }
+                            }
+
+                            // Text link to switch back to animation
+                            TextButton(
+                                onClick = { showQrFallback = false },
+                                modifier = Modifier.testTag("hide_qr_fallback_link")
+                            ) {
+                                Text(
+                                    text = "Hide QR",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                )
+                            }
+                        } else {
+                            // Pulsing Hotspot / Radio animation
+                            PulsingRadioAnimation(
+                                modifier = Modifier.padding(vertical = 4.dp),
+                                size = 170.dp,
+                                waveColor = MaterialTheme.colorScheme.primary
+                            )
+
+                            // Small "Show QR instead" text link
+                            TextButton(
+                                onClick = { showQrFallback = true },
+                                modifier = Modifier.testTag("show_qr_fallback_link")
+                            ) {
+                                Text(
+                                    text = "Show QR instead",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = if (showQrFallback) {
+                                "Receiver can scan this QR code within the Flip app, or connect using the code below:"
+                            } else {
+                                "Broadcasting via BLE. Nearby receivers will detect this device automatically."
+                            },
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
                         )
+
+                        // Connection code
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = "CONNECT CODE",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        letterSpacing = 2.sp
+                                    )
+                                )
+                                Text(
+                                    text = connectCode,
+                                    style = MaterialTheme.typography.titleLarge.copy(
+                                        fontWeight = FontWeight.Black,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                )
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.weight(1f))
-
-        OutlinedButton(
-            onClick = onCancel,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp)
-                .testTag("cancel_advertising_button"),
-            colors = ButtonDefaults.outlinedButtonColors(
-                contentColor = AccentRed
-            ),
-            border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Text(
-                "Cancel", 
-                color = AccentRed, 
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
-            )
+            // Bottom action anchored with spacing
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .testTag("cancel_advertising_button"),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = AccentRed
+                    ),
+                    border = BorderStroke(1.dp, AccentRed.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Text(
+                        "Cancel", 
+                        color = AccentRed, 
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                }
+            }
         }
     }
 }
@@ -1753,7 +1834,7 @@ fun ReceiverScanningScreen(
                             )
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
-                                text = "Searching over BLE...",
+                                text = "Searching...",
                                 style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                             )
                         }
@@ -1828,7 +1909,7 @@ fun ReceiverScanningScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "Or enter Connect Code",
+                    text = "Connect with code",
                     style = MaterialTheme.typography.titleSmall.copy(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 )
 
@@ -1838,8 +1919,10 @@ fun ReceiverScanningScreen(
                 ) {
                     OutlinedTextField(
                         value = manualCode,
-                        onValueChange = { manualCode = it },
-                        placeholder = { Text("Enter 4-Digit Code", color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                        onValueChange = { newValue ->
+                            manualCode = newValue.filter { it.isDigit() }
+                        },
+                        placeholder = { Text("Enter code", color = MaterialTheme.colorScheme.onSurfaceVariant) },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("manual_code_input"),
@@ -1855,7 +1938,7 @@ fun ReceiverScanningScreen(
 
                     Button(
                         onClick = {
-                            val code = manualCode.trim()
+                            val code = manualCode.trim().filter { it.isDigit() }
                             if (code.length >= 4) {
                                 // Connect codes map to last octet + port
                                 // e.g. Connect Code "58080" maps to IP segment: .5, Port: 8080.
@@ -1864,11 +1947,12 @@ fun ReceiverScanningScreen(
                                     val parts = localIpStr.split(".")
                                     "${parts[0]}.${parts[1]}.${parts[2]}."
                                 } else {
-                                    "192.168.43." // standard Android Hotspot subnet base
+                                    "192.168.49."
                                 }
                                 val portPart = code.takeLast(4).toIntOrNull() ?: 8080
                                 val ipOctet = code.dropLast(4)
-                                onManualConnect("$basePrefix$ipOctet", portPart)
+                                val targetIp = if (ipOctet.isNotEmpty()) "$basePrefix$ipOctet" else "${basePrefix}1"
+                                onManualConnect(targetIp, portPart)
                             }
                         },
                         modifier = Modifier
@@ -1911,7 +1995,7 @@ fun ReceiverScanningScreen(
 }
 
 // -------------------------------------------------------------
-// IN-APP FILE EXPLORER COMPONENTS
+// FILES COMPONENTS
 // -------------------------------------------------------------
 @Composable
 fun CustomFilterChip(
@@ -1942,12 +2026,408 @@ fun CustomFilterChip(
     }
 }
 
+@Composable
+fun DaySectionHeader(
+    title: String,
+    totalCount: Int,
+    selectedCount: Int,
+    onToggleSelectAll: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 16.dp, bottom = 6.dp, start = 4.dp, end = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall.copy(
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+            ),
+            modifier = Modifier.weight(1f)
+        )
+
+        // Select circle for date header with minimum 48dp touch target
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(bounded = false, radius = 22.dp),
+                    onClick = onToggleSelectAll
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            when {
+                // All selected -> filled check
+                selectedCount == totalCount && totalCount > 0 -> {
+                    Surface(
+                        modifier = Modifier.size(22.dp),
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        shadowElevation = 1.dp
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = "All selected",
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
+                // Some selected -> partly filled circle
+                selectedCount in 1 until totalCount -> {
+                    Surface(
+                        modifier = Modifier.size(22.dp),
+                        shape = CircleShape,
+                        color = Color.Transparent,
+                        border = BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary)
+                            )
+                        }
+                    }
+                }
+                // None selected -> empty circle
+                else -> {
+                    Surface(
+                        modifier = Modifier.size(22.dp),
+                        shape = CircleShape,
+                        color = Color.Transparent,
+                        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+                    ) {}
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MediaGridItem(
+    file: FileEntry,
+    isChecked: Boolean,
+    onOpen: () -> Unit,
+    onToggleSelect: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isVideo = file.category == "Videos"
+
+    Box(
+        modifier = modifier
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+            .border(
+                width = if (isChecked) 2.5.dp else 0.5.dp,
+                color = if (isChecked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
+                shape = RoundedCornerShape(8.dp)
+            )
+            .clickable(onClick = onOpen)
+    ) {
+        FileThumbnail(
+            file = file,
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Video indicator badge
+        if (isVideo) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(4.dp),
+                shape = RoundedCornerShape(4.dp),
+                color = Color.Black.copy(alpha = 0.65f)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "Video",
+                        tint = Color.White,
+                        modifier = Modifier.size(12.dp)
+                    )
+                }
+            }
+        }
+
+        // Selected item subtle dim overlay
+        if (isChecked) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.24f))
+            )
+        }
+
+        // Small select circle in top-right corner with 48dp minimum touch target
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .size(48.dp)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = ripple(bounded = false, radius = 20.dp),
+                    onClick = onToggleSelect
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (isChecked) {
+                Surface(
+                    modifier = Modifier.size(22.dp),
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primary,
+                    shadowElevation = 2.dp
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = "Selected",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
+            } else {
+                Surface(
+                    modifier = Modifier.size(22.dp),
+                    shape = CircleShape,
+                    color = Color.Black.copy(alpha = 0.35f),
+                    border = BorderStroke(1.5.dp, Color.White.copy(alpha = 0.85f)),
+                    shadowElevation = 1.dp
+                ) {}
+            }
+        }
+    }
+}
+
+@Composable
+fun FileListItemCard(
+    file: FileEntry,
+    selectedCategory: String,
+    isChecked: Boolean,
+    context: Context,
+    onOpen: () -> Unit,
+    onToggleSelect: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isDirectory = file.isDirectory
+    val isApp = file.category == "Apps"
+    val isMedia = file.category == "Images" || file.category == "Videos"
+    val isDocument = file.category == "Documents"
+
+    val dateString = remember(file.dateModified) {
+        if (file.dateModified > 0) {
+            val sdf = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault())
+            sdf.format(Date(file.dateModified * 1000L))
+        } else {
+            ""
+        }
+    }
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpen),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isChecked) {
+                MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        ),
+        border = BorderStroke(
+            width = if (isChecked) 2.dp else 1.dp,
+            color = if (isChecked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+        ),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                val icon = when (file.category) {
+                    "Images" -> Icons.Default.Image
+                    "Videos" -> Icons.Default.VideoLibrary
+                    "Audio" -> Icons.Default.Audiotrack
+                    "Apps" -> Icons.Default.Android
+                    "Directory" -> Icons.Default.Folder
+                    else -> Icons.Default.InsertDriveFile
+                }
+
+                if (isApp && file.appIcon != null) {
+                    val appIcon = file.appIcon
+                    val iconBitmap = remember(appIcon) {
+                        val width = appIcon.intrinsicWidth.coerceAtLeast(1)
+                        val height = appIcon.intrinsicHeight.coerceAtLeast(1)
+                        val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+                        val canvas = android.graphics.Canvas(bitmap)
+                        appIcon.setBounds(0, 0, canvas.width, canvas.height)
+                        appIcon.draw(canvas)
+                        bitmap
+                    }
+                    Image(
+                        bitmap = iconBitmap.asImageBitmap(),
+                        contentDescription = "App Icon",
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                    )
+                } else if (isMedia) {
+                    FileThumbnail(
+                        file = file,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                    )
+                } else if (isDocument) {
+                    val (docIcon, docTint) = getDocumentIconAndTint(file)
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = docTint.copy(alpha = 0.12f),
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = docIcon,
+                                contentDescription = file.name,
+                                tint = docTint,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                    }
+                } else {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = file.category,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    val displayName = if (isApp) file.name.removeSuffix(".apk") else file.name
+                    Text(
+                        text = displayName,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (isApp) {
+                        val sizeStr = android.text.format.Formatter.formatFileSize(context, file.size)
+                        val versionStr = file.versionName ?: "1.0"
+                        val pkgStr = file.packageName ?: ""
+                        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            if (pkgStr.isNotEmpty()) {
+                                Text(
+                                    text = pkgStr,
+                                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(
+                                text = "Version: $versionStr • Size: $sizeStr",
+                                style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            )
+                        }
+                    } else if (!isDirectory) {
+                        val sizeStr = android.text.format.Formatter.formatFileSize(context, file.size)
+                        val subText = if (dateString.isNotEmpty()) "$sizeStr • $dateString" else sizeStr
+                        Text(
+                            text = subText,
+                            style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        )
+                    } else {
+                        Text(
+                            text = "Folder",
+                            style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        )
+                    }
+                }
+            }
+
+            // Select circle at the end of the row (or folder navigation arrow)
+            if (!isDirectory) {
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = ripple(bounded = false, radius = 22.dp),
+                            onClick = onToggleSelect
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isChecked) {
+                        Surface(
+                            modifier = Modifier.size(22.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary,
+                            shadowElevation = 1.dp
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Selected",
+                                    tint = MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+                    } else {
+                        Surface(
+                            modifier = Modifier.size(22.dp),
+                            shape = CircleShape,
+                            color = Color.Transparent,
+                            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+                        ) {}
+                    }
+                }
+            } else {
+                Icon(
+                    imageVector = Icons.Default.ArrowForward,
+                    contentDescription = "Open Folder",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalPermissionsApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun InAppFilePickerContent(
     onDismiss: () -> Unit,
     onSendFiles: (List<LocalFileItem>) -> Unit,
-    onLaunchSystemPicker: () -> Unit
+    onLaunchSystemPicker: () -> Unit,
+    selectedKeysState: MutableState<Set<String>> = remember { mutableStateOf(emptySet()) },
+    clearSelectionOnBack: Boolean = true
 ) {
     val context = LocalContext.current
     val prefs = remember(context) { context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE) }
@@ -1967,6 +2447,8 @@ fun InAppFilePickerContent(
     // Category files observed from app-scoped FileRepository
     val currentCategoryFlow = remember(selectedCategory) { FileRepository.getCategoryFlow(selectedCategory) }
     val filesList by currentCategoryFlow.collectAsState()
+    val currentGroupedFlow = remember(selectedCategory) { FileRepository.getGroupedCategoryFlow(selectedCategory) }
+    val groupedList by (currentGroupedFlow ?: remember { kotlinx.coroutines.flow.MutableStateFlow(emptyList()) }).collectAsState()
     val isLoadingMap by FileRepository.isLoadingMap.collectAsState()
     val isLoading = isLoadingMap[selectedCategory] == true
     var searchQuery by remember { mutableStateOf("") }
@@ -1975,8 +2457,7 @@ fun InAppFilePickerContent(
     var currentDirectory by remember { mutableStateOf(android.os.Environment.getExternalStorageDirectory() ?: java.io.File("/sdcard")) }
     
     // Multi-select state tracked strictly by canonical key
-    var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var isSelectionMode by remember { mutableStateOf(false) }
+    var selectedKeys by selectedKeysState
 
     // Deletion states and Scoped Storage consent launcher
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
@@ -1991,17 +2472,17 @@ fun InAppFilePickerContent(
                 val keys = entries.map { it.key }.toSet()
                 com.example.repository.FileRepository.purgeKeys(keys)
                 selectedKeys = selectedKeys - keys
-                if (selectedKeys.isEmpty()) isSelectionMode = false
-                Toast.makeText(context, "Deleted ${entries.size} file(s)", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Deleted ${entries.size} file${if (entries.size > 1) "s" else ""}", Toast.LENGTH_SHORT).show()
             }
+        } else {
+            Toast.makeText(context, "Deletion cancelled or permission denied", Toast.LENGTH_SHORT).show()
         }
         pendingConsentEntries = null
     }
 
     // Proper back handler
     BackHandler(enabled = true) {
-        if (isSelectionMode) {
-            isSelectionMode = false
+        if (clearSelectionOnBack && selectedKeys.isNotEmpty()) {
             selectedKeys = emptySet()
         } else if (selectedCategory == "Storage" && currentDirectory != android.os.Environment.getExternalStorageDirectory()) {
             val parent = currentDirectory.parentFile
@@ -2042,7 +2523,6 @@ fun InAppFilePickerContent(
             FileRepository.addSafDocuments(context, resolved)
             val resolvedKeys = resolved.map { FileRepository.toFileEntry(context, it).key }
             selectedKeys = selectedKeys + resolvedKeys
-            isSelectionMode = true
         }
     }
 
@@ -2226,15 +2706,22 @@ fun InAppFilePickerContent(
         }
     }
     
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .imePadding(),
+        contentAlignment = Alignment.TopCenter
     ) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 480.dp)
+                .fillMaxSize()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
         // Header
-        if (isSelectionMode) {
+        if (selectedKeys.isNotEmpty()) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -2244,11 +2731,8 @@ fun InAppFilePickerContent(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    IconButton(onClick = {
-                        isSelectionMode = false
-                        selectedKeys = emptySet()
-                    }) {
-                        Icon(imageVector = Icons.Default.Close, contentDescription = "Cancel Selection", tint = AccentRed)
+                    IconButton(onClick = { selectedKeys = emptySet() }) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Clear Selection", tint = AccentRed)
                     }
                     Text(
                         text = "${selectedKeys.size} selected",
@@ -2258,41 +2742,13 @@ fun InAppFilePickerContent(
                         )
                     )
                 }
-                
-                if (selectedKeys.isNotEmpty()) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        IconButton(
-                            onClick = {
-                                val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
-                                entriesToDelete = selectedEntries
-                                showDeleteConfirmDialog = true
-                            },
-                            modifier = Modifier.size(38.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Delete,
-                                contentDescription = "Delete Selected",
-                                tint = AccentRed,
-                                modifier = Modifier.size(22.dp)
-                            )
-                        }
 
-                        Button(
-                            onClick = {
-                                val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
-                                handleSendAction(selectedEntries.map { it.transferSource })
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                            modifier = Modifier.height(38.dp)
-                        ) {
-                            Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Send", style = MaterialTheme.typography.labelMedium)
-                        }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TextButton(onClick = { selectedKeys = emptySet() }) {
+                        Text("Clear", style = MaterialTheme.typography.labelLarge)
                     }
                 }
             }
@@ -2310,7 +2766,7 @@ fun InAppFilePickerContent(
                         Icon(imageVector = Icons.Default.Close, contentDescription = "Close File Picker")
                     }
                     Text(
-                        text = "In-App Explorer",
+                        text = "Files",
                         style = MaterialTheme.typography.titleLarge.copy(
                             fontWeight = FontWeight.Bold, 
                             color = MaterialTheme.colorScheme.onSurface
@@ -2561,6 +3017,9 @@ fun InAppFilePickerContent(
                         color = MaterialTheme.colorScheme.primary
                     )
                 } else {
+                    val isGroupedCategory = selectedCategory in listOf("Images", "Videos", "Audio", "Documents")
+                    val isGridCategory = selectedCategory in listOf("Images", "Videos")
+
                     val displayFiles = remember(filesList, searchQuery) {
                         if (searchQuery.isBlank()) {
                             filesList
@@ -2568,8 +3027,20 @@ fun InAppFilePickerContent(
                             filesList.filter { it.name.contains(searchQuery, ignoreCase = true) }
                         }
                     }
+
+                    val displayGroups = remember(filesList, searchQuery, groupedList, selectedCategory) {
+                        if (!isGroupedCategory) {
+                            emptyList()
+                        } else if (searchQuery.isBlank()) {
+                            groupedList
+                        } else {
+                            FileRepository.groupFilesByDay(displayFiles)
+                        }
+                    }
+
+                    val isEmpty = if (isGroupedCategory) displayGroups.isEmpty() else displayFiles.isEmpty()
                     
-                    if (displayFiles.isEmpty()) {
+                    if (isEmpty) {
                         Column(
                             modifier = Modifier.fillMaxSize(),
                             verticalArrangement = Arrangement.Center,
@@ -2593,532 +3064,389 @@ fun InAppFilePickerContent(
                                 style = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
                             )
                         }
-                    } else {
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        modifier = Modifier.fillMaxSize()
-                    ) {
-                        if (selectedCategory == "Apps") {
-                            item {
-                                Card(
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-                                    ),
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(bottom = 8.dp)
+                    } else if (isGridCategory) {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            displayGroups.forEach { group ->
+                                val groupKeys = group.files.map { it.key }.toSet()
+                                val selectedCount = group.files.count { it.key in selectedKeys }
+                                item(
+                                    key = group.dayKey,
+                                    span = { GridItemSpan(maxLineSpan) }
                                 ) {
-                                    Column(
-                                        modifier = Modifier.padding(12.dp),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Text(
-                                            text = "App Sharing Preferences",
-                                            style = MaterialTheme.typography.bodyMedium.copy(
-                                                fontWeight = FontWeight.Bold,
-                                                color = MaterialTheme.colorScheme.onSurface
-                                            )
-                                        )
-                                        
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clickable {
-                                                    showSystemApps = !showSystemApps
-                                                }
-                                                .padding(vertical = 4.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = "Show System Apps",
-                                                    style = MaterialTheme.typography.bodySmall.copy(
-                                                        fontWeight = FontWeight.Bold,
-                                                        color = MaterialTheme.colorScheme.onSurface
-                                                    )
-                                                )
-                                                Text(
-                                                    text = "Include system packages in the applications list",
-                                                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                )
+                                    DaySectionHeader(
+                                        title = group.headerTitle,
+                                        totalCount = group.files.size,
+                                        selectedCount = selectedCount,
+                                        onToggleSelectAll = {
+                                            selectedKeys = if (selectedCount == group.files.size) {
+                                                selectedKeys - groupKeys
+                                            } else {
+                                                selectedKeys + groupKeys
                                             }
-                                            Switch(
-                                                checked = showSystemApps,
-                                                onCheckedChange = { showSystemApps = it },
-                                                colors = SwitchDefaults.colors(
-                                                    checkedThumbColor = MaterialTheme.colorScheme.primary,
-                                                    checkedTrackColor = MaterialTheme.colorScheme.primaryContainer
-                                                )
-                                            )
                                         }
-
-                                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
-
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clickable {
-                                                    keepExtractedApk = !keepExtractedApk
-                                                    prefs.edit().putBoolean("keep_extracted_apk", keepExtractedApk).apply()
-                                                }
-                                                .padding(vertical = 4.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
-                                        ) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = "Keep Extracted APKs",
-                                                    style = MaterialTheme.typography.bodySmall.copy(
-                                                        fontWeight = FontWeight.Bold,
-                                                        color = MaterialTheme.colorScheme.onSurface
-                                                    )
-                                                )
-                                                Text(
-                                                    text = "Save extracted APKs in internal storage after transfer complete",
-                                                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                )
-                                            }
-                                            Switch(
-                                                checked = keepExtractedApk,
-                                                onCheckedChange = {
-                                                    keepExtractedApk = it
-                                                    prefs.edit().putBoolean("keep_extracted_apk", it).apply()
-                                                },
-                                                colors = SwitchDefaults.colors(
-                                                    checkedThumbColor = MaterialTheme.colorScheme.primary,
-                                                    checkedTrackColor = MaterialTheme.colorScheme.primaryContainer
-                                                )
-                                            )
+                                    )
+                                }
+                                items(group.files, key = { it.key }) { file ->
+                                    val isChecked = selectedKeys.contains(file.key)
+                                    MediaGridItem(
+                                        file = file,
+                                        isChecked = isChecked,
+                                        onOpen = { openLocalFile(context, file) },
+                                        onToggleSelect = {
+                                            selectedKeys = if (isChecked) selectedKeys - file.key else selectedKeys + file.key
                                         }
-                                    }
+                                    )
                                 }
                             }
                         }
-
-                        if (selectedCategory == "Storage") {
-                            item {
-                                val externalStorageDir = android.os.Environment.getExternalStorageDirectory()
-                                val totalSpace = externalStorageDir.totalSpace
-                                val freeSpace = externalStorageDir.freeSpace
-                                val usedSpace = totalSpace - freeSpace
-                                val totalStr = android.text.format.Formatter.formatFileSize(context, totalSpace)
-                                val freeStr = android.text.format.Formatter.formatFileSize(context, freeSpace)
-                                val usedStr = android.text.format.Formatter.formatFileSize(context, usedSpace)
-                                val usedPercent = if (totalSpace > 0) usedSpace.toFloat() / totalSpace else 0f
-
-                                Card(
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-                                    ),
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(bottom = 8.dp)
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(12.dp),
-                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    } else {
+                        LazyColumn(
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            if (selectedCategory == "Apps") {
+                                item(key = "apps_pref_card") {
+                                    Card(
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(bottom = 8.dp)
                                     ) {
-                                        Row(
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            modifier = Modifier.fillMaxWidth()
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
                                         ) {
                                             Text(
-                                                text = "Storage Space Info",
+                                                text = "App Sharing Preferences",
                                                 style = MaterialTheme.typography.bodyMedium.copy(
                                                     fontWeight = FontWeight.Bold,
                                                     color = MaterialTheme.colorScheme.onSurface
                                                 )
                                             )
-                                            Text(
-                                                text = "$usedStr / $totalStr used",
-                                                style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            )
+                                            
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable {
+                                                        showSystemApps = !showSystemApps
+                                                    }
+                                                    .padding(vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = "Show System Apps",
+                                                        style = MaterialTheme.typography.bodySmall.copy(
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                    )
+                                                    Text(
+                                                        text = "Include system packages in the applications list",
+                                                        style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                    )
+                                                }
+                                                Switch(
+                                                    checked = showSystemApps,
+                                                    onCheckedChange = { showSystemApps = it },
+                                                    colors = SwitchDefaults.colors(
+                                                        checkedThumbColor = MaterialTheme.colorScheme.primary,
+                                                        checkedTrackColor = MaterialTheme.colorScheme.primaryContainer
+                                                    )
+                                                )
+                                            }
+
+                                            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f))
+
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable {
+                                                        keepExtractedApk = !keepExtractedApk
+                                                        prefs.edit().putBoolean("keep_extracted_apk", keepExtractedApk).apply()
+                                                    }
+                                                    .padding(vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = "Keep Extracted APKs",
+                                                        style = MaterialTheme.typography.bodySmall.copy(
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                    )
+                                                    Text(
+                                                        text = "Save extracted APKs in internal storage after transfer complete",
+                                                        style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                    )
+                                                }
+                                                Switch(
+                                                    checked = keepExtractedApk,
+                                                    onCheckedChange = {
+                                                        keepExtractedApk = it
+                                                        prefs.edit().putBoolean("keep_extracted_apk", it).apply()
+                                                    },
+                                                    colors = SwitchDefaults.colors(
+                                                        checkedThumbColor = MaterialTheme.colorScheme.primary,
+                                                        checkedTrackColor = MaterialTheme.colorScheme.primaryContainer
+                                                    )
+                                                )
+                                            }
                                         }
-                                        LinearProgressIndicator(
-                                            progress = { usedPercent },
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .height(6.dp)
-                                                .clip(RoundedCornerShape(3.dp)),
-                                            color = MaterialTheme.colorScheme.primary,
-                                            trackColor = MaterialTheme.colorScheme.outlineVariant
-                                        )
-                                        Text(
-                                            text = "$freeStr free",
-                                            style = MaterialTheme.typography.bodySmall.copy(
-                                                color = MaterialTheme.colorScheme.primary,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        )
                                     }
                                 }
                             }
-                        }
 
-                        if (selectedCategory == "Documents") {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !hasAllFilesAccess) {
-                                item {
+                            if (selectedCategory == "Storage") {
+                                item(key = "storage_info_card") {
+                                    val externalStorageDir = android.os.Environment.getExternalStorageDirectory()
+                                    val totalSpace = externalStorageDir.totalSpace
+                                    val freeSpace = externalStorageDir.freeSpace
+                                    val usedSpace = totalSpace - freeSpace
+                                    val totalStr = android.text.format.Formatter.formatFileSize(context, totalSpace)
+                                    val freeStr = android.text.format.Formatter.formatFileSize(context, freeSpace)
+                                    val usedStr = android.text.format.Formatter.formatFileSize(context, usedSpace)
+                                    val usedPercent = if (totalSpace > 0) usedSpace.toFloat() / totalSpace else 0f
+
                                     Card(
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(bottom = 12.dp)
-                                            .testTag("documents_permission_card"),
-                                        colors = CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                                        ),
-                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
-                                        shape = RoundedCornerShape(16.dp)
+                                            .padding(bottom = 8.dp)
                                     ) {
                                         Column(
-                                            modifier = Modifier.padding(16.dp),
-                                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
                                         ) {
                                             Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                modifier = Modifier.fillMaxWidth()
                                             ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Description,
-                                                    contentDescription = null,
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(24.dp)
-                                                )
                                                 Text(
-                                                    text = "Allow access to documents",
-                                                    style = MaterialTheme.typography.titleMedium.copy(
+                                                    text = "Storage Space Info",
+                                                    style = MaterialTheme.typography.bodyMedium.copy(
                                                         fontWeight = FontWeight.Bold,
                                                         color = MaterialTheme.colorScheme.onSurface
                                                     )
                                                 )
+                                                Text(
+                                                    text = "$usedStr / $totalStr used",
+                                                    style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                )
                                             }
+                                            LinearProgressIndicator(
+                                                progress = { usedPercent },
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(6.dp)
+                                                    .clip(RoundedCornerShape(3.dp)),
+                                                color = MaterialTheme.colorScheme.primary,
+                                                trackColor = MaterialTheme.colorScheme.outlineVariant
+                                            )
                                             Text(
-                                                text = "On Android 11+, browsing PDF, Office, and text documents requires All Files Access. You can grant access or pick specific documents manually.",
+                                                text = "$freeStr free",
                                                 style = MaterialTheme.typography.bodySmall.copy(
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    color = MaterialTheme.colorScheme.primary,
+                                                    fontWeight = FontWeight.Bold
                                                 )
                                             )
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (selectedCategory == "Documents") {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !hasAllFilesAccess) {
+                                    item(key = "documents_perm_card") {
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(bottom = 12.dp)
+                                                .testTag("documents_permission_card"),
+                                            colors = CardDefaults.cardColors(
+                                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                            ),
+                                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
+                                            shape = RoundedCornerShape(16.dp)
+                                        ) {
+                                            Column(
+                                                modifier = Modifier.padding(16.dp),
+                                                verticalArrangement = Arrangement.spacedBy(10.dp)
                                             ) {
-                                                Button(
-                                                    onClick = {
-                                                        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                                                            data = Uri.parse("package:${context.packageName}")
-                                                        }
-                                                        try {
-                                                            context.startActivity(intent)
-                                                        } catch (_: Exception) {
-                                                            val fallback = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                                                            try {
-                                                                context.startActivity(fallback)
-                                                            } catch (e: Exception) {
-                                                                Toast.makeText(context, "Cannot open settings: ${e.message}", Toast.LENGTH_SHORT).show()
-                                                            }
-                                                        }
-                                                    },
-                                                    modifier = Modifier.weight(1f).testTag("allow_documents_button"),
-                                                    shape = RoundedCornerShape(10.dp)
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                                                 ) {
-                                                    Text("Allow access")
+                                                    Icon(
+                                                        imageVector = Icons.Default.Description,
+                                                        contentDescription = null,
+                                                        tint = MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.size(24.dp)
+                                                    )
+                                                    Text(
+                                                        text = "Allow access to documents",
+                                                        style = MaterialTheme.typography.titleMedium.copy(
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onSurface
+                                                        )
+                                                    )
                                                 }
-                                                OutlinedButton(
-                                                    onClick = { safDocumentsLauncher.launch(arrayOf("*/*")) },
-                                                    modifier = Modifier.weight(1f).testTag("pick_documents_button"),
-                                                    shape = RoundedCornerShape(10.dp)
+                                                Text(
+                                                    text = "On Android 11+, browsing PDF, Office, and text documents requires All Files Access. You can grant access or pick specific documents manually.",
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
+                                                )
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                                                 ) {
-                                                    Text("Pick documents")
+                                                    Button(
+                                                        onClick = {
+                                                            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                                                data = Uri.parse("package:${context.packageName}")
+                                                            }
+                                                            try {
+                                                                context.startActivity(intent)
+                                                            } catch (_: Exception) {
+                                                                val fallback = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                                                try {
+                                                                    context.startActivity(fallback)
+                                                                } catch (e: Exception) {
+                                                                    Toast.makeText(context, "Cannot open settings: ${e.message}", Toast.LENGTH_SHORT).show()
+                                                                }
+                                                            }
+                                                        },
+                                                        modifier = Modifier.weight(1f).testTag("allow_documents_button"),
+                                                        shape = RoundedCornerShape(10.dp)
+                                                    ) {
+                                                        Text("Allow access")
+                                                    }
+                                                    OutlinedButton(
+                                                        onClick = { safDocumentsLauncher.launch(arrayOf("*/*")) },
+                                                        modifier = Modifier.weight(1f).testTag("pick_documents_button"),
+                                                        shape = RoundedCornerShape(10.dp)
+                                                    ) {
+                                                        Text("Pick documents")
+                                                    }
                                                 }
                                             }
                                         }
+                                    }
+                                } else {
+                                    item(key = "documents_pick_card") {
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(bottom = 6.dp)
+                                                .clickable { safDocumentsLauncher.launch(arrayOf("*/*")) },
+                                            colors = CardDefaults.cardColors(
+                                                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                                            ),
+                                            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
+                                            shape = RoundedCornerShape(16.dp)
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(14.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.FolderOpen,
+                                                    contentDescription = "Pick Documents",
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(28.dp)
+                                                )
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = "Pick Documents",
+                                                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                                    )
+                                                    Text(
+                                                        text = "Select from secure device downloads, files, or cloud folders.",
+                                                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f))
+                                                    )
+                                                }
+                                                Icon(
+                                                    imageVector = Icons.Default.Add,
+                                                    contentDescription = "Add Documents",
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(20.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (isGroupedCategory) {
+                                displayGroups.forEach { group ->
+                                    val groupKeys = group.files.map { it.key }.toSet()
+                                    val selectedCount = group.files.count { it.key in selectedKeys }
+                                    item(key = group.dayKey) {
+                                        DaySectionHeader(
+                                            title = group.headerTitle,
+                                            totalCount = group.files.size,
+                                            selectedCount = selectedCount,
+                                            onToggleSelectAll = {
+                                                selectedKeys = if (selectedCount == group.files.size) {
+                                                    selectedKeys - groupKeys
+                                                } else {
+                                                    selectedKeys + groupKeys
+                                                }
+                                            }
+                                        )
+                                    }
+                                    items(group.files, key = { it.key }) { file ->
+                                        val isChecked = selectedKeys.contains(file.key)
+                                        FileListItemCard(
+                                            file = file,
+                                            selectedCategory = selectedCategory,
+                                            isChecked = isChecked,
+                                            context = context,
+                                            onOpen = { openLocalFile(context, file) },
+                                            onToggleSelect = {
+                                                selectedKeys = if (isChecked) selectedKeys - file.key else selectedKeys + file.key
+                                            }
+                                        )
                                     }
                                 }
                             } else {
-                                item {
-                                    Card(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(bottom = 6.dp)
-                                            .clickable { safDocumentsLauncher.launch(arrayOf("*/*")) },
-                                        colors = CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
-                                        ),
-                                        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
-                                        shape = RoundedCornerShape(16.dp)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(14.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.FolderOpen,
-                                                contentDescription = "Pick Documents",
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(28.dp)
-                                            )
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = "Pick Documents",
-                                                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                                                )
-                                                Text(
-                                                    text = "Select from secure device downloads, files, or cloud folders.",
-                                                    style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f))
-                                                )
-                                            }
-                                            Icon(
-                                                imageVector = Icons.Default.Add,
-                                                contentDescription = "Add Documents",
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
- 
-                        items(displayFiles, key = { it.key }) { file ->
-                            val isChecked = selectedKeys.contains(file.key)
-                            val isDirectory = file.isDirectory
-                            val isApp = file.category == "Apps"
-                            
-                            val dateString = remember(file.dateModified) {
-                                if (file.dateModified > 0) {
-                                    val sdf = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault())
-                                    sdf.format(Date(file.dateModified * 1000L))
-                                } else {
-                                    ""
-                                }
-                            }
-                            
-                            Card(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .combinedClickable(
-                                        onClick = {
-                                            if (isSelectionMode) {
-                                                if (!isDirectory) {
-                                                    val newSelected = if (isChecked) selectedKeys - file.key else selectedKeys + file.key
-                                                    selectedKeys = newSelected
-                                                    if (newSelected.isEmpty()) {
-                                                        isSelectionMode = false
-                                                    }
-                                                }
+                                items(displayFiles, key = { it.key }) { file ->
+                                    val isChecked = selectedKeys.contains(file.key)
+                                    val isDirectory = file.isDirectory
+                                    FileListItemCard(
+                                        file = file,
+                                        selectedCategory = selectedCategory,
+                                        isChecked = isChecked,
+                                        context = context,
+                                        onOpen = {
+                                            if (selectedCategory == "Storage" && isDirectory) {
+                                                currentDirectory = java.io.File(file.displayUri.path ?: "")
                                             } else {
-                                                if (selectedCategory == "Storage" && isDirectory) {
-                                                    currentDirectory = java.io.File(file.displayUri.path ?: "")
-                                                } else {
-                                                    openLocalFile(context, file)
-                                                }
+                                                openLocalFile(context, file)
                                             }
                                         },
-                                        onLongClick = {
-                                            if (!isSelectionMode && !isDirectory) {
-                                                isSelectionMode = true
-                                                selectedKeys = setOf(file.key)
+                                        onToggleSelect = {
+                                            if (!isDirectory) {
+                                                selectedKeys = if (isChecked) selectedKeys - file.key else selectedKeys + file.key
                                             }
                                         }
-                                    ),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = if (isChecked) {
-                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-                                    } else {
-                                        MaterialTheme.colorScheme.surface
-                                    }
-                                ),
-                                border = BorderStroke(
-                                    width = 1.dp,
-                                    color = if (isChecked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
-                                ),
-                                shape = RoundedCornerShape(16.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(14.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        val icon = when (file.category) {
-                                            "Images" -> Icons.Default.Image
-                                            "Videos" -> Icons.Default.VideoLibrary
-                                            "Audio" -> Icons.Default.Audiotrack
-                                            "Apps" -> Icons.Default.Android
-                                            "Directory" -> Icons.Default.Folder
-                                            else -> Icons.Default.InsertDriveFile
-                                        }
-                                        
-                                        val isApp = file.category == "Apps"
-                                        val isMedia = file.category == "Images" || file.category == "Videos"
-                                        val isDocument = file.category == "Documents"
-                                        if (isApp && file.appIcon != null) {
-                                            val appIcon = file.appIcon
-                                            val iconBitmap = remember(appIcon) {
-                                                val width = appIcon.intrinsicWidth.coerceAtLeast(1)
-                                                val height = appIcon.intrinsicHeight.coerceAtLeast(1)
-                                                val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
-                                                val canvas = android.graphics.Canvas(bitmap)
-                                                appIcon.setBounds(0, 0, canvas.width, canvas.height)
-                                                appIcon.draw(canvas)
-                                                bitmap
-                                            }
-                                            Image(
-                                                bitmap = iconBitmap.asImageBitmap(),
-                                                contentDescription = "App Icon",
-                                                modifier = Modifier
-                                                    .size(40.dp)
-                                                    .clip(RoundedCornerShape(8.dp))
-                                            )
-                                        } else if (isMedia) {
-                                            FileThumbnail(
-                                                file = file,
-                                                modifier = Modifier
-                                                    .size(40.dp)
-                                                    .clip(RoundedCornerShape(8.dp))
-                                                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                                            )
-                                        } else if (isDocument) {
-                                            val (docIcon, docTint) = getDocumentIconAndTint(file)
-                                            Surface(
-                                                shape = RoundedCornerShape(8.dp),
-                                                color = docTint.copy(alpha = 0.12f),
-                                                modifier = Modifier.size(40.dp)
-                                            ) {
-                                                Box(contentAlignment = Alignment.Center) {
-                                                    Icon(
-                                                        imageVector = docIcon,
-                                                        contentDescription = file.name,
-                                                        tint = docTint,
-                                                        modifier = Modifier.size(24.dp)
-                                                    )
-                                                }
-                                            }
-                                        } else {
-                                            Icon(
-                                                imageVector = icon,
-                                                contentDescription = file.category,
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(24.dp)
-                                            )
-                                        }
-                                        Spacer(modifier = Modifier.width(12.dp))
-                                        
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            val displayName = if (isApp) file.name.removeSuffix(".apk") else file.name
-                                            Text(
-                                                text = displayName,
-                                                style = MaterialTheme.typography.bodyMedium.copy(
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.onSurface
-                                                ),
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            if (isApp) {
-                                                val sizeStr = android.text.format.Formatter.formatFileSize(context, file.size)
-                                                val versionStr = file.versionName ?: "1.0"
-                                                val pkgStr = file.packageName ?: ""
-                                                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                                    if (pkgStr.isNotEmpty()) {
-                                                        Text(
-                                                            text = pkgStr,
-                                                            style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis
-                                                        )
-                                                    }
-                                                    Text(
-                                                        text = "Version: $versionStr • Size: $sizeStr",
-                                                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                     )
-                                                }
-                                            } else if (!isDirectory) {
-                                                val sizeStr = android.text.format.Formatter.formatFileSize(context, file.size)
-                                                val subText = if (dateString.isNotEmpty()) "$sizeStr • $dateString" else sizeStr
-                                                Text(
-                                                    text = subText,
-                                                    style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                )
-                                            } else {
-                                                Text(
-                                                    text = "Folder",
-                                                    style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                )
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (!isDirectory) {
-                                        if (isSelectionMode) {
-                                            Checkbox(
-                                                checked = isChecked,
-                                                onCheckedChange = { checked ->
-                                                    val newSelected = if (checked == true) {
-                                                        selectedKeys + file.key
-                                                    } else {
-                                                        selectedKeys - file.key
-                                                    }
-                                                    selectedKeys = newSelected
-                                                    if (newSelected.isEmpty()) {
-                                                        isSelectionMode = false
-                                                    }
-                                                }
-                                            )
-                                        } else {
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                            ) {
-                                                if (!isApp && selectedCategory != "Apps") {
-                                                    IconButton(
-                                                        onClick = {
-                                                            entriesToDelete = listOf(file)
-                                                            showDeleteConfirmDialog = true
-                                                        },
-                                                        modifier = Modifier.size(32.dp)
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Default.Delete,
-                                                            contentDescription = "Delete File",
-                                                            tint = AccentRed.copy(alpha = 0.75f),
-                                                            modifier = Modifier.size(18.dp)
-                                                        )
-                                                    }
-                                                }
-
-                                                FilledTonalButton(
-                                                    onClick = {
-                                                        if (isApp) {
-                                                            handleSendAction(listOf(file.transferSource))
-                                                        } else {
-                                                            openLocalFile(context, file)
-                                                        }
-                                                    },
-                                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                                                    modifier = Modifier.height(32.dp),
-                                                    colors = ButtonDefaults.filledTonalButtonColors(
-                                                        containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
-                                                        contentColor = MaterialTheme.colorScheme.primary
-                                                    )
-                                                ) {
-                                                    val btnIcon = if (isApp) Icons.AutoMirrored.Filled.Send else Icons.Default.Launch
-                                                    val btnLabel = if (isApp) "Send" else "Open"
-                                                    Icon(imageVector = btnIcon, contentDescription = btnLabel, modifier = Modifier.size(12.dp))
-                                                    Spacer(modifier = Modifier.width(4.dp))
-                                                    Text(btnLabel, style = MaterialTheme.typography.labelMedium)
-                                                }
-                                            }
-                                        }
-                                    }
+                                    )
                                 }
                             }
                         }
@@ -3126,7 +3454,6 @@ fun InAppFilePickerContent(
                 }
             }
         }
-    }
         
         // Actions Footer
         if (selectedKeys.isNotEmpty()) {
@@ -3154,7 +3481,17 @@ fun InAppFilePickerContent(
 
                 Button(
                     onClick = {
-                        val selectedEntries = filesList.filter { selectedKeys.contains(it.key) }
+                        val allCategoryFiles = FileRepository.images.value +
+                            FileRepository.videos.value +
+                            FileRepository.audio.value +
+                            FileRepository.documents.value +
+                            FileRepository.apps.value +
+                            FileRepository.storage.value
+                        val selectedEntries = if (allCategoryFiles.any { selectedKeys.contains(it.key) }) {
+                            allCategoryFiles.filter { selectedKeys.contains(it.key) }.distinctBy { it.key }
+                        } else {
+                            filesList.filter { selectedKeys.contains(it.key) }
+                        }
                         handleSendAction(selectedEntries.map { it.transferSource })
                     },
                     modifier = Modifier
@@ -3173,6 +3510,7 @@ fun InAppFilePickerContent(
             }
         }
     }
+}
 
     if (isExtracting) {
         AlertDialog(
@@ -3231,7 +3569,7 @@ fun InAppFilePickerContent(
 
     if (showDeleteConfirmDialog && entriesToDelete.isNotEmpty()) {
         val count = entriesToDelete.size
-        val title = if (count == 1) "Delete File?" else "Delete $count Files?"
+        val title = "Delete $count file${if (count > 1) "s" else ""}?"
         val message = if (count == 1) {
             "Are you sure you want to permanently delete \"${entriesToDelete.first().name}\"? This action cannot be undone."
         } else {
@@ -3272,8 +3610,7 @@ fun InAppFilePickerContent(
                                 if (deleted > 0) {
                                     val deletedKeySet = targets.map { it.key }.toSet()
                                     selectedKeys = selectedKeys - deletedKeySet
-                                    if (selectedKeys.isEmpty()) isSelectionMode = false
-                                    Toast.makeText(context, "Deleted $deleted file(s)", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Deleted $deleted file${if (deleted > 1) "s" else ""}", Toast.LENGTH_SHORT).show()
                                 } else {
                                     Toast.makeText(context, "Could not delete file(s)", Toast.LENGTH_SHORT).show()
                                 }
@@ -3317,8 +3654,589 @@ fun InAppFilePickerContent(
 }
 
 // -------------------------------------------------------------
+// TRANSFER METRICS HELPER (Speed & ETA calculation)
+// -------------------------------------------------------------
+object TransferMetricsHelper {
+    private class MetricEntry(
+        var lastBytes: Long = 0L,
+        var lastTimeMillis: Long = 0L,
+        var speedBytesPerSec: Long = 0L,
+        var smoothedSpeed: Double = 0.0
+    )
+
+    private val metricsMap = java.util.concurrent.ConcurrentHashMap<String, MetricEntry>()
+
+    // Sliding window of queue transmission samples for 5-second smoothed speed
+    private data class SpeedSample(val timestamp: Long, val totalBytes: Long)
+    private val queueSamples = java.util.Collections.synchronizedList(mutableListOf<SpeedSample>())
+    private var queueTransferStartTime = 0L
+    private var lastRecordedTransferred = -1L
+
+    fun computeSpeedAndEta(transferId: String, currentBytes: Long, totalBytes: Long): Pair<Long, Long> {
+        val now = System.currentTimeMillis()
+        val entry = metricsMap.computeIfAbsent(transferId) {
+            MetricEntry(currentBytes, now, 0L, 0.0)
+        }
+
+        val elapsed = now - entry.lastTimeMillis
+        if (elapsed >= 500L) {
+            val bytesDelta = (currentBytes - entry.lastBytes).coerceAtLeast(0L)
+            val instantSpeed = (bytesDelta * 1000.0) / elapsed.toDouble()
+            entry.smoothedSpeed = if (entry.smoothedSpeed == 0.0) instantSpeed else (entry.smoothedSpeed * 0.7 + instantSpeed * 0.3)
+            entry.speedBytesPerSec = entry.smoothedSpeed.toLong()
+            entry.lastBytes = currentBytes
+            entry.lastTimeMillis = now
+        }
+
+        val speed = entry.speedBytesPerSec
+        val remainingBytes = (totalBytes - currentBytes).coerceAtLeast(0L)
+        val etaSeconds = if (speed > 1024L) remainingBytes / speed else 0L
+
+        return Pair(speed, etaSeconds)
+    }
+
+    data class QueueStatus(
+        val line1: String,
+        val line2: String,
+        val progress: Float?,
+        val isIncoming: Boolean,
+        val speed: Long = 0L,
+        val timePart: String = ""
+    )
+
+    fun computeQueueStatus(
+        remoteDevice: Device?,
+        transferQueue: List<TransferItem>,
+        connectionState: ConnectionState,
+        role: String? = null
+    ): QueueStatus {
+        val peerName = remoteDevice?.name ?: "Peer"
+        if (connectionState == ConnectionState.SEARCHING || connectionState == ConnectionState.CONNECTING) {
+            val line1 = if (role == "SENDER") "Waiting for receiver..." else "Connecting to $peerName..."
+            val line2 = if (role == "SENDER") "Wi-Fi Direct · Searching" else "Wi-Fi Direct · Connecting"
+            return QueueStatus(line1, line2, null, false)
+        }
+        if (connectionState != ConnectionState.CONNECTED) {
+            return QueueStatus("Disconnected", "Tap to reconnect", null, false)
+        }
+
+        val line1 = "Connected to $peerName"
+        val totalFiles = transferQueue.size
+        if (totalFiles == 0) {
+            return QueueStatus(line1, "Ready", null, false)
+        }
+
+        val completedCount = transferQueue.count { it.status == TransferStatus.COMPLETE }
+        val activeTransfer = transferQueue.find { it.status == TransferStatus.SENDING }
+
+        if (activeTransfer == null) {
+            queueSamples.clear()
+            queueTransferStartTime = 0L
+            lastRecordedTransferred = -1L
+
+            return if (completedCount == totalFiles && totalFiles > 0) {
+                QueueStatus(line1, "All $totalFiles files sent", 1f, false)
+            } else {
+                val pendingCount = transferQueue.count { it.status == TransferStatus.QUEUED }
+                val pausedCount = transferQueue.count { it.status == TransferStatus.PAUSED }
+                val line2 = when {
+                    pausedCount > 0 -> "Transfer paused · $completedCount of $totalFiles complete"
+                    pendingCount > 0 -> "${completedCount + 1} of $totalFiles files queued"
+                    else -> "$totalFiles file${if (totalFiles > 1) "s" else ""}"
+                }
+                QueueStatus(line1, line2, null, false)
+            }
+        }
+
+        // Actively transmitting
+        val now = System.currentTimeMillis()
+        if (queueTransferStartTime == 0L) {
+            queueTransferStartTime = now
+        }
+
+        var transferredBytes = 0L
+        var totalBytes = 0L
+        for (item in transferQueue) {
+            totalBytes += item.fileSize
+            transferredBytes += when (item.status) {
+                TransferStatus.COMPLETE -> item.fileSize
+                TransferStatus.SENDING -> item.bytesTransferred
+                else -> item.bytesTransferred
+            }
+        }
+
+        val overallPercent = if (totalBytes > 0L) {
+            ((transferredBytes * 100L) / totalBytes).toInt().coerceIn(0, 100)
+        } else {
+            0
+        }
+        val overallProgress = if (totalBytes > 0L) {
+            (transferredBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        val remainingBytes = (totalBytes - transferredBytes).coerceAtLeast(0L)
+
+        // 5-second sliding window
+        synchronized(queueSamples) {
+            if (transferredBytes != lastRecordedTransferred || queueSamples.isEmpty() || now - queueSamples.last().timestamp >= 250L) {
+                queueSamples.add(SpeedSample(now, transferredBytes))
+                lastRecordedTransferred = transferredBytes
+            }
+            val cutoff = now - 5000L
+            while (queueSamples.isNotEmpty() && queueSamples.first().timestamp < cutoff) {
+                queueSamples.removeAt(0)
+            }
+        }
+
+        val activeDuration = now - queueTransferStartTime
+        val (speed, timePart) = if (activeDuration < 3000L) {
+            Pair(0L, "Calculating...")
+        } else {
+            val (timeDiff, bytesDiff) = synchronized(queueSamples) {
+                if (queueSamples.size >= 2) {
+                    val first = queueSamples.first()
+                    val last = queueSamples.last()
+                    Pair(last.timestamp - first.timestamp, (last.totalBytes - first.totalBytes).coerceAtLeast(0L))
+                } else {
+                    Pair(0L, 0L)
+                }
+            }
+            val spd = if (timeDiff >= 500L) (bytesDiff * 1000L) / timeDiff else 0L
+            if (spd < 1024L) {
+                Pair(spd, "—")
+            } else {
+                val etaSeconds = remainingBytes / spd
+                Pair(spd, "${formatEta(etaSeconds)} left")
+            }
+        }
+
+        val currentFileIndex = (completedCount + 1).coerceAtMost(totalFiles)
+        val line2 = "$currentFileIndex of $totalFiles · $overallPercent% · $timePart"
+
+        return QueueStatus(
+            line1 = line1,
+            line2 = line2,
+            progress = overallProgress,
+            isIncoming = activeTransfer.isIncoming,
+            speed = speed,
+            timePart = timePart
+        )
+    }
+
+    fun clear(transferId: String) {
+        metricsMap.remove(transferId)
+    }
+
+    fun formatSpeed(bytesPerSec: Long): String {
+        return when {
+            bytesPerSec <= 0L -> "-- B/s"
+            bytesPerSec < 1024L -> "$bytesPerSec B/s"
+            bytesPerSec < 1024L * 1024L -> String.format(Locale.US, "%.1f KB/s", bytesPerSec / 1024.0)
+            else -> String.format(Locale.US, "%.1f MB/s", bytesPerSec / (1024.0 * 1024.0))
+        }
+    }
+
+    fun formatEta(etaSeconds: Long): String {
+        return when {
+            etaSeconds <= 0L -> "< 1s"
+            etaSeconds < 60L -> "${etaSeconds}s"
+            etaSeconds < 3600L -> "${etaSeconds / 60L}m ${etaSeconds % 60L}s"
+            else -> "${etaSeconds / 3600L}h ${(etaSeconds % 3600L) / 60L}m"
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// SESSION MINI BAR & STATUS FORMATTER (2-LINE TABULAR NUMERALS)
+// -------------------------------------------------------------
+@Composable
+fun SessionMiniBar(
+    line1Text: String,
+    line2Text: String,
+    activeProgress: Float?,
+    isIncoming: Boolean = false,
+    onExpand: () -> Unit,
+    onDisconnect: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .clickable(onClick = onExpand)
+            .testTag("session_mini_bar"),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        shadowElevation = 8.dp,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .background(
+                                MaterialTheme.colorScheme.primaryContainer,
+                                CircleShape
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (activeProgress != null) {
+                                if (isIncoming) Icons.Default.ArrowDownward else Icons.Default.ArrowUpward
+                            } else {
+                                Icons.Default.Check
+                            },
+                            contentDescription = "Session Status",
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = line1Text,
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = line2Text,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFeatureSettings = "tnum",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                IconButton(
+                    onClick = onDisconnect,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .testTag("minibar_disconnect_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Disconnect Session",
+                        tint = AccentRed,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            if (activeProgress != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                LinearProgressIndicator(
+                    progress = { activeProgress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .clip(CircleShape),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+                )
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// POST-ONBOARDING SHARE BANNER
+// -------------------------------------------------------------
+@Composable
+fun PostOnboardingShareBanner(
+    data: com.example.viewmodel.PendingShareBannerData,
+    onSend: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val titleText = if (data.items.size == 1) {
+        "${data.items.first().name} ready to send"
+    } else if (data.items.size > 1) {
+        "${data.items.size} files ready to send"
+    } else {
+        "Text link ready to send"
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(16.dp)
+            .testTag("post_onboarding_share_banner"),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        shadowElevation = 8.dp,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AttachFile,
+                        contentDescription = "Pending Files",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Text(
+                    text = titleText,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurfaceVariant)
+                ) {
+                    Text("Dismiss")
+                }
+                Button(
+                    onClick = onSend,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    ),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Send", fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// SHARED APP OPTION SHEET (Play Store link / package ID intake)
+// -------------------------------------------------------------
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SharedAppOptionSheet(
+    option: com.example.viewmodel.AppShareOption,
+    onSendApp: () -> Unit,
+    onSendText: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        dragHandle = { BottomSheetDefaults.DragHandle() },
+        shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
+        containerColor = MaterialTheme.colorScheme.surface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 12.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(
+                text = "Share Options",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            )
+
+            // Option 1: Send App
+            Surface(
+                onClick = onSendApp,
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier.fillMaxWidth().testTag("send_app_option")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    val app = option.appItem
+                    if (app.appIcon != null) {
+                        val iconBitmap = remember(app.packageName) {
+                            try {
+                                val d = app.appIcon
+                                val b = android.graphics.Bitmap.createBitmap(
+                                    d.intrinsicWidth.coerceAtLeast(48),
+                                    d.intrinsicHeight.coerceAtLeast(48),
+                                    android.graphics.Bitmap.Config.ARGB_8888
+                                )
+                                val c = android.graphics.Canvas(b)
+                                d.setBounds(0, 0, c.width, c.height)
+                                d.draw(c)
+                                b.asImageBitmap()
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                        if (iconBitmap != null) {
+                            Image(
+                                bitmap = iconBitmap,
+                                contentDescription = app.name,
+                                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(8.dp))
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Android,
+                                contentDescription = "App Icon",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(40.dp)
+                            )
+                        }
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Android,
+                            contentDescription = "App Icon",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(40.dp)
+                        )
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Send the app ${app.name.removeSuffix(".apk").removeSuffix(".apks")}",
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = formatSize(app.size),
+                                style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            )
+                            if (app.isSplitApk) {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.secondaryContainer,
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        text = "Prepared as .apks",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                            fontWeight = FontWeight.Medium
+                                        ),
+                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Option 2: Send Text
+            Surface(
+                onClick = onSendText,
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier.fillMaxWidth().testTag("send_text_option")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Send Text",
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Send Text",
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        )
+                        Text(
+                            text = option.originalText,
+                            style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+// -------------------------------------------------------------
 // CONNECTED SCREEN (Active Session and File Transfer Queue)
 // -------------------------------------------------------------
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectedScreen(
     remoteDevice: Device?,
@@ -3328,11 +4246,18 @@ fun ConnectedScreen(
     onPauseItem: (String) -> Unit,
     onResumeItem: (String) -> Unit,
     onCancelItem: (String) -> Unit,
-    onDisconnect: () -> Unit
+    onDisconnect: () -> Unit,
+    onMinimize: () -> Unit = {}
 ) {
     var shareText by remember { mutableStateOf("") }
     val context = LocalContext.current
     var showInAppFilePicker by remember { mutableStateOf(false) }
+    val pickerSelectedKeysState = remember { mutableStateOf<Set<String>>(emptySet()) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+    BackHandler(enabled = !showInAppFilePicker) {
+        onMinimize()
+    }
 
     // Launchers for picking images and generic files
     val filePicker = rememberLauncherForActivityResult(
@@ -3345,74 +4270,111 @@ fun ConnectedScreen(
     }
 
     if (showInAppFilePicker) {
-        InAppFilePickerContent(
-            onDismiss = { showInAppFilePicker = false },
-            onSendFiles = { selectedFiles ->
-                selectedFiles.forEach { file ->
-                    onSendFile(file.uri, file.name, file.size)
-                }
-            },
-            onLaunchSystemPicker = {
-                filePicker.launch(arrayOf("*/*"))
-                showInAppFilePicker = false
-            }
-        )
-    } else {
+        ModalBottomSheet(
+            onDismissRequest = { showInAppFilePicker = false },
+            sheetState = sheetState,
+            dragHandle = { BottomSheetDefaults.DragHandle() },
+            modifier = Modifier.fillMaxHeight(),
+            shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
+            containerColor = MaterialTheme.colorScheme.surface
+        ) {
+            InAppFilePickerContent(
+                onDismiss = { showInAppFilePicker = false },
+                onSendFiles = { selectedFiles ->
+                    selectedFiles.forEach { file ->
+                        onSendFile(file.uri, file.name, file.size)
+                    }
+                    pickerSelectedKeysState.value = emptySet()
+                    showInAppFilePicker = false
+                },
+                onLaunchSystemPicker = {
+                    filePicker.launch(arrayOf("*/*"))
+                    showInAppFilePicker = false
+                },
+                selectedKeysState = pickerSelectedKeysState,
+                clearSelectionOnBack = false
+            )
+        }
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding(),
+        contentAlignment = Alignment.TopCenter
+    ) {
         Column(
             modifier = Modifier
-                .fillMaxSize()
+                .widthIn(max = 480.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-        // Connected Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
+            // Connected Header (Stable non-morphing layout, no additional minimize button)
             Row(
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                AnimatedCircularCheckmark(
-                    size = 32.dp,
-                    ringColor = Color(0xFF34C759),
-                    checkColor = Color.White,
-                    ringWidth = 2.dp,
-                    checkWidth = 2.5.dp
-                )
-                Column {
-                    Text(
-                        text = "Connected Session",
-                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    AnimatedCircularCheckmark(
+                        size = 32.dp,
+                        ringColor = Color(0xFF34C759),
+                        checkColor = Color.White,
+                        ringWidth = 2.dp,
+                        checkWidth = 2.5.dp
                     )
-                    Text(
-                        text = remoteDevice?.name ?: "Remote Peer",
-                        style = MaterialTheme.typography.titleLarge.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Connected Session",
+                            style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
-                    )
+                        Text(
+                            text = remoteDevice?.name ?: "Remote Peer",
+                            style = MaterialTheme.typography.titleLarge.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Button(
+                    onClick = onDisconnect,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = AccentRed.copy(alpha = 0.12f),
+                        contentColor = AccentRed
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .height(38.dp)
+                        .defaultMinSize(minWidth = 96.dp)
+                        .testTag("disconnect_button")
+                ) {
+                    Text("Disconnect", fontWeight = FontWeight.Bold, maxLines = 1)
                 }
             }
 
-            Button(
-                onClick = onDisconnect,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = AccentRed.copy(alpha = 0.12f),
-                    contentColor = AccentRed
-                ),
-                shape = RoundedCornerShape(12.dp),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-                modifier = Modifier.testTag("disconnect_button")
-            ) {
-                Text("Disconnect", fontWeight = FontWeight.Bold)
-            }
-        }
-
-        // Global Monochrome Progress Bar for Active Transfers
+        // Global Universal Progress & Speed Card for Active Transfers
         val activeTransfer = transferQueue.find { it.status == TransferStatus.SENDING }
         if (activeTransfer != null) {
+            val queueStatus = TransferMetricsHelper.computeQueueStatus(
+                remoteDevice = remoteDevice,
+                transferQueue = transferQueue,
+                connectionState = ConnectionState.CONNECTED
+            )
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
@@ -3448,17 +4410,41 @@ fun ConnectedScreen(
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "${(activeTransfer.progress * 100).toInt()}%",
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                fontFamily = FontFamily.Monospace,
-                                fontWeight = FontWeight.Bold
-                            ),
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            if (queueStatus.speed > 0L) {
+                                Text(
+                                    text = TransferMetricsHelper.formatSpeed(queueStatus.speed),
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    ),
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            Text(
+                                text = "${((queueStatus.progress ?: 0f) * 100).toInt()}%",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            if (queueStatus.timePart.isNotBlank() && queueStatus.timePart != "—") {
+                                Text(
+                                    text = "(${queueStatus.timePart})",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                )
+                            }
+                        }
                     }
                     LinearProgressIndicator(
-                        progress = activeTransfer.progress,
+                        progress = { activeTransfer.progress },
                         color = MaterialTheme.colorScheme.primary,
                         trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
                         modifier = Modifier
@@ -3504,7 +4490,7 @@ fun ConnectedScreen(
                     ) {
                         Icon(imageVector = Icons.Default.AttachFile, contentDescription = "Pick File", tint = MaterialTheme.colorScheme.onPrimary)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Send File", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary)
+                        Text("Send files", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary)
                     }
                 }
 
@@ -3558,7 +4544,7 @@ fun ConnectedScreen(
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
+                .heightIn(min = 160.dp, max = 340.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
             shape = RoundedCornerShape(20.dp)
@@ -3582,7 +4568,7 @@ fun ConnectedScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .weight(1f),
+                            .heightIn(min = 120.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -3631,6 +4617,12 @@ fun TransferItemRow(
     onCancel: () -> Unit
 ) {
     val progressPercent = (item.progress * 100).toInt()
+    val isSending = item.status == TransferStatus.SENDING
+    val (_, eta) = if (isSending) {
+        TransferMetricsHelper.computeSpeedAndEta(item.id, item.bytesTransferred, item.fileSize)
+    } else {
+        Pair(0L, 0L)
+    }
     
     // Choose status color
     val progressColor = when (item.status) {
@@ -3694,7 +4686,7 @@ fun TransferItemRow(
                 )
                 
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
@@ -3712,6 +4704,18 @@ fun TransferItemRow(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall
                     )
+                    if (isSending && eta > 0) {
+                        Text(
+                            text = "•",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            text = "${TransferMetricsHelper.formatEta(eta)} left",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
             }
 
@@ -3816,7 +4820,7 @@ fun TransferItemRow(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 LinearProgressIndicator(
-                    progress = item.progress,
+                    progress = { item.progress },
                     color = progressColor,
                     trackColor = progressColor.copy(alpha = 0.15f),
                     modifier = Modifier
@@ -3825,13 +4829,18 @@ fun TransferItemRow(
                         .clip(CircleShape)
                 )
                 Spacer(modifier = Modifier.width(12.dp))
-                Text(
-                    text = "$progressPercent%",
-                    color = progressColor,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "$progressPercent%",
+                        color = progressColor,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
             }
         }
     }
@@ -3907,6 +4916,22 @@ private val thumbnailCache = object : LruCache<String, android.graphics.Bitmap>(
 // Open local/selected file utility for FileEntry using displayUri
 fun openLocalFile(context: Context, file: FileEntry) {
     try {
+        val isApp = file.name.endsWith(".apk", ignoreCase = true) || file.name.endsWith(".apks", ignoreCase = true)
+        if (isApp) {
+            val ioFile = when {
+                file.displayUri.scheme == "file" -> file.displayUri.path?.let { java.io.File(it) }
+                file.key.startsWith("file:") -> java.io.File(file.key.removePrefix("file:"))
+                else -> {
+                    val appReceived = java.io.File(StorageService.getAppReceivedDirectory(context), file.name)
+                    if (appReceived.exists()) appReceived else java.io.File(StorageService.getFlipDirectory(), file.name)
+                }
+            }
+            if (ioFile != null && ioFile.exists()) {
+                PackageInstallerHelper.install(context, ioFile)
+                return
+            }
+        }
+
         var uri = file.displayUri
         val mimeType = file.mimeType.ifEmpty {
             context.contentResolver.getType(uri) ?: when (file.name.substringAfterLast('.', "").lowercase()) {
@@ -4047,3 +5072,94 @@ fun FileThumbnail(file: FileEntry, modifier: Modifier = Modifier) {
         }
     }
 }
+
+// -------------------------------------------------------------
+// Layout Previews across 5 screen configurations
+// -------------------------------------------------------------
+@Preview(name = "Home - Small Phone", widthDp = 320, heightDp = 640)
+@Preview(name = "Home - Tall 20:9 Phone", widthDp = 360, heightDp = 800)
+@Preview(name = "Home - 21:9 Phone", widthDp = 360, heightDp = 860)
+@Preview(name = "Home - Tablet", widthDp = 800, heightDp = 1280)
+@Preview(name = "Home - Font Scale 1.3", widthDp = 360, heightDp = 800, fontScale = 1.3f)
+@Composable
+private fun HomeScreenPreview() {
+    MyApplicationTheme {
+        Surface {
+            HomeScreen(
+                localDevice = Device(id = "1", name = "Pixel 8 · 4A", ip = "192.168.49.1", port = 8080, flags = 0x01.toByte()),
+                onSendMode = {},
+                onReceiveMode = {},
+                onManualConnect = { _, _ -> },
+                onExploreFiles = {}
+            )
+        }
+    }
+}
+
+@Preview(name = "Sender - Small Phone", widthDp = 320, heightDp = 640)
+@Preview(name = "Sender - Tall 20:9 Phone", widthDp = 360, heightDp = 800)
+@Preview(name = "Sender - 21:9 Phone", widthDp = 360, heightDp = 860)
+@Preview(name = "Sender - Tablet", widthDp = 800, heightDp = 1280)
+@Preview(name = "Sender - Font Scale 1.3", widthDp = 360, heightDp = 800, fontScale = 1.3f)
+@Composable
+private fun SenderWaitingScreenPreview() {
+    MyApplicationTheme {
+        Surface {
+            SenderWaitingScreen(
+                localDevice = Device(id = "1", name = "Pixel 8 · 4A", ip = "192.168.49.1", port = 8080, flags = 0x01.toByte()),
+                onUpdateIp = {},
+                onCancel = {}
+            )
+        }
+    }
+}
+
+@Preview(name = "Transfer - Small Phone", widthDp = 320, heightDp = 640)
+@Preview(name = "Transfer - Tall 20:9 Phone", widthDp = 360, heightDp = 800)
+@Preview(name = "Transfer - 21:9 Phone", widthDp = 360, heightDp = 860)
+@Preview(name = "Transfer - Tablet", widthDp = 800, heightDp = 1280)
+@Preview(name = "Transfer - Font Scale 1.3", widthDp = 360, heightDp = 800, fontScale = 1.3f)
+@Composable
+private fun ConnectedScreenPreview() {
+    MyApplicationTheme {
+        Surface {
+            ConnectedScreen(
+                remoteDevice = Device(id = "2", name = "Galaxy S24 · 9B", ip = "192.168.49.2", port = 8080, flags = 0x01.toByte()),
+                transferQueue = listOf(
+                    TransferItem(
+                        id = "tx-1",
+                        fileName = "photo_vacation.jpg",
+                        fileSize = 4_200_000L,
+                        bytesTransferred = 2_730_000L,
+                        status = TransferStatus.SENDING,
+                        isIncoming = false
+                    )
+                ),
+                onSendFile = { _, _, _ -> },
+                onSendText = {},
+                onPauseItem = {},
+                onResumeItem = {},
+                onCancelItem = {},
+                onDisconnect = {}
+            )
+        }
+    }
+}
+
+@Preview(name = "MiniBar - Small Phone Font Scale 1.3", widthDp = 320, fontScale = 1.3f)
+@Composable
+private fun SessionMiniBarPreview() {
+    MyApplicationTheme {
+        Surface {
+            SessionMiniBar(
+                line1Text = "Connected to Galaxy S24",
+                line2Text = "2 of 5 · 43% · 12s left",
+                activeProgress = 0.43f,
+                isIncoming = false,
+                onExpand = {},
+                onDisconnect = {}
+            )
+        }
+    }
+}
+

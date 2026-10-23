@@ -49,7 +49,7 @@ class HttpServerService(private val context: android.content.Context, private va
         val portsToTry = listOf(8080, 8081, 8082, 8083)
         for (port in portsToTry) {
             try {
-                val sSocket = ServerSocket(port)
+                val sSocket = ServerSocket(port, 50, java.net.InetAddress.getByName("0.0.0.0"))
                 serverSocket = sSocket
                 boundPort = port
                 isRunning = true
@@ -170,13 +170,15 @@ class HttpServerService(private val context: android.content.Context, private va
                         } else {
                             HotspotCredentialStore.saveKnownReceiver(context, receivedUuid, device.name)
                             HotspotCredentialStore.notifyPeersChanged(context)
-                            listener.onDeviceConnected(device.copy(id = receivedUuid))
+                            val socketClientIp = com.example.service.control.ControlChannelConstants.toIpv4(socket.inetAddress) ?: device.ip
+                            val localIp = com.example.service.control.ControlChannelConstants.toIpv4(socket.localAddress) ?: "127.0.0.1"
+                            listener.onDeviceConnected(device.copy(id = receivedUuid, ip = socketClientIp))
 
                             val responseJson = deviceAdapter.toJson(
                                 Device(
                                     id = ownUuid,
                                     name = localIdentity.displayName,
-                                    ip = socket.localAddress.hostAddress ?: "127.0.0.1",
+                                    ip = localIp,
                                     port = boundPort,
                                     sid = DeviceIdentity.currentSessionId
                                 )

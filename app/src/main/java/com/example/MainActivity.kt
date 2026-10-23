@@ -23,6 +23,10 @@ import androidx.compose.runtime.getValue
 import android.annotation.SuppressLint
 import com.example.viewmodel.FlipViewModel
 
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.example.viewmodel.OnboardingState
+import android.content.Context
+
 @SuppressLint("InvalidFragmentVersionForActivityResult")
 class MainActivity : FragmentActivity() {
 
@@ -58,7 +62,24 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val splashScreen = try {
+            installSplashScreen()
+        } catch (e: Exception) {
+            Log.w("MainActivity", "SplashScreen install skipped: ${e.message}")
+            null
+        }
         super.onCreate(savedInstanceState)
+        
+        // Read onboarding-done flag as early as possible in onCreate
+        val prefs = getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
+        val isOnboardingDone = prefs.getBoolean("onboarding_complete", false)
+        val initialOnboardingState = if (isOnboardingDone) OnboardingState.Done else OnboardingState.NotDone
+        viewModel.setOnboardingState(initialOnboardingState)
+
+        // Hold splash screen on screen condition while state is Loading
+        splashScreen?.setKeepOnScreenCondition {
+            viewModel.onboardingState.value is OnboardingState.Loading
+        }
         
         // Ensure status bar is always visible with dark icons against light background
         enableEdgeToEdge(
@@ -236,8 +257,12 @@ class MainActivity : FragmentActivity() {
                 }
             }
 
+            // Debug log with tag "FlipShare" that prints only the scheme, authority, MIME and text length
+            val firstUri = uris.firstOrNull()
+            Log.d("FlipShare", "scheme=${firstUri?.scheme}, authority=${firstUri?.authority}, mime=$type, textLength=${sharedText?.length ?: 0}")
+
             if (uris.isNotEmpty() || !sharedText.isNullOrBlank()) {
-                viewModel.handleIncomingShare(uris.toList(), sharedText)
+                viewModel.handleIncomingShare(uris.toList(), sharedText, getSourceAppName())
             }
 
             // 6. Clear intent extras so rotation or returning to the app does not re-trigger
@@ -253,5 +278,21 @@ class MainActivity : FragmentActivity() {
                 Log.w("MainActivity", "Failed to clear share intent extras: ${e.message}")
             }
         }
+    }
+
+    private fun getSourceAppName(): String {
+        val callingPkg = callingPackage ?: try {
+            referrer?.authority
+        } catch (_: Exception) {
+            null
+        }
+        if (!callingPkg.isNullOrBlank()) {
+            try {
+                val appInfo = packageManager.getApplicationInfo(callingPkg, 0)
+                return packageManager.getApplicationLabel(appInfo).toString()
+            } catch (_: Exception) {
+            }
+        }
+        return "the source app"
     }
 }

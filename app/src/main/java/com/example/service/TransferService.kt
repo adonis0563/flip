@@ -184,8 +184,8 @@ class TransferService(private val context: Context) {
                                 return toSkip
                             }
                         }
-                    } else if (uri.scheme == "file" || uri.path?.startsWith("/") == true) {
-                        val filePath = if (uri.scheme == "file") uri.path else fileUriStr
+                    } else if (uri.scheme == "file") {
+                        val filePath = uri.path ?: fileUriStr
                         Log.d(TAG, "[FILE_TRANSFER] Opening FileInputStream for file path: $filePath")
                         java.io.FileInputStream(java.io.File(filePath!!))
                     } else {

@@ -79,14 +79,14 @@ fun PairingScannerDialog(
                     onLegacyConnect?.invoke(ip, port)
                     onDismiss()
                 } else {
-                    Toast.makeText(context, "Invalid IP address in QR code.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Invalid QR code. Please scan a Flip pairing code.", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Malformed pairing QR code: ${e.message}")
                 Toast.makeText(context, "Malformed pairing QR code.", Toast.LENGTH_SHORT).show()
             }
         } else if (trimmed.contains(".") && !trimmed.contains("://")) {
-            // Raw IP or IP:PORT input
+            // Raw code input
             try {
                 val parts = trimmed.split(":")
                 val ip = parts[0].trim()
@@ -97,7 +97,7 @@ fun PairingScannerDialog(
                     onDismiss()
                 }
             } catch (e: Exception) {
-                Toast.makeText(context, "Invalid IP format.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Invalid code.", Toast.LENGTH_SHORT).show()
             }
         } else {
             // Reject random, non-Flip, or retired first-time QR codes
@@ -258,7 +258,7 @@ fun PairingScannerDialog(
                         OutlinedTextField(
                             value = manualInput,
                             onValueChange = { manualInput = it },
-                            placeholder = { Text("Paste flip:// QR code or IP", color = Color.Gray, fontSize = 13.sp) },
+                            placeholder = { Text("Paste pairing code", color = Color.Gray, fontSize = 13.sp) },
                             singleLine = true,
                             colors = OutlinedTextFieldDefaults.colors(
                                 focusedTextColor = Color.White,

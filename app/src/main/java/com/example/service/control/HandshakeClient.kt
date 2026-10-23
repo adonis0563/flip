@@ -37,6 +37,33 @@ class HandshakeClient {
     private val socketRef = AtomicReference<Socket?>(null)
     private var clientScope: CoroutineScope? = null
     private var heartbeatJob: Job? = null
+    private var readerJob: Job? = null
+    private val writeLock = Any()
+
+    var onPeerBye: ((peerName: String) -> Unit)? = null
+    var onPeerLost: (() -> Unit)? = null
+
+    var peerTransferPort: Int = 0
+        private set
+
+    fun isAlive(): Boolean {
+        val s = socketRef.get()
+        return s != null && !s.isClosed && s.isConnected && !isClosed.get()
+    }
+
+    fun sendBye(name: String) {
+        val socket = socketRef.get() ?: return
+        try {
+            socket.soTimeout = 500
+            val output = socket.getOutputStream()
+            synchronized(writeLock) {
+                ControlMessage.writeMessage(output, ControlMessage.Bye(name))
+            }
+            android.util.Log.i("FlipLink", "[CONTROL] Sent BYE from client: $name")
+        } catch (e: Exception) {
+            android.util.Log.w("FlipLink", "Failed to send BYE from client: ${e.message}")
+        }
+    }
 
     /**
      * Executes the control channel handshake synchronously on IO thread.
@@ -47,8 +74,13 @@ class HandshakeClient {
         expectedPeerUuid: String,
         ownIdentity: DeviceIdentity,
         port: Int = ControlChannelConstants.PORT,
-        onPeerLost: (() -> Unit)? = null
+        localTransferPort: Int = 0,
+        localIp: String? = null,
+        onPeerLost: (() -> Unit)? = null,
+        onPeerBye: ((peerName: String) -> Unit)? = null
     ): HandshakeResult = withContext(Dispatchers.IO) {
+        if (onPeerLost != null) this@HandshakeClient.onPeerLost = onPeerLost
+        if (onPeerBye != null) this@HandshakeClient.onPeerBye = onPeerBye
         val startTime = System.currentTimeMillis()
         val expectedNorm = ControlChannelConstants.normalizeUuid(expectedPeerUuid)
         val ownNorm = ControlChannelConstants.normalizeUuid(ownIdentity.uuid)
@@ -93,12 +125,16 @@ class HandshakeClient {
             val input = socket.getInputStream()
             val output = socket.getOutputStream()
 
-            // 2. Send HELLO with own identity
+            // 2. Send HELLO with own identity and actual httpPort
+            val ownIp = localIp ?: ControlChannelConstants.toIpv4(socket.localAddress)
             val hello = ControlMessage.Hello(
                 app = "flip",
                 v = 1,
                 uuid = ownNorm,
-                name = ownIdentity.displayName
+                name = ownIdentity.displayName,
+                port = localTransferPort,
+                httpPort = localTransferPort,
+                ip = ownIp
             )
             ControlMessage.writeMessage(output, hello)
             ControlChannelConstants.logStep(
@@ -141,6 +177,8 @@ class HandshakeClient {
                 close()
                 return@withContext HandshakeResult.Malformed("Expected HELLO_ACK, received ${ackMsg.javaClass.simpleName}")
             }
+
+            peerTransferPort = if (ackMsg.httpPort > 0) ackMsg.httpPort else ackMsg.port
 
             // 4. Verify received UUID matches expectedPeerUuid
             val receivedNorm = ControlChannelConstants.normalizeUuid(ackMsg.uuid)
@@ -201,7 +239,12 @@ class HandshakeClient {
             startHeartbeat(
                 socket = socket,
                 peerUuid = receivedNorm,
-                onPeerLost = onPeerLost
+                peerName = ackMsg.name
+            )
+
+            android.util.Log.i(
+                "FlipLink",
+                "HandshakeClient verified: own=.${ControlChannelConstants.lastOctet(ownIp)}:$localTransferPort, peer=.${ControlChannelConstants.lastOctet(host)}:$peerTransferPort"
             )
 
             return@withContext HandshakeResult.Success
@@ -214,46 +257,79 @@ class HandshakeClient {
     private fun startHeartbeat(
         socket: Socket,
         peerUuid: String,
-        onPeerLost: (() -> Unit)?
+        peerName: String
     ) {
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         clientScope = scope
 
         val consecutiveMisses = AtomicInteger(0)
+        val isByeReceived = AtomicBoolean(false)
 
-        heartbeatJob = scope.launch {
+        // Continuous reader coroutine for immediate BYE and PONG reception
+        readerJob = scope.launch {
             val input = socket.getInputStream()
-            val output = socket.getOutputStream()
-
             while (isActive && !isClosed.get() && !socket.isClosed) {
-                delay(ControlChannelConstants.HEARTBEAT_INTERVAL_MS)
-                if (!isActive || isClosed.get() || socket.isClosed) break
+                val msg = try {
+                    socket.soTimeout = ControlChannelConstants.SERVER_HEARTBEAT_TIMEOUT_MS
+                    ControlMessage.readMessage(input)
+                } catch (te: SocketTimeoutException) {
+                    null
+                } catch (ioe: IOException) {
+                    null
+                } catch (e: Exception) {
+                    null
+                }
 
-                var pongReceived = false
-                try {
-                    // Send PING
-                    ControlMessage.writeMessage(output, ControlMessage.Ping)
-                    ControlChannelConstants.logStep(
-                        step = "ping_sent",
-                        peerId = peerUuid
-                    )
+                if (msg == null) {
+                    break
+                }
 
-                    // Expect PONG within 3s
-                    socket.soTimeout = ControlChannelConstants.PONG_TIMEOUT_MS
-                    val response = ControlMessage.readMessage(input)
-                    if (response is ControlMessage.Pong) {
-                        pongReceived = true
+                when (msg) {
+                    is ControlMessage.Pong -> {
                         consecutiveMisses.set(0)
                         ControlChannelConstants.logStep(
                             step = "pong_received",
                             peerId = peerUuid
                         )
                     }
-                } catch (_: Exception) {
-                    pongReceived = false
+                    is ControlMessage.Bye -> {
+                        isByeReceived.set(true)
+                        val name = if (msg.name.isNotBlank()) msg.name else peerName
+                        android.util.Log.i("FlipLink", "[CONTROL] Client received BYE from server: $name")
+                        close()
+                        onPeerBye?.invoke(name)
+                        break
+                    }
+                    else -> {}
                 }
+            }
 
-                if (!pongReceived) {
+            if (!isClosed.get() && !isByeReceived.get()) {
+                ControlChannelConstants.logStep(
+                    step = "heartbeat_lost",
+                    peerId = peerUuid
+                )
+                close()
+                onPeerLost?.invoke()
+            }
+        }
+
+        heartbeatJob = scope.launch {
+            val output = socket.getOutputStream()
+
+            while (isActive && !isClosed.get() && !socket.isClosed) {
+                delay(ControlChannelConstants.HEARTBEAT_INTERVAL_MS)
+                if (!isActive || isClosed.get() || socket.isClosed) break
+
+                try {
+                    synchronized(writeLock) {
+                        ControlMessage.writeMessage(output, ControlMessage.Ping)
+                    }
+                    ControlChannelConstants.logStep(
+                        step = "ping_sent",
+                        peerId = peerUuid
+                    )
+                } catch (e: Exception) {
                     val misses = consecutiveMisses.incrementAndGet()
                     ControlChannelConstants.logStep(
                         step = "ping_miss",
@@ -267,7 +343,9 @@ class HandshakeClient {
                             peerId = peerUuid
                         )
                         close()
-                        onPeerLost?.invoke()
+                        if (!isByeReceived.get()) {
+                            onPeerLost?.invoke()
+                        }
                         break
                     }
                 }
@@ -287,6 +365,9 @@ class HandshakeClient {
 
         heartbeatJob?.cancel()
         heartbeatJob = null
+
+        readerJob?.cancel()
+        readerJob = null
 
         clientScope?.cancel()
         clientScope = null

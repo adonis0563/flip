@@ -600,4 +600,44 @@ object StorageService {
             Log.e("StorageService", "Failed to clean temp transfer files: ${e.message}")
         }
     }
+
+    fun getInstalledAppItem(context: Context, packageName: String): LocalFileItem? {
+        val pm = context.packageManager
+        return try {
+            val pkg = pm.getPackageInfo(packageName, PackageManager.GET_META_DATA)
+            val app = pkg.applicationInfo ?: return null
+            val label = app.loadLabel(pm).toString()
+            val apkPath = app.publicSourceDir ?: app.sourceDir ?: return null
+            val file = File(apkPath)
+            if (!file.exists()) return null
+            val splitDirs = app.splitSourceDirs
+            val isSplit = !splitDirs.isNullOrEmpty()
+            val totalSize = if (isSplit) {
+                val all = mutableListOf(file)
+                splitDirs?.forEach { splitPath ->
+                    val sf = File(splitPath)
+                    if (sf.exists()) all.add(sf)
+                }
+                all.sumOf { it.length() }
+            } else {
+                file.length()
+            }
+            val fileName = if (isSplit) "$label.apks" else "$label.apk"
+            val appIcon = try { app.loadIcon(pm) } catch (_: Exception) { null }
+            LocalFileItem(
+                id = packageName.hashCode().toLong(),
+                uri = Uri.fromFile(file),
+                name = fileName,
+                size = totalSize,
+                mimeType = "application/vnd.android.package-archive",
+                category = "Apps",
+                packageName = packageName,
+                versionName = pkg.versionName ?: "1.0",
+                isSplitApk = isSplit,
+                appIcon = appIcon
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
 }

@@ -25,8 +25,21 @@ data class FileEntry(
     val versionName: String? = null,
     val isSplitApk: Boolean = false,
     val appIcon: Drawable? = null,
+    val dateTaken: Long? = null,
+    val dateAdded: Long = 0L,
     private val explicitTransferSource: LocalFileItem? = null
 ) {
+    /**
+     * Resolves the sort timestamp in milliseconds: DATE_TAKEN if present (> 0), otherwise DATE_ADDED (* 1000L), fallback to DATE_MODIFIED (* 1000L).
+     */
+    val sortTimeMillis: Long
+        get() {
+            if (dateTaken != null && dateTaken > 0L) return dateTaken
+            if (dateAdded > 0L) return dateAdded * 1000L
+            if (dateModified > 0L) return dateModified * 1000L
+            return 0L
+        }
+
     /**
      * Backward-compatible constructor for code providing an explicit LocalFileItem.
      */
@@ -43,7 +56,9 @@ data class FileEntry(
         packageName: String? = null,
         versionName: String? = null,
         isSplitApk: Boolean = false,
-        appIcon: Drawable? = null
+        appIcon: Drawable? = null,
+        dateTaken: Long? = null,
+        dateAdded: Long = 0L
     ) : this(
         key = key,
         displayUri = displayUri,
@@ -57,6 +72,8 @@ data class FileEntry(
         versionName = versionName,
         isSplitApk = isSplitApk,
         appIcon = appIcon,
+        dateTaken = dateTaken,
+        dateAdded = dateAdded,
         explicitTransferSource = transferSource
     )
 

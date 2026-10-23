@@ -503,7 +503,7 @@ fun GetReadyBottomSheet(
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp),
         dragHandle = { BottomSheetDefaults.DragHandle() },
         containerColor = MaterialTheme.colorScheme.surface,
         contentColor = MaterialTheme.colorScheme.onSurface,

@@ -19,11 +19,14 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanRecord
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.example.model.Device
 import java.net.InetAddress
@@ -55,6 +58,9 @@ class BleDiscoveryService(
         val FLIP_SERVICE_UUID: UUID = UUID.fromString("0000fd01-0000-1000-8000-00805f9b34fb")
         val FLIP_CHAR_UUID: UUID = UUID.fromString("0000fd02-0000-1000-8000-00805f9b34fb")
         val FLIP_PARCEL_UUID = ParcelUuid(FLIP_SERVICE_UUID)
+
+        @Volatile
+        var lastAdvertiseError: String? = null
     }
 
     private val bluetoothManager: BluetoothManager? =
@@ -90,7 +96,39 @@ class BleDiscoveryService(
     // PERMISSION CHECKS (Supporting Android 10 to 15)
     // -------------------------------------------------------------
 
-    private fun hasAdvertisePermission(): Boolean {
+    private fun findActivity(ctx: Context): Activity? {
+        var c = ctx
+        while (c is ContextWrapper) {
+            if (c is Activity) return c
+            c = c.baseContext
+        }
+        return null
+    }
+
+    /**
+     * On Android 12+, request BLUETOOTH_ADVERTISE, BLUETOOTH_SCAN, and BLUETOOTH_CONNECT
+     * at runtime before advertising, scanning or opening the GATT server, and check them before each call.
+     */
+    fun requestRuntimeBlePermissionsIfMissing() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val required = arrayOf(
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            )
+            val missing = required.filter {
+                ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isNotEmpty()) {
+                Log.w(TAG, "[BLE] Requesting missing BLE runtime permissions on Android 12+: $missing")
+                findActivity(context)?.let { act ->
+                    ActivityCompat.requestPermissions(act, missing.toTypedArray(), 1002)
+                }
+            }
+        }
+    }
+
+    fun hasAdvertisePermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
@@ -100,7 +138,7 @@ class BleDiscoveryService(
         }
     }
 
-    private fun hasScanPermission(): Boolean {
+    fun hasScanPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
@@ -110,6 +148,14 @@ class BleDiscoveryService(
             val hasLocation = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
                 ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
             hasLegacyBt && hasLocation
+        }
+    }
+
+    fun hasGattServerPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED
         }
     }
 
@@ -127,10 +173,15 @@ class BleDiscoveryService(
     ) {
         Log.d(TAG, "[BLE] start advertising requested: IP=$localIp, Port=$port, Device=$deviceName, Flags=$flags")
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requestRuntimeBlePermissionsIfMissing()
+        }
+
         val adapter = bluetoothAdapter
         if (adapter == null) {
             val msg = "Bluetooth is not supported on this device"
             Log.e(TAG, "[BLE] Advertising failure: $msg")
+            lastAdvertiseError = msg
             listener?.onDiscoveryError(msg)
             return
         }
@@ -138,24 +189,30 @@ class BleDiscoveryService(
         if (!adapter.isEnabled) {
             val msg = "Bluetooth is turned off"
             Log.e(TAG, "[BLE] Advertising failure: $msg")
+            lastAdvertiseError = msg
             listener?.onDiscoveryError(msg)
             return
         }
 
-        if (!adapter.isMultipleAdvertisementSupported) {
-            val msg = "BLE Advertising is not supported by this device hardware"
+        // 4. Replace isMultipleAdvertisementSupported check with bluetoothAdapter.bluetoothLeAdvertiser != null
+        val leAdvertiser = adapter.bluetoothLeAdvertiser
+        if (leAdvertiser == null) {
+            val msg = "This phone can't advertise over Bluetooth"
             Log.w(TAG, "[BLE] Advertising warning: $msg")
+            lastAdvertiseError = msg
             listener?.onDiscoveryError(msg)
             return
         }
+        advertiser = leAdvertiser
 
         if (!hasAdvertisePermission()) {
             val msg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                "Bluetooth advertise permission (BLUETOOTH_ADVERTISE) not granted"
+                "Bluetooth advertise permission (BLUETOOTH_ADVERTISE / BLUETOOTH_CONNECT) not granted"
             } else {
                 "Bluetooth permission not granted"
             }
             Log.e(TAG, "[BLE] Advertising failure: $msg")
+            lastAdvertiseError = msg
             listener?.onDiscoveryError(msg)
             return
         }
@@ -164,21 +221,31 @@ class BleDiscoveryService(
         stopAdvertising()
 
         try {
-            advertiser = adapter.bluetoothLeAdvertiser
-            if (advertiser == null) {
-                val msg = "Failed to obtain BluetoothLeAdvertiser"
-                Log.e(TAG, "[BLE] Advertising failure: $msg")
-                listener?.onDiscoveryError(msg)
-                return
-            }
+            advertiser = leAdvertiser
 
             // 1. Pack binary payload for Service Data:
             // [0..3]: IPv4 (4 bytes)
             // [4..5]: Port (2 bytes, big endian)
             // [6..9]: DeviceId truncated/hash (4 bytes)
             // [10]: Flags byte (bit 0 = ready, bit 1 = transport: 0=hotspot, 1=wfd)
-            // [11..]: Truncated device name (up to 10 bytes)
-            val serviceDataBytes = encodeServiceData(localIp, port, deviceId, deviceName, flags)
+            // [11..]: Truncated device name in UTF-8
+            var serviceDataBytes = encodeServiceData(localIp, port, deviceId, deviceName, flags)
+
+            // Requirement 1 & 2: Compute advertisement size in code:
+            // 3 (flags) + 4 (service data header for 16-bit UUID) + payload bytes for service data field + 4 more if addServiceUuid is also used.
+            // Remove addServiceUuid since service data UUID already identifies Flip.
+            val usingServiceUuid = false
+            var advertSize = 3 + 4 + serviceDataBytes.size + (if (usingServiceUuid) 4 else 0)
+            Log.i(TAG, "[BLE] Advertisement packet size: $advertSize bytes (flags=3, serviceDataHeader=4, payload=${serviceDataBytes.size}, serviceUuid=${if (usingServiceUuid) 4 else 0})")
+
+            if (advertSize > 31) {
+                Log.w(TAG, "[BLE] Advertisement packet size $advertSize exceeds 31 bytes limit! Capping device name.")
+                val maxPayload = if (usingServiceUuid) 20 else 24
+                val maxNameBytes = (maxPayload - 11).coerceAtLeast(0) // IP(4) + Port(2) + ID(4) + Flags(1) = 11
+                serviceDataBytes = encodeServiceData(localIp, port, deviceId, deviceName, flags, maxNameBytes = maxNameBytes)
+                advertSize = 3 + 4 + serviceDataBytes.size + (if (usingServiceUuid) 4 else 0)
+                Log.i(TAG, "[BLE] Recomputed advertisement packet size after trim: $advertSize bytes")
+            }
 
             // 2. Start GATT Server to respond to read requests with full metadata
             startGattServer(localIp, port, deviceId, deviceName)
@@ -190,10 +257,10 @@ class BleDiscoveryService(
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
                 .build()
 
+            // 2. Remove addServiceUuid, since the service data UUID already identifies Flip
             val advertiseData = AdvertiseData.Builder()
                 .setIncludeDeviceName(false) // Custom packing preserves byte budget
                 .setIncludeTxPowerLevel(false)
-                .addServiceUuid(FLIP_PARCEL_UUID)
                 .addServiceData(FLIP_PARCEL_UUID, serviceDataBytes)
                 .build()
 
@@ -201,22 +268,25 @@ class BleDiscoveryService(
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                     super.onStartSuccess(settingsInEffect)
                     isAdvertising = true
+                    lastAdvertiseError = null
                     Log.i(TAG, "[BLE] Advertising started successfully for device: $deviceName (IP: $localIp:$port)")
                 }
 
                 override fun onStartFailure(errorCode: Int) {
                     super.onStartFailure(errorCode)
                     isAdvertising = false
-                    val errorDesc = when (errorCode) {
-                        ADVERTISE_FAILED_ALREADY_STARTED -> "Already started"
-                        ADVERTISE_FAILED_DATA_TOO_LARGE -> "Data too large"
-                        ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "Feature unsupported"
-                        ADVERTISE_FAILED_INTERNAL_ERROR -> "Internal error"
-                        ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "Too many advertisers"
-                        else -> "Error code $errorCode"
+                    val errorName = when (errorCode) {
+                        ADVERTISE_FAILED_DATA_TOO_LARGE -> "DATA_TOO_LARGE" // 1
+                        ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "TOO_MANY_ADVERTISERS" // 2
+                        ADVERTISE_FAILED_ALREADY_STARTED -> "ALREADY_STARTED" // 3
+                        ADVERTISE_FAILED_INTERNAL_ERROR -> "INTERNAL_ERROR" // 4
+                        ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "FEATURE_UNSUPPORTED" // 5
+                        else -> "UNKNOWN_ERROR_$errorCode"
                     }
-                    Log.e(TAG, "[BLE] Advertising failed: $errorDesc")
-                    listener?.onDiscoveryError("BLE Advertising failed: $errorDesc")
+                    Log.e(TAG, "[BLE] Advertising failed: $errorName (code $errorCode)")
+                    val debugMsg = "BLE Advertising failed: $errorName ($errorCode)"
+                    lastAdvertiseError = debugMsg
+                    listener?.onDiscoveryError(debugMsg)
                 }
             }
 
@@ -267,7 +337,13 @@ class BleDiscoveryService(
 
     private fun startGattServer(localIp: String, port: Int, deviceId: String, deviceName: String) {
         val manager = bluetoothManager ?: return
-        if (!hasAdvertisePermission()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requestRuntimeBlePermissionsIfMissing()
+        }
+        if (!hasGattServerPermission()) {
+            Log.w(TAG, "[BLE] GATT server permission (BLUETOOTH_CONNECT) not granted")
+            return
+        }
 
         try {
             val serverCallback = object : BluetoothGattServerCallback() {
@@ -287,7 +363,7 @@ class BleDiscoveryService(
                             ByteArray(0)
                         }
                         try {
-                            if (hasAdvertisePermission()) {
+                            if (hasGattServerPermission()) {
                                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, subData)
                             }
                         } catch (e: SecurityException) {
@@ -295,7 +371,7 @@ class BleDiscoveryService(
                         }
                     } else {
                         try {
-                            if (hasAdvertisePermission()) {
+                            if (hasGattServerPermission()) {
                                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, 0, null)
                             }
                         } catch (e: Exception) {
@@ -330,6 +406,10 @@ class BleDiscoveryService(
     fun startScanning() {
         Log.d(TAG, "[BLE] start scanning requested")
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            requestRuntimeBlePermissionsIfMissing()
+        }
+
         val adapter = bluetoothAdapter
         if (adapter == null) {
             val msg = "Bluetooth is not supported on this device"
@@ -347,7 +427,7 @@ class BleDiscoveryService(
 
         if (!hasScanPermission()) {
             val msg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                "Bluetooth scan permission (BLUETOOTH_SCAN) not granted"
+                "Bluetooth scan permission (BLUETOOTH_SCAN / BLUETOOTH_CONNECT) not granted"
             } else {
                 "Location or Bluetooth permission not granted for BLE scanning"
             }
@@ -369,10 +449,10 @@ class BleDiscoveryService(
                 return
             }
 
-            // Filter specifically for the Flip service UUID
+            // Requirement 2: Filter with ScanFilter.Builder().setServiceData(uuid, null) instead of setServiceUuid
             val filters = listOf(
                 ScanFilter.Builder()
-                    .setServiceUuid(FLIP_PARCEL_UUID)
+                    .setServiceData(FLIP_PARCEL_UUID, null)
                     .build()
             )
 
@@ -477,7 +557,8 @@ class BleDiscoveryService(
         port: Int,
         deviceId: String,
         deviceName: String,
-        flags: Byte = 0x01
+        flags: Byte = 0x01,
+        maxNameBytes: Int = 10
     ): ByteArray {
         val ipBytes = try {
             InetAddress.getByName(ip).address
@@ -489,10 +570,9 @@ class BleDiscoveryService(
             if (it.size >= 4) it.copyOf(4) else it + ByteArray(4 - it.size)
         }
 
-        // Limit device name to 10 bytes to prevent exceeding BLE advertise payload size
-        val nameBytes = deviceName.toByteArray(Charsets.UTF_8).let {
-            if (it.size > 10) it.copyOf(10) else it
-        }
+        // Limit device name bytes to prevent exceeding BLE advertise payload size
+        val rawNameBytes = deviceName.toByteArray(Charsets.UTF_8)
+        val nameBytes = if (rawNameBytes.size > maxNameBytes) rawNameBytes.copyOf(maxNameBytes) else rawNameBytes
 
         val buffer = ByteBuffer.allocate(4 + 2 + 4 + 1 + nameBytes.size)
         buffer.put(ipBytes)

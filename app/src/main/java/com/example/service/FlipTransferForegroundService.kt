@@ -46,7 +46,9 @@ sealed class FirstTimeConnectionState {
 
     data class Connected(
         val peerUuid: String,
-        val peerName: String
+        val peerName: String,
+        val peerIp: String = "",
+        val peerPort: Int = 0
     ) : FirstTimeConnectionState()
 
     data class Failed(
@@ -61,6 +63,8 @@ class FlipTransferForegroundService : Service() {
     interface ServiceBridge {
         fun onCancelTransfer(transferId: String)
         fun onDisconnectSession()
+        fun onPeerBye(peerName: String)
+        fun onPeerLost()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -171,7 +175,7 @@ class FlipTransferForegroundService : Service() {
          * Keeps it running for the whole screen and stops it on cancel or screen close.
          */
         @Synchronized
-        fun startSenderControl(context: Context) {
+        fun startSenderControl(context: Context, transferPort: Int = 0) {
             teardownFirstTimeConnection()
             connectionStartTime = System.currentTimeMillis()
             _connectionFlowState.value = FirstTimeConnectionState.Idle
@@ -181,10 +185,13 @@ class FlipTransferForegroundService : Service() {
             val server = HandshakeServer()
             senderServer = server
 
+            val actualTransferPort = if (transferPort > 0) transferPort else (currentRemoteDevice?.port ?: 0)
+
             server.start(
                 ownIdentity = ownIdentity,
                 port = ControlChannelConstants.PORT,
-                onPeerConnected = { peerUuid, peerName ->
+                transferPort = actualTransferPort,
+                onPeerConnected = { peerUuid, peerName, peerIp, peerPort ->
                     val elapsed = System.currentTimeMillis() - connectionStartTime
                     ControlChannelConstants.logStep(
                         step = "connected",
@@ -197,15 +204,17 @@ class FlipTransferForegroundService : Service() {
                     // Single source of truth sets Connected state
                     _connectionFlowState.value = FirstTimeConnectionState.Connected(
                         peerUuid = peerUuid,
-                        peerName = peerName
+                        peerName = peerName,
+                        peerIp = peerIp,
+                        peerPort = peerPort
                     )
 
                     // Continue to the transfer flow
                     val remoteDev = Device(
                         id = peerUuid,
                         name = peerName,
-                        ip = "0.0.0.0",
-                        port = 8080
+                        ip = if (peerIp.isNotBlank()) peerIp else "0.0.0.0",
+                        port = peerPort
                     )
                     start(context, remoteDev, "SENDER")
                 },
@@ -217,6 +226,10 @@ class FlipTransferForegroundService : Service() {
                     )
                     teardownFirstTimeConnection()
                     _connectionFlowState.value = FirstTimeConnectionState.Failed("Connection lost.")
+                    bridge?.onPeerLost()
+                },
+                onPeerBye = { peerName ->
+                    bridge?.onPeerBye(peerName)
                 }
             )
         }
@@ -253,6 +266,9 @@ class FlipTransferForegroundService : Service() {
             hotspotJoinHelper = joiner
 
             val client = HandshakeClient()
+            client.onPeerBye = { byeName ->
+                bridge?.onPeerBye(byeName)
+            }
             receiverClient = client
 
             receiverFlowJob = flowScope.launch {
@@ -339,6 +355,10 @@ class FlipTransferForegroundService : Service() {
                                 teardownFirstTimeConnection()
                                 _connectionFlowState.value = FirstTimeConnectionState.Failed("Connection lost. The sender's hotspot may have turned off.")
                             }
+                            bridge?.onPeerLost()
+                        },
+                        onPeerBye = { byeName ->
+                            bridge?.onPeerBye(byeName)
                         }
                     )
 
@@ -462,6 +482,19 @@ class FlipTransferForegroundService : Service() {
         fun resetFirstTimeState() {
             teardownFirstTimeConnection()
             _connectionFlowState.value = FirstTimeConnectionState.Idle
+        }
+
+        fun sendBye(name: String) {
+            try {
+                senderServer?.sendBye(name)
+            } catch (_: Exception) {}
+            try {
+                receiverClient?.sendBye(name)
+            } catch (_: Exception) {}
+        }
+
+        fun isControlChannelAlive(): Boolean {
+            return (senderServer?.isAlive() == true) || (receiverClient?.isAlive() == true)
         }
 
         fun start(context: Context, remoteDevice: Device?, role: String? = null) {

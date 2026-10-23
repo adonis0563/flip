@@ -41,7 +41,10 @@ secretsGradlePlugin = "2.0.1"
 googleServices = "4.5.0"
 biometric = "1.2.0-alpha05"
 
+coreSplashscreen = "1.0.1"
+
 [libraries]
+androidx-core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "coreSplashscreen" }
 androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }

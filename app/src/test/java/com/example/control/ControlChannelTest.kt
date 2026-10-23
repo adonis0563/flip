@@ -85,6 +85,16 @@ class ControlChannelTest {
     }
 
     @Test
+    fun testByeMessageSerializationAndParsing() {
+        val bye = ControlMessage.Bye(name = "Pixel 8")
+        val json = bye.toJsonString()
+        val parsed = ControlMessage.parse(json)
+        assertNotNull(parsed)
+        assertTrue(parsed is ControlMessage.Bye)
+        assertEquals("Pixel 8", (parsed as ControlMessage.Bye).name)
+    }
+
+    @Test
     fun testSameDeviceErrorMessageParsing() {
         val err = ControlMessage.Error(error = "same_device")
         val parsed = ControlMessage.parse(err.toJsonString())

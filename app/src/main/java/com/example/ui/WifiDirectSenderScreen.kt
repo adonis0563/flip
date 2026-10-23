@@ -62,7 +62,7 @@ private const val TAG = "FlipDirect"
 @Composable
 fun WifiDirectSenderScreen(
     localDevice: Device?,
-    onClientConnected: (ownerIpAddress: String, peerId: String, peerName: String) -> Unit,
+    onClientConnected: (peerIp: String, peerId: String, peerName: String, port: Int) -> Unit,
     onCancel: () -> Unit,
     wifiDirectHost: WifiDirectHost,
     connectionState: ConnectionState = ConnectionState.IDLE,
@@ -79,17 +79,26 @@ fun WifiDirectSenderScreen(
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isGroupReady by remember { mutableStateOf(false) }
     var isAppForeground by remember { mutableStateOf(true) }
-    var realOwnerAddress by remember { mutableStateOf<String?>(null) }
-    var hasHandedOff by remember { mutableStateOf(false) }
+    var establishedRemoteIp by remember { mutableStateOf<String?>(null) }
+    var establishedRemotePort by remember { mutableIntStateOf(0) }
 
-    fun handoffConnected(ownerIp: String, peerId: String, peerName: String) {
-        if (hasHandedOff) {
-            Log.d(TAG, "[WFD_SENDER] onClientConnected already called; ignoring duplicate handoff")
+    fun handoffConnected(peerIp: String, peerId: String, peerName: String, port: Int) {
+        if (establishedRemoteIp != null) {
+            val initialIp = establishedRemoteIp!!
+            val initialPort = establishedRemotePort
+            if (peerIp.isNotBlank() && (peerIp != initialIp || port != initialPort)) {
+                Log.w(
+                    "FlipLink",
+                    "Later connection differs: remote address last number: .${com.example.service.control.ControlChannelConstants.lastOctet(peerIp)}, port: $port (initial was .${com.example.service.control.ControlChannelConstants.lastOctet(initialIp)}, port: $initialPort)"
+                )
+            }
             return
         }
-        hasHandedOff = true
-        Log.i(TAG, "[WFD_SENDER] Handoff to transfer flow (ownerIp=$ownerIp, peerId=$peerId, peerName=$peerName)")
-        onClientConnected(ownerIp, peerId, peerName)
+        establishedRemoteIp = peerIp
+        establishedRemotePort = port
+        Log.i("FlipLink", "Remote address last number: .${com.example.service.control.ControlChannelConstants.lastOctet(peerIp)}, port: $port")
+        Log.i(TAG, "[WFD_SENDER] Handoff to transfer flow (peerIp=.${com.example.service.control.ControlChannelConstants.lastOctet(peerIp)}, peerId=$peerId, peerName=$peerName, port=$port)")
+        onClientConnected(peerIp, peerId, peerName, port)
     }
 
     // Lifecycle observer to hide QR when app goes to background and restore on return
@@ -136,8 +145,11 @@ fun WifiDirectSenderScreen(
             is FirstTimeConnectionState.Connected -> {
                 Log.i(TAG, "[WFD_SENDER] Control channel handshake succeeded with ${s.peerName} (${s.peerUuid})")
                 hostStatusText = "Connected to ${s.peerName}! Starting transfer..."
-                val ownerIp = realOwnerAddress?.takeIf { it.isNotBlank() } ?: "192.168.49.1"
-                handoffConnected(ownerIp, s.peerUuid, s.peerName)
+                val peerIp = s.peerIp.takeIf { it.isNotBlank() && it != "0.0.0.0" }
+                    ?: remoteDevice?.ip?.takeIf { it.isNotBlank() && it != "0.0.0.0" }
+                    ?: s.peerIp
+                val peerPort = if (s.peerPort > 0) s.peerPort else (remoteDevice?.port ?: 0)
+                handoffConnected(peerIp, s.peerUuid, s.peerName, peerPort)
             }
             is FirstTimeConnectionState.Handshaking -> {
                 hostStatusText = "Verifying receiver..."
@@ -158,10 +170,13 @@ fun WifiDirectSenderScreen(
             val peer = remoteDevice
             val peerId = peer?.id ?: ""
             val peerName = peer?.name ?: "Receiver"
-            val ownerIp = realOwnerAddress?.takeIf { it.isNotBlank() } ?: peer?.ip?.takeIf { it.isNotBlank() } ?: "192.168.49.1"
-            Log.i(TAG, "[WFD_SENDER] Receiver HTTP /connect arrived ($peerName at $ownerIp)")
+            val requestRemoteIp = peer?.ip?.takeIf { it.isNotBlank() && it != "0.0.0.0" }
+                ?: (connectionFlowState as? FirstTimeConnectionState.Connected)?.peerIp?.takeIf { it.isNotBlank() && it != "0.0.0.0" }
+                ?: (peer?.ip ?: "")
+            val peerPort = peer?.port?.takeIf { it > 0 } ?: (connectionFlowState as? FirstTimeConnectionState.Connected)?.peerPort ?: 0
+            Log.i(TAG, "[WFD_SENDER] Receiver HTTP /connect arrived ($peerName at last_number=.${com.example.service.control.ControlChannelConstants.lastOctet(requestRemoteIp)}:$peerPort)")
             hostStatusText = "Connected to $peerName! Starting transfer..."
-            handoffConnected(ownerIp, peerId, peerName)
+            handoffConnected(requestRemoteIp, peerId, peerName, peerPort)
         }
     }
 

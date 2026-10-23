@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class ConnectionState {
     IDLE,
@@ -43,6 +44,22 @@ data class PendingShareRequest(
     val targetDevice: Device? = null
 )
 
+sealed interface OnboardingState {
+    data object Loading : OnboardingState
+    data object Done : OnboardingState
+    data object NotDone : OnboardingState
+}
+
+data class PendingShareBannerData(
+    val items: List<LocalFileItem>,
+    val text: String? = null
+)
+
+data class AppShareOption(
+    val appItem: LocalFileItem,
+    val originalText: String
+)
+
 class FlipViewModel(application: Application) : AndroidViewModel(application), 
     HttpServerService.ServerListener, BleDiscoveryService.DiscoveryListener {
 
@@ -54,6 +71,8 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private var handshakeClient: HandshakeClient? = null
     private var httpServerService: HttpServerService? = null
     private var directSenderTimeoutJob: Job? = null
+    private var groupLostDebounceJob: Job? = null
+    private val isCleaningUp = AtomicBoolean(false)
 
     // UI state flows
     private val _connectionState = MutableStateFlow(ConnectionState.IDLE)
@@ -92,6 +111,95 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
     private val _pendingShareRequest = MutableStateFlow<PendingShareRequest?>(null)
     val pendingShareRequest: StateFlow<PendingShareRequest?> = _pendingShareRequest.asStateFlow()
 
+    private val _onboardingState = MutableStateFlow<OnboardingState>(OnboardingState.Loading)
+    val onboardingState: StateFlow<OnboardingState> = _onboardingState.asStateFlow()
+
+    private val _pendingPostOnboardingShare = MutableStateFlow<PendingShareBannerData?>(null)
+    val pendingPostOnboardingShare: StateFlow<PendingShareBannerData?> = _pendingPostOnboardingShare.asStateFlow()
+
+    private val _appSharePromptState = MutableStateFlow<AppShareOption?>(null)
+    val appSharePromptState: StateFlow<AppShareOption?> = _appSharePromptState.asStateFlow()
+
+    fun setOnboardingState(state: OnboardingState) {
+        _onboardingState.value = state
+    }
+
+    fun setOnboardingDone() {
+        _onboardingState.value = OnboardingState.Done
+    }
+
+    fun dismissPendingPostOnboardingShare() {
+        _pendingPostOnboardingShare.value = null
+    }
+
+    fun sendPendingPostOnboardingShare() {
+        val pending = _pendingPostOnboardingShare.value ?: return
+        _pendingPostOnboardingShare.value = null
+        if (pending.items.isNotEmpty()) {
+            preSelectFiles(pending.items)
+        }
+        if (!pending.text.isNullOrBlank()) {
+            pendingSharedText = pending.text
+        }
+    }
+
+    fun clearAppSharePrompt() {
+        _appSharePromptState.value = null
+    }
+
+    fun chooseSendSharedApp(appItem: LocalFileItem) {
+        _appSharePromptState.value = null
+        viewModelScope.launch(Dispatchers.IO) {
+            val extracted = StorageService.extractApk(context, appItem)
+            if (extracted != null && extracted.exists()) {
+                val fileItem = LocalFileItem(
+                    id = System.currentTimeMillis(),
+                    uri = Uri.fromFile(extracted),
+                    name = extracted.name,
+                    size = extracted.length(),
+                    mimeType = "application/vnd.android.package-archive",
+                    category = "Apps"
+                )
+                withContext(Dispatchers.Main) {
+                    val session = ConnectionSessionManager.session.value
+                    val isConnected = session.isConnected || _connectionState.value == ConnectionState.CONNECTED
+                    val target = session.remoteDevice ?: _remoteDevice.value
+                    if (isConnected && target != null) {
+                        _pendingShareRequest.value = PendingShareRequest(
+                            items = listOf(fileItem),
+                            text = null,
+                            targetDevice = target
+                        )
+                    } else {
+                        _pendingPostOnboardingShare.value = PendingShareBannerData(listOf(fileItem), null)
+                    }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    showToast("Could not prepare app for sharing.")
+                }
+            }
+        }
+    }
+
+    fun chooseSendSharedText(text: String) {
+        _appSharePromptState.value = null
+        viewModelScope.launch(Dispatchers.Main) {
+            val session = ConnectionSessionManager.session.value
+            val isConnected = session.isConnected || _connectionState.value == ConnectionState.CONNECTED
+            val target = session.remoteDevice ?: _remoteDevice.value
+            if (isConnected && target != null) {
+                _pendingShareRequest.value = PendingShareRequest(
+                    items = emptyList(),
+                    text = text,
+                    targetDevice = target
+                )
+            } else {
+                _pendingPostOnboardingShare.value = PendingShareBannerData(emptyList(), text)
+            }
+        }
+    }
+
     private val _openExplorerEvent = MutableStateFlow(false)
     val openExplorerEvent: StateFlow<Boolean> = _openExplorerEvent.asStateFlow()
 
@@ -110,9 +218,48 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _openExplorerEvent.value = false
     }
 
+    fun isControlChannelAlive(): Boolean {
+        return handshakeClient?.isAlive() == true || FlipTransferForegroundService.isControlChannelAlive()
+    }
+
+    fun handleWifiDirectGroupState(isConnected: Boolean) {
+        if (_connectionState.value != ConnectionState.CONNECTED) {
+            groupLostDebounceJob?.cancel()
+            groupLostDebounceJob = null
+            return
+        }
+
+        if (isConnected) {
+            // Cancel debounce if connection flaps back to connected
+            groupLostDebounceJob?.cancel()
+            groupLostDebounceJob = null
+        } else {
+            // Debounce 1 s to ignore flapping during setup
+            if (groupLostDebounceJob?.isActive != true) {
+                groupLostDebounceJob = viewModelScope.launch {
+                    delay(1000L)
+                    if (_connectionState.value == ConnectionState.CONNECTED) {
+                        Log.i("FlipLink", "Wi-Fi Direct group lost after 1s debounce")
+                        performDisconnectCleanup("group lost", "Connection ended")
+                    }
+                }
+            }
+        }
+    }
+
     fun setHandshakeClient(client: HandshakeClient?) {
         synchronized(this) {
             this.handshakeClient = client
+            client?.onPeerBye = { peerName ->
+                viewModelScope.launch(Dispatchers.Main) {
+                    performDisconnectCleanup("BYE", "$peerName ended the session")
+                }
+            }
+            client?.onPeerLost = {
+                viewModelScope.launch(Dispatchers.Main) {
+                    performDisconnectCleanup("heartbeat", "Connection lost")
+                }
+            }
         }
     }
 
@@ -189,6 +336,14 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             sid = DeviceIdentity.currentSessionId
         )
 
+        // Connect Wi-Fi Direct connection listeners
+        wifiDirectHost.onGroupStateChanged = { isConnected ->
+            handleWifiDirectGroupState(isConnected)
+        }
+        wifiDirectClient.onGroupStateChanged = { isConnected ->
+            handleWifiDirectGroupState(isConnected)
+        }
+
         // Connect Foreground Service bridge
         FlipTransferForegroundService.bridge = object : FlipTransferForegroundService.ServiceBridge {
             override fun onCancelTransfer(transferId: String) {
@@ -196,7 +351,19 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             }
 
             override fun onDisconnectSession() {
-                disconnect()
+                performDisconnectCleanup("user", "Disconnected")
+            }
+
+            override fun onPeerBye(peerName: String) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    performDisconnectCleanup("BYE", "$peerName ended the session")
+                }
+            }
+
+            override fun onPeerLost() {
+                viewModelScope.launch(Dispatchers.Main) {
+                    performDisconnectCleanup("heartbeat", "Connection lost")
+                }
             }
         }
 
@@ -217,23 +384,10 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                         _role.value = session.role
                     }
                 } else if (!session.isConnected && _connectionState.value == ConnectionState.CONNECTED) {
-                    performDisconnectCleanup()
+                    performDisconnectCleanup("user", null)
                 }
             }
         }
-    }
-
-    fun updateDeviceName(newName: String) {
-        val trimmed = newName.trim()
-        if (trimmed.isEmpty()) return
-        val current = _localDevice.value ?: return
-        val updated = current.copy(name = trimmed)
-        _localDevice.value = updated
-        DeviceIdentity.setDisplayName(context, trimmed)
-        context.getSharedPreferences("flip_prefs", Context.MODE_PRIVATE)
-            .edit()
-            .putString("device_name", trimmed)
-            .apply()
     }
 
     fun clearToast() {
@@ -315,9 +469,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     Log.i("FlipViewModel", "[TRANSFER] Direct sender HTTP server started on port $port")
                 }
 
-                // 2. Start sender control channel
+                val boundHttpPort = httpServerService?.boundPort ?: _localDevice.value?.port ?: 0
+
+                // 2. Start sender control channel with actual bound port
                 try {
-                    FlipTransferForegroundService.startSenderControl(context)
+                    FlipTransferForegroundService.startSenderControl(context, boundHttpPort)
                 } catch (e: Exception) {
                     Log.w("FlipViewModel", "[WFD_SENDER] Handshake server initialization: ${e.message}")
                 }
@@ -346,7 +502,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                         _directSenderPayloadUri.value = payloadUri
 
                         // Start BLE Advertising
-                        val port = currentLocal?.port ?: 8080
+                        val port = currentLocal?.port ?: (httpServerService?.boundPort ?: 0)
                         bleService.startAdvertising(
                             localIp = "0.0.0.0",
                             port = port,
@@ -380,18 +536,48 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     /**
      * Connects to the joined client and enters the transfer flow.
+     * Sets remote.ip = peerIp (the receiver's address), never the owner address.
+     * If the receiver's HTTP /connect arrives first, uses that request's remote address instead.
+     * Uses whichever comes first, and logs if a later one differs (tag "FlipLink", last number only and port).
      */
-    fun onDirectClientConnected(ownerIp: String, port: Int = 8080, peerId: String = "", peerName: String = "") {
+    fun onDirectClientConnected(peerIp: String, port: Int, peerId: String = "", peerName: String = "") {
         directSenderTimeoutJob?.cancel()
         directSenderTimeoutJob = null
         viewModelScope.launch(Dispatchers.Main) {
             bleService.stopScanning()
             bleService.stopAdvertising()
+
+            val existingRemote = _remoteDevice.value
+            val ownerIp = NetworkUtils.getLocalIpAddress() ?: ""
+
+            val cleanPeerIp = peerIp.takeIf { it.isNotBlank() && it != ownerIp && it != "0.0.0.0" && !it.startsWith("127.") }
+            val existingIp = existingRemote?.ip?.takeIf { it.isNotBlank() && it != ownerIp && it != "0.0.0.0" && !it.startsWith("127.") }
+            val arpIp = com.example.service.control.ControlChannelConstants.getReceiverIpFromArp(ownerIp)
+                ?.takeIf { it.isNotBlank() && it != ownerIp && it != "0.0.0.0" && !it.startsWith("127.") }
+
+            val resolvedIp = cleanPeerIp ?: existingIp ?: arpIp ?: ""
+            val resolvedPort = if (port > 0) port else (existingRemote?.port ?: 0)
+
+            if (resolvedIp.isBlank() || resolvedIp == ownerIp || resolvedIp == "0.0.0.0" || resolvedIp.startsWith("127.")) {
+                Log.e("FlipLink", "ERROR: Cannot connect to receiver: resolved IP is invalid or self (.${com.example.service.control.ControlChannelConstants.lastOctet(resolvedIp)}). Aborting connection.")
+                showToast("Receiver not detected. Check that both phones are on the same network.")
+                return@launch
+            }
+
+            val ownPort = httpServerService?.boundPort ?: _localDevice.value?.port ?: 0
+            Log.i(
+                "FlipLink",
+                "Sender connected: own=.${com.example.service.control.ControlChannelConstants.lastOctet(ownerIp)}:$ownPort, peer=.${com.example.service.control.ControlChannelConstants.lastOctet(resolvedIp)}:$resolvedPort"
+            )
+
+            val resolvedId = if (peerId.isNotBlank()) peerId else (existingRemote?.id?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString())
+            val resolvedName = if (peerName.isNotBlank() && peerName != "Receiver") peerName else (existingRemote?.name?.takeIf { it.isNotBlank() } ?: (if (peerName.isNotBlank()) peerName else "Receiver"))
+
             val remote = Device(
-                id = if (peerId.isNotBlank()) peerId else java.util.UUID.randomUUID().toString(),
-                name = if (peerName.isNotBlank()) peerName else "Receiver",
-                ip = ownerIp,
-                port = port
+                id = resolvedId,
+                name = resolvedName,
+                ip = resolvedIp,
+                port = resolvedPort
             )
             _remoteDevice.value = remote
             _role.value = "SENDER"
@@ -404,7 +590,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     fun onDirectReceiverConnected(
         ownerIp: String,
-        port: Int = 8080,
+        port: Int,
         peerId: String = "",
         peerName: String = "",
         handshakeClient: HandshakeClient? = null,
@@ -431,6 +617,12 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                         _role.value = "RECEIVER"
                         _connectionState.value = ConnectionState.CONNECTED
                         FlipTransferForegroundService.start(context, remote, "RECEIVER")
+                        val ownIp = currentLocal.ip
+                        val ownPort = currentLocal.port
+                        Log.i(
+                            "FlipLink",
+                            "Receiver connected: own=.${com.example.service.control.ControlChannelConstants.lastOctet(ownIp)}:$ownPort, peer=.${com.example.service.control.ControlChannelConstants.lastOctet(ownerIp)}:$port"
+                        )
                         showToast("Connected to ${remote.name}")
                         checkAndQueuePreSelected()
                         onDone(true, null)
@@ -446,7 +638,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     fun onDirectReceiverConnected(
         ownerIp: String,
-        port: Int = 8080,
+        port: Int,
         peerId: String = "",
         peerName: String = "",
         onDone: (Boolean, String?) -> Unit
@@ -539,7 +731,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 onError = { err ->
                     Log.e("FlipViewModel", "Failed to connect: $err")
                     _connectionState.value = ConnectionState.SEARCHING
-                    showToast("Connection failed: $err")
+                    showToast("Connection failed. Check that both phones are on the same network.")
                 }
             )
         }
@@ -568,8 +760,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     checkAndQueuePreSelected()
                 },
                 onError = { err ->
-                    performDisconnectCleanup()
-                    showToast("Failed to connect: $err")
+                    performDisconnectCleanup("error", "Connection failed. Check that both phones are on the same network.")
                 }
             )
         }
@@ -585,16 +776,39 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                 transferService.notifyDisconnect(remote.ip, remote.port)
             }
         }
-        performDisconnectCleanup()
-        showToast("Disconnected")
+        performDisconnectCleanup("user", "Disconnected")
     }
 
-    fun performDisconnectCleanup() {
-        Log.i("FlipViewModel", "[CLEANUP] Starting performDisconnectCleanup()")
+    fun performDisconnectCleanup(trigger: String = "user", reasonToast: String? = null) {
+        if (!isCleaningUp.compareAndSet(false, true)) {
+            Log.d("FlipLink", "Cleanup already in progress; ignoring duplicate trigger: $trigger")
+            return
+        }
+        Log.i("FlipLink", "Cleanup triggered by: $trigger")
+
         directSenderTimeoutJob?.cancel()
         directSenderTimeoutJob = null
+        groupLostDebounceJob?.cancel()
+        groupLostDebounceJob = null
 
-        // 1. Wi-Fi Direct Host stop (safe to repeat)
+        // 1. Send BYE message to peer first (best effort, 500 ms timeout) if not triggered by BYE
+        if (!trigger.equals("BYE", ignoreCase = true)) {
+            val ownName = _localDevice.value?.name ?: DeviceIdentity.get(context).displayName
+            try {
+                runBlocking {
+                    withTimeoutOrNull(500L) {
+                        withContext(Dispatchers.IO) {
+                            handshakeClient?.sendBye(ownName)
+                            FlipTransferForegroundService.sendBye(ownName)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("FlipLink", "Failed to send BYE during cleanup: ${e.message}")
+            }
+        }
+
+        // 2. Wi-Fi Direct Host stop (safe to repeat)
         try {
             wifiDirectHost.stop()
             Log.d("FlipViewModel", "[CLEANUP] wifiDirectHost stopped")
@@ -602,7 +816,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             Log.w("FlipViewModel", "[CLEANUP] Error stopping wifiDirectHost: ${e.message}")
         }
 
-        // 2. Wi-Fi Direct Client leave (safe to repeat)
+        // 3. Wi-Fi Direct Client leave (safe to repeat)
         try {
             wifiDirectClient.leave()
             Log.d("FlipViewModel", "[CLEANUP] wifiDirectClient left group")
@@ -610,7 +824,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             Log.w("FlipViewModel", "[CLEANUP] Error leaving wifiDirectClient: ${e.message}")
         }
 
-        // 3. Receiver HandshakeClient close (safe to repeat)
+        // 4. Receiver HandshakeClient close (safe to repeat)
         synchronized(this) {
             try {
                 handshakeClient?.close()
@@ -622,7 +836,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             }
         }
 
-        // 4. BLE stop scanning and advertising (safe to repeat)
+        // 5. BLE stop scanning and advertising (safe to repeat)
         try {
             bleService.stopScanning()
             Log.d("FlipViewModel", "[CLEANUP] bleService stopped scanning")
@@ -636,7 +850,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             Log.w("FlipViewModel", "[CLEANUP] Error stopping BLE advertising: ${e.message}")
         }
 
-        // 5. Control-channel server teardown (safe to repeat)
+        // 6. Control-channel server teardown (safe to repeat)
         try {
             FlipTransferForegroundService.teardownFirstTimeConnection()
             Log.d("FlipViewModel", "[CLEANUP] Control channel torn down")
@@ -644,7 +858,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             Log.w("FlipViewModel", "[CLEANUP] Error tearing down control channel: ${e.message}")
         }
 
-        // 6. HTTP server stop (safe to repeat)
+        // 7. HTTP server stop (safe to repeat)
         try {
             httpServerService?.stopServer()
             Log.d("FlipViewModel", "[CLEANUP] httpServerService stopped")
@@ -655,7 +869,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             _isServerRunning.value = false
         }
 
-        // 7. Foreground transfer service stop (safe to repeat)
+        // 8. Foreground transfer service stop (safe to repeat)
         try {
             FlipTransferForegroundService.stop(context)
         } catch (e: Exception) {
@@ -688,11 +902,17 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         _connectionState.value = ConnectionState.IDLE
         _role.value = null
         _directSenderPayloadUri.value = null
+
+        if (reasonToast != null) {
+            showToast(reasonToast)
+        }
+
+        isCleaningUp.set(false)
         Log.i("FlipViewModel", "[CLEANUP] performDisconnectCleanup() completed successfully")
     }
 
     fun resetToHome() {
-        performDisconnectCleanup()
+        performDisconnectCleanup("user", null)
     }
 
     /**
@@ -769,6 +989,34 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
             return
         }
 
+        // Before uploading, probe TCP reachability with 2s timeout
+        val isReachable = withContext(Dispatchers.IO) {
+            try {
+                java.net.Socket().use { probeSocket ->
+                    probeSocket.connect(java.net.InetSocketAddress(remote.ip, remote.port), 2000)
+                }
+                true
+            } catch (e: Exception) {
+                Log.e(
+                    "FlipLink",
+                    "Pre-upload check failed to peer .${com.example.service.control.ControlChannelConstants.lastOctet(remote.ip)}:${remote.port}: ${e.message}"
+                )
+                false
+            }
+        }
+        if (!isReachable) {
+            withContext(Dispatchers.Main) {
+                showToast("Can't reach the other phone. Try again.")
+            }
+            updateItemStatus(item.id, TransferStatus.FAILED, "Can't reach the other phone. Try again.")
+            if (!isControlChannelAlive()) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    performDisconnectCleanup("error", "Connection lost")
+                }
+            }
+            return
+        }
+
         // Update status to SENDING
         updateItemStatus(item.id, TransferStatus.SENDING)
 
@@ -780,6 +1028,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         } catch (e: Exception) {
             Log.e("FlipViewModel", "Handshake failed: ${e.message}")
             updateItemStatus(item.id, TransferStatus.FAILED, "Handshake failed: ${e.message}")
+            if (isSocketError(e) && !isControlChannelAlive()) {
+                viewModelScope.launch(Dispatchers.Main) {
+                    performDisconnectCleanup("error", "Connection lost")
+                }
+            }
             return
         }
 
@@ -873,12 +1126,40 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                         )
                     }
                     updateItemStatus(item.id, TransferStatus.FAILED, errMsg)
+                    if (isSocketErrorMessage(errMsg) && !isControlChannelAlive()) {
+                        viewModelScope.launch(Dispatchers.Main) {
+                            performDisconnectCleanup("error", "Connection lost")
+                        }
+                    }
                 }
                 completer.complete(Unit)
             }
         )
 
         completer.await()
+    }
+
+    private fun isSocketError(e: Throwable): Boolean {
+        return e is java.net.SocketException ||
+                e is java.net.SocketTimeoutException ||
+                e is java.net.ConnectException ||
+                isSocketErrorMessage(e.message ?: "")
+    }
+
+    private fun isSocketErrorMessage(msg: String): Boolean {
+        val lower = msg.lowercase()
+        return lower.contains("socket") ||
+                lower.contains("connection refused") ||
+                lower.contains("connection reset") ||
+                lower.contains("broken pipe") ||
+                lower.contains("timed out") ||
+                lower.contains("timeout") ||
+                lower.contains("econnrefused") ||
+                lower.contains("econnreset") ||
+                lower.contains("network unreachable") ||
+                lower.contains("no route to host") ||
+                lower.contains("unexpected end of stream") ||
+                lower.contains("connection abort")
     }
 
     private fun updateItemStatus(id: String, status: TransferStatus, errMsg: String? = null) {
@@ -997,8 +1278,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onDeviceDisconnected() {
         viewModelScope.launch(Dispatchers.Main) {
-            performDisconnectCleanup()
-            showToast("Remote device disconnected")
+            performDisconnectCleanup("heartbeat", "Remote device disconnected")
         }
     }
 
@@ -1158,7 +1438,7 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onCleared() {
         super.onCleared()
-        performDisconnectCleanup()
+        performDisconnectCleanup("user", null)
     }
 
     fun updateLocalIpAddress(newIp: String) {
@@ -1180,28 +1460,104 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
         }
     }
 
-    fun handleIncomingShare(uris: List<Uri>, text: String?) {
+    fun handleIncomingShare(uris: List<Uri>, text: String?, sourceAppName: String = "the source app") {
         viewModelScope.launch(Dispatchers.Main) {
+            // Check if text is a Play Store link or bare package ID of an installed app
+            if (!text.isNullOrBlank() && uris.isEmpty()) {
+                val playStoreRegex = """(?:https?://)?play\.google\.com/store/apps/details\?id=([a-zA-Z0-9._]+)""".toRegex()
+                val barePkgRegex = """^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]+)+$""".toRegex()
+                val trimmed = text.trim()
+                val pkgMatch = playStoreRegex.find(trimmed)?.groupValues?.get(1)
+                    ?: if (barePkgRegex.matches(trimmed)) trimmed else null
+
+                if (pkgMatch != null) {
+                    val installedApp = StorageService.getInstalledAppItem(context, pkgMatch)
+                    if (installedApp != null) {
+                        _appSharePromptState.value = AppShareOption(installedApp, text)
+                        return@launch
+                    }
+                }
+            }
+
             val items = withContext(Dispatchers.IO) {
                 uris.mapNotNull { uri ->
                     try {
                         var name = "unnamed_file"
                         var size = 0L
-                        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                            val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                            if (cursor.moveToFirst()) {
-                                if (nameIndex != -1) name = cursor.getString(nameIndex) ?: "unnamed_file"
-                                if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+
+                        // 1. Get name and size using OpenableColumns without assuming a file path
+                        try {
+                            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                                val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                                val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                                if (cursor.moveToFirst()) {
+                                    if (nameIndex != -1) name = cursor.getString(nameIndex) ?: "unnamed_file"
+                                    if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            if (e is SecurityException || e is java.io.FileNotFoundException || e is IllegalArgumentException) {
+                                throw e
                             }
                         }
+
+                        if (size <= 0L) {
+                            try {
+                                context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                                    val stat = pfd.statSize
+                                    if (stat > 0L) size = stat
+                                }
+                            } catch (e: Exception) {
+                                if (e is SecurityException || e is java.io.FileNotFoundException || e is IllegalArgumentException) {
+                                    throw e
+                                }
+                            }
+                        }
+
+                        // 2. Open via openInputStream and inspect for AndroidManifest.xml if extension is missing
+                        var hasManifest = false
+                        try {
+                            context.contentResolver.openInputStream(uri)?.use { stream ->
+                                if (!name.endsWith(".apk", ignoreCase = true) && !name.endsWith(".apks", ignoreCase = true)) {
+                                    try {
+                                        java.util.zip.ZipInputStream(stream.buffered()).use { zis ->
+                                            var entry = zis.nextEntry
+                                            var count = 0
+                                            while (entry != null && count < 30) {
+                                                if (entry.name == "AndroidManifest.xml" || entry.name.endsWith("/AndroidManifest.xml")) {
+                                                    hasManifest = true
+                                                    break
+                                                }
+                                                count++
+                                                entry = zis.nextEntry
+                                            }
+                                        }
+                                    } catch (_: Exception) {
+                                        // Non-zip file
+                                    }
+                                }
+                            } ?: throw java.io.FileNotFoundException("Could not open input stream")
+                        } catch (e: Exception) {
+                            if (e is SecurityException || e is java.io.FileNotFoundException || e is IllegalArgumentException) {
+                                throw e
+                            }
+                        }
+
                         val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
+                        if ((mimeType == "application/vnd.android.package-archive" || hasManifest) &&
+                            !name.endsWith(".apk", ignoreCase = true) && !name.endsWith(".apks", ignoreCase = true)
+                        ) {
+                            name = "$name.apk"
+                        }
+
                         val category = when {
+                            name.endsWith(".apk", ignoreCase = true) || name.endsWith(".apks", ignoreCase = true) -> "Apps"
                             mimeType.startsWith("image/") -> "Images"
                             mimeType.startsWith("video/") -> "Videos"
                             mimeType.startsWith("audio/") -> "Audio"
                             else -> "Documents"
                         }
+
                         LocalFileItem(
                             id = uri.hashCode().toLong(),
                             uri = uri,
@@ -1211,10 +1567,19 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                             category = category
                         )
                     } catch (e: Exception) {
-                        Log.e("FlipViewModel", "Error parsing shared URI: $uri", e)
+                        Log.e("FlipViewModel", "Error reading shared URI: $uri", e)
+                        if (e is SecurityException || e is java.io.FileNotFoundException || e is IllegalArgumentException) {
+                            withContext(Dispatchers.Main) {
+                                showToast("Couldn't read this file from $sourceAppName. Try sharing it again.")
+                            }
+                        }
                         null
                     }
                 }
+            }
+
+            if (items.isEmpty() && text.isNullOrBlank()) {
+                return@launch
             }
 
             val session = ConnectionSessionManager.session.value
@@ -1229,17 +1594,11 @@ class FlipViewModel(application: Application) : AndroidViewModel(application),
                     targetDevice = target
                 )
             } else {
-                // Not connected: keep items as pending selection and open normal connect flow
-                if (items.isNotEmpty()) {
-                    preSelectFiles(items)
-                    showToast("${items.size} file(s) selected. Connect to a device to send.")
-                }
-                if (!text.isNullOrBlank()) {
-                    pendingSharedText = text
-                    if (items.isEmpty()) {
-                        showToast("Text prepared to send. Connect to a device to send.")
-                    }
-                }
+                // Not connected: queue items as pending confirmation banner on HomeScreen
+                _pendingPostOnboardingShare.value = PendingShareBannerData(
+                    items = items,
+                    text = text
+                )
             }
         }
     }

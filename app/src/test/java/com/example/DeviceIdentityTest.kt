@@ -106,18 +106,16 @@ class DeviceIdentityTest {
     }
 
     @Test
-    fun testDeviceIdentity_survivesRestartSimulationAndAllowsRenaming() {
+    fun testDeviceIdentity_survivesRestartSimulationAndHasConsistentModelShortCodeName() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         DeviceIdentity.resetMemoryCacheForTesting()
 
         val firstRunIdentity = DeviceIdentity.get(context)
         val originalUuid = firstRunIdentity.uuid
         val originalId8 = firstRunIdentity.id8
+        val originalDisplayName = firstRunIdentity.displayName
 
-        // Rename device
-        DeviceIdentity.setDisplayName(context, "Pixel 9 Pro XL")
-        val renamedIdentity = DeviceIdentity.get(context)
-        assertEquals("Pixel 9 Pro XL", renamedIdentity.displayName)
+        assertTrue(originalDisplayName.contains(firstRunIdentity.shortCode))
 
         // Simulate app restart: clear memory cache
         DeviceIdentity.resetMemoryCacheForTesting()
@@ -126,6 +124,6 @@ class DeviceIdentityTest {
         assertEquals("UUID must survive app restart", originalUuid, restartIdentity.uuid)
         assertEquals("id8 must survive app restart", originalId8, restartIdentity.id8)
         assertEquals("shortCode must survive app restart", originalId8.take(4).uppercase(), restartIdentity.shortCode)
-        assertEquals("Renamed display name must survive app restart", "Pixel 9 Pro XL", restartIdentity.displayName)
+        assertEquals("Display name must survive app restart and remain model plus short code", originalDisplayName, restartIdentity.displayName)
     }
 }
